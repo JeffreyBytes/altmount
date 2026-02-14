@@ -100,6 +100,12 @@ func (mrf *MetadataRemoteFile) OpenFile(ctx context.Context, name string) (bool,
 		showCorrupted = sc
 	}
 
+	// Force showCorrupted if we are inside the corrupted_metadata folder
+	// normalizedName is clean and has no trailing slashes
+	if strings.HasPrefix(normalizedName, "corrupted_metadata/") || normalizedName == "corrupted_metadata" {
+		showCorrupted = true
+	}
+
 	// Check if this is a directory first
 	if mrf.metadataService.DirectoryExists(normalizedName) {
 		// Create a directory handle
@@ -169,7 +175,10 @@ func (mrf *MetadataRemoteFile) OpenFile(ctx context.Context, name string) (bool,
 
 	// Start tracking stream if tracker available
 	streamID := ""
-	if mrf.streamTracker != nil {
+	if suppress, _ := ctx.Value(utils.SuppressStreamTrackingKey).(bool); suppress {
+		// Stream tracking handled at caller level (e.g. FUSE Handle)
+		streamID = ""
+	} else if mrf.streamTracker != nil {
 		// Check if we already have a stream ID in context
 		if id, ok := ctx.Value(utils.StreamIDKey).(string); ok && id != "" {
 			streamID = id
@@ -291,6 +300,7 @@ func (mrf *MetadataRemoteFile) RenameFile(ctx context.Context, oldName, newName 
 		if err := os.Rename(oldDirPath, newDirPath); err != nil {
 			return false, fmt.Errorf("failed to rename directory: %w", err)
 		}
+
 		return true, nil
 	}
 
@@ -323,8 +333,10 @@ func (mrf *MetadataRemoteFile) RenameFile(ctx context.Context, oldName, newName 
 
 	// Clean up any health records for the new location and optionally for the directory
 	if mrf.healthRepository != nil {
-		// Remove health record for the specific resulting file (the new one)
-		_ = mrf.healthRepository.DeleteHealthRecord(ctx, normalizedNew)
+		// Update the health record path to follow the move
+		if err := mrf.healthRepository.RenameHealthRecord(ctx, normalizedOld, normalizedNew); err != nil {
+			slog.WarnContext(ctx, "Failed to update health record path during MOVE", "old", normalizedOld, "new", normalizedNew, "error", err)
+		}
 
 		// Check if we should resolve other repairs in the same directory
 		cfg := mrf.configGetter()
@@ -664,7 +676,8 @@ type MetadataVirtualFile struct {
 	// Segment offset index for O(1) offset→segment lookup
 	segmentIndex *segmentOffsetIndex
 
-	mu sync.Mutex
+	mu      sync.Mutex
+	closeWg sync.WaitGroup // tracks background reader closes during seek
 }
 
 // segmentOffsetIndex provides O(1) lookup for offset→segment mapping using binary search
@@ -791,6 +804,7 @@ func (mvf *MetadataVirtualFile) Read(p []byte) (n int, err error) {
 
 		if totalRead > 0 && mvf.streamTracker != nil && mvf.streamID != "" {
 			mvf.streamTracker.UpdateProgress(mvf.streamID, int64(totalRead))
+			mvf.streamTracker.UpdateCurrentOffset(mvf.streamID, mvf.position)
 
 			// Update buffered offset if available
 			if ur, ok := mvf.reader.(interface{ GetBufferedOffset() int64 }); ok {
@@ -973,6 +987,9 @@ func (mvf *MetadataVirtualFile) Seek(offset int64, whence int) (int64, error) {
 	// on next read. This prevents stale range information from being reused after seek.
 	if abs != mvf.position {
 		mvf.originalRangeEnd = 0
+		if mvf.streamTracker != nil && mvf.streamID != "" {
+			mvf.streamTracker.UpdateCurrentOffset(mvf.streamID, abs)
+		}
 	}
 
 	mvf.position = abs
@@ -988,13 +1005,16 @@ func (mvf *MetadataVirtualFile) Close() error {
 	}
 
 	mvf.mu.Lock()
-	defer mvf.mu.Unlock()
 	if mvf.reader != nil {
-		err := mvf.reader.Close()
+		mvf.reader.Close()
 		mvf.reader = nil
 		mvf.readerInitialized = false
-		return err
 	}
+	mvf.mu.Unlock()
+
+	// Wait for any background reader closes from previous seeks
+	mvf.closeWg.Wait()
+
 	return nil
 }
 
@@ -1075,11 +1095,15 @@ func (mvf *MetadataVirtualFile) hasMoreDataToRead() bool {
 	return false
 }
 
-// closeCurrentReader closes the current reader and resets reader state
+// closeCurrentReader detaches the current reader and closes it in the background.
+// This avoids blocking Seek on UsenetReader.Close() which may wait for in-flight downloads.
 func (mvf *MetadataVirtualFile) closeCurrentReader() {
 	if mvf.reader != nil {
-		mvf.reader.Close()
+		reader := mvf.reader
 		mvf.reader = nil
+		mvf.closeWg.Go(func() {
+			reader.Close()
+		})
 	}
 	mvf.readerInitialized = false
 }
@@ -1205,7 +1229,7 @@ func (mvf *MetadataVirtualFile) createUsenetReader(ctx context.Context, start, e
 		}
 	}
 
-	return usenet.NewUsenetReader(ctx, mvf.poolManager.GetPool, rg, mvf.maxPrefetch)
+	return usenet.NewUsenetReader(ctx, mvf.poolManager.GetPool, rg, mvf.maxPrefetch, mvf.streamTracker, mvf.streamID)
 }
 
 // wrapWithEncryption wraps a usenet reader with encryption using metadata

@@ -1,6 +1,7 @@
 import { formatDistanceToNowStrict } from "date-fns";
-import { AlertTriangle, CheckCircle, Network, XCircle } from "lucide-react";
+import { AlertTriangle, CheckCircle, Network, Timer, XCircle, Zap } from "lucide-react";
 import type { ProviderStatus } from "../../types/api";
+import { formatSpeed } from "../../lib/utils";
 
 interface ProviderCardProps {
 	provider: ProviderStatus;
@@ -63,7 +64,14 @@ export function ProviderCard({ provider, className }: ProviderCardProps) {
 				{/* Header with host and state badge */}
 				<div className="flex items-start justify-between">
 					<div className="min-w-0 flex-1">
-						<h3 className="card-title truncate font-medium text-base">{provider.host}</h3>
+						<div className="flex items-center gap-2">
+							<div className={`h-2 w-2 shrink-0 rounded-full ${
+								provider.state.toLowerCase() === 'active' 
+									? (provider.error_count > 10 ? 'animate-pulse bg-warning' : 'bg-success') 
+									: (provider.state.toLowerCase() === 'failed' ? 'bg-error' : 'bg-base-300')
+							}`} />
+							<h3 className="card-title truncate font-medium text-base">{provider.host}</h3>
+						</div>
 						{provider.username && (
 							<p className="cursor-pointer truncate text-base-content/60 text-sm blur-sm transition-all hover:blur-none">
 								@{provider.username}
@@ -91,9 +99,42 @@ export function ProviderCard({ provider, className }: ProviderCardProps) {
 					/>
 				</div>
 
+				{/* Performance Stats */}
+				<div className="mt-4 grid grid-cols-3 gap-2 border-base-200 border-t pt-4 text-center">
+					<div className="space-y-1">
+						<div className="flex items-center justify-center gap-1 text-[9px] text-base-content/50 uppercase tracking-wider">
+							<Zap className="h-2.5 w-2.5" />
+							<span>Speed</span>
+						</div>
+						<div className="truncate font-bold font-mono text-primary text-xs">
+							{provider.current_speed_bytes_per_sec !== undefined 
+								? formatSpeed(provider.current_speed_bytes_per_sec) 
+								: "0 B/s"}
+						</div>
+					</div>
+					<div className="space-y-1">
+						<div className="flex items-center justify-center gap-1 text-[9px] text-base-content/50 uppercase tracking-wider">
+							<Timer className="h-2.5 w-2.5" />
+							<span>Ping</span>
+						</div>
+						<div className="font-bold font-mono text-info text-xs">
+							{provider.ping_ms}ms
+						</div>
+					</div>
+					<div className="space-y-1">
+						<div className="flex items-center justify-center gap-1 text-[9px] text-base-content/50 uppercase tracking-wider">
+							<AlertTriangle className="h-2.5 w-2.5" />
+							<span>Errors</span>
+						</div>
+						<div className={`font-bold font-mono text-xs ${provider.error_count > 0 ? 'text-error' : 'text-base-content/30'}`}>
+							{provider.error_count}
+						</div>
+					</div>
+				</div>
+
 				{/* Missing Articles */}
 				{provider.missing_count > 0 && (
-					<div className="mt-2 space-y-1">
+					<div className="mt-2 space-y-1 border-base-200 border-t pt-2">
 						<div className="flex items-center justify-between text-sm">
 							<span className="text-base-content/70">Missing Articles</span>
 							<div className="text-right">

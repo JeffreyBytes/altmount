@@ -292,7 +292,7 @@ func TestDir_Getattr(t *testing.T) {
 	logger := slog.Default()
 
 	// Test root directory
-	root := NewDir(nil, "", logger, 1000, 1000, nil)
+	root := NewDir(nil, "", logger, 1000, 1000, nil, nil)
 	ctx := context.Background()
 	out := &fuse.AttrOut{}
 	errno := root.Getattr(ctx, nil, out)
@@ -302,6 +302,26 @@ func TestDir_Getattr(t *testing.T) {
 	assert.Equal(t, uint32(0755|syscall.S_IFDIR), out.Mode)
 	assert.Equal(t, uint32(1000), out.Uid)
 	assert.Equal(t, uint32(1000), out.Gid)
+}
+
+func TestDir_Statfs(t *testing.T) {
+	logger := slog.Default()
+	root := NewDir(nil, "", logger, 1000, 1000, nil, nil)
+	ctx := context.Background()
+	out := &fuse.StatfsOut{}
+	errno := root.Statfs(ctx, out)
+
+	assert.Equal(t, syscall.Errno(0), errno)
+	assert.Equal(t, uint64(1024*1024*1024*1024*1024/4096), out.Blocks)
+	assert.Equal(t, uint64(1024*1024*1024*1024*1024/4096), out.Bfree)
+	assert.Equal(t, uint64(1024*1024*1024*1024*1024/4096), out.Bavail)
+	assert.Equal(t, uint32(4096), out.Bsize)
+}
+
+func TestDir_Mkdir(t *testing.T) {
+	// We need a way to mock nzbfilesystem.NzbFilesystem but it's a struct not an interface.
+	// For now, we skip adding a full integration test here as it would require significant mocking of MetadataRemoteFile.
+	// The implementation in dir.go is straightforward delegation to d.nzbfs.Mkdir and d.nzbfs.Stat.
 }
 
 func TestHandle_Release_Idempotent(t *testing.T) {

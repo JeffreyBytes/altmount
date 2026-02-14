@@ -105,6 +105,7 @@ type ProviderAPIResponse struct {
 	Enabled           bool       `json:"enabled"`
 	IsBackupProvider  bool       `json:"is_backup_provider"`
 	InflightRequests  int        `json:"inflight_requests"`
+	LastRTTMs         int64      `json:"last_rtt_ms"`
 	LastSpeedTestMbps float64    `json:"last_speed_test_mbps"`
 	LastSpeedTestTime *time.Time `json:"last_speed_test_time,omitempty"`
 }
@@ -159,6 +160,7 @@ func ToConfigAPIResponse(cfg *config.Config, apiKey string) *ConfigAPIResponse {
 			Enabled:           p.Enabled != nil && *p.Enabled,
 			IsBackupProvider:  p.IsBackupProvider != nil && *p.IsBackupProvider,
 			InflightRequests:  p.InflightRequests,
+			LastRTTMs:         p.LastRTTMs,
 			LastSpeedTestMbps: p.LastSpeedTestMbps,
 			LastSpeedTestTime: p.LastSpeedTestTime,
 		}
@@ -344,6 +346,41 @@ type QueueStatsResponse struct {
 	LastUpdated         time.Time `json:"last_updated"`
 }
 
+// QueueHistoryRange represents statistics for a specific time range
+type QueueHistoryRange struct {
+	Completed  int     `json:"completed"`
+	Failed     int     `json:"failed"`
+	Percentage float64 `json:"percentage"`
+}
+
+// ImportHistoryResponse represents a persistent import record in API responses
+type ImportHistoryResponse struct {
+	ID          int64     `json:"id"`
+	NzbID       *int64    `json:"nzb_id"`
+	NzbName     string    `json:"nzb_name"`
+	FileName    string    `json:"file_name"`
+	FileSize    int64     `json:"file_size"`
+	VirtualPath string    `json:"virtual_path"`
+	Category    *string   `json:"category"`
+	CompletedAt time.Time `json:"completed_at"`
+}
+
+// DailyStat represents statistics for a single day
+type DailyStat struct {
+	Day       string `json:"day"`
+	Completed int    `json:"completed"`
+	Failed    int    `json:"failed"`
+}
+
+// QueueHistoricalStatsResponse represents historical queue statistics
+type QueueHistoricalStatsResponse struct {
+	Last24Hours QueueHistoryRange `json:"last_24_hours"`
+	Last7Days   QueueHistoryRange `json:"last_7_days"`
+	Last30Days  QueueHistoryRange `json:"last_30_days"`
+	Last365Days QueueHistoryRange `json:"last_365_days"`
+	Daily       []DailyStat       `json:"daily"`
+}
+
 // Health API Types
 
 // HealthItemResponse represents a health record in API responses
@@ -352,7 +389,7 @@ type HealthItemResponse struct {
 	FilePath         string                  `json:"file_path"`
 	LibraryPath      *string                 `json:"library_path,omitempty"`
 	Status           database.HealthStatus   `json:"status"`
-	LastChecked      time.Time               `json:"last_checked"`
+	LastChecked      *time.Time              `json:"last_checked"`
 	LastError        *string                 `json:"last_error"`
 	RetryCount       int                     `json:"retry_count"`
 	MaxRetries       int                     `json:"max_retries"`
@@ -541,6 +578,78 @@ func ToQueueStatsResponse(stats *database.QueueStats) *QueueStatsResponse {
 	}
 }
 
+// ToQueueHistoricalStatsResponse converts database.ImportDailyStat slice to QueueHistoricalStatsResponse
+func ToQueueHistoricalStatsResponse(stats []*database.ImportDailyStat) *QueueHistoricalStatsResponse {
+	response := &QueueHistoricalStatsResponse{
+		Daily: make([]DailyStat, 0, len(stats)),
+	}
+
+	now := time.Now().UTC()
+	day24h := now.Add(-24 * time.Hour)
+	day7d := now.Add(-7 * 24 * time.Hour)
+	day30d := now.Add(-30 * 24 * time.Hour)
+	day365d := now.Add(-365 * 24 * time.Hour)
+
+	for _, s := range stats {
+		// Daily list
+		response.Daily = append(response.Daily, DailyStat{
+			Day:       s.Day.Format("2006-01-02"),
+			Completed: s.CompletedCount,
+			Failed:    s.FailedCount,
+		})
+
+		// Aggregates
+		if s.Day.After(day365d) || s.Day.Format("2006-01-02") == day365d.Format("2006-01-02") {
+			response.Last365Days.Completed += s.CompletedCount
+			response.Last365Days.Failed += s.FailedCount
+		}
+		if s.Day.After(day30d) || s.Day.Format("2006-01-02") == day30d.Format("2006-01-02") {
+			response.Last30Days.Completed += s.CompletedCount
+			response.Last30Days.Failed += s.FailedCount
+		}
+		if s.Day.After(day7d) || s.Day.Format("2006-01-02") == day7d.Format("2006-01-02") {
+			response.Last7Days.Completed += s.CompletedCount
+			response.Last7Days.Failed += s.FailedCount
+		}
+		if s.Day.After(day24h) || s.Day.Format("2006-01-02") == day24h.Format("2006-01-02") {
+			response.Last24Hours.Completed += s.CompletedCount
+			response.Last24Hours.Failed += s.FailedCount
+		}
+	}
+
+	// Calculate percentages
+	calcPercentage := func(r *QueueHistoryRange) {
+		total := r.Completed + r.Failed
+		if total > 0 {
+			r.Percentage = (float64(r.Completed) / float64(total)) * 100
+		}
+	}
+
+	calcPercentage(&response.Last24Hours)
+	calcPercentage(&response.Last7Days)
+	calcPercentage(&response.Last30Days)
+	calcPercentage(&response.Last365Days)
+
+	return response
+}
+
+// ToImportHistoryResponse converts database.ImportHistory to ImportHistoryResponse
+func ToImportHistoryResponse(h *database.ImportHistory) *ImportHistoryResponse {
+	if h == nil {
+		return nil
+	}
+	return &ImportHistoryResponse{
+		ID:          h.ID,
+		NzbID:       h.NzbID,
+		NzbName:     h.NzbName,
+		FileName:    h.FileName,
+		FileSize:    h.FileSize,
+		VirtualPath: h.VirtualPath,
+		Category:    h.Category,
+		CompletedAt: h.CompletedAt,
+	}
+}
+
 // ToHealthItemResponse converts database.FileHealth to HealthItemResponse
 func ToHealthItemResponse(item *database.FileHealth) *HealthItemResponse {
 	if item == nil {
@@ -706,6 +815,7 @@ type ProviderStatusResponse struct {
 	LastSpeedTestMbps     float64    `json:"last_speed_test_mbps"`
 	LastSpeedTestTime     *time.Time `json:"last_speed_test_time,omitempty"`
 	CurrentSpeedBytesPerSec float64    `json:"current_speed_bytes_per_sec"`
+	PingMs                  int64      `json:"ping_ms"`
 	MissingCount            int64      `json:"missing_count"`
 	MissingRatePerMinute    float64    `json:"missing_rate_per_minute"`
 	MissingWarning          bool       `json:"missing_warning"`

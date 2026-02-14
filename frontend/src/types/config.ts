@@ -1,5 +1,8 @@
 // Configuration types that match the backend API structure
 
+// Mount type for unified mount configuration
+export type MountType = "none" | "rclone" | "fuse" | "rclone_external";
+
 // Base configuration response from API
 export interface ConfigResponse {
 	webdav: WebDAVConfig;
@@ -17,6 +20,7 @@ export interface ConfigResponse {
 	arrs: ArrsConfig;
 	providers: ProviderConfig[];
 	mount_path: string;
+	mount_type: MountType;
 	api_key?: string;
 }
 
@@ -26,6 +30,7 @@ export interface WebDAVConfig {
 	user: string;
 	password: string;
 	host?: string;
+	debug?: boolean;
 }
 
 // API server configuration
@@ -226,6 +231,7 @@ export interface ProviderConfig {
 	password_set: boolean;
 	enabled: boolean;
 	is_backup_provider: boolean;
+	last_rtt_ms?: number;
 	last_speed_test_mbps?: number;
 	last_speed_test_time?: string;
 }
@@ -266,6 +272,7 @@ export interface ConfigUpdateRequest {
 	arrs?: ArrsConfig;
 	providers?: ProviderUpdateRequest[];
 	mount_path?: string;
+	mount_type?: MountType;
 }
 
 // WebDAV update request
@@ -440,6 +447,7 @@ export type ConfigSection =
 	| "health"
 	| "import"
 	| "providers"
+	| "mount"
 	| "rclone"
 	| "fuse"
 	| "sabnzbd"
@@ -663,7 +671,9 @@ export interface ArrsConfig {
 	sonarr_instances: ArrsInstanceConfig[];
 	queue_cleanup_enabled?: boolean;
 	queue_cleanup_interval_seconds?: number;
+	queue_cleanup_grace_period_minutes?: number;
 	queue_cleanup_allowlist?: IgnoredMessage[];
+	cleanup_automatic_import_failure?: boolean;
 }
 
 // Sync status and progress types
@@ -700,6 +710,10 @@ export interface ArrsFormData {
 	webhook_base_url?: string;
 	radarr_instances: ArrsInstanceConfig[];
 	sonarr_instances: ArrsInstanceConfig[];
+	queue_cleanup_enabled?: boolean;
+	queue_cleanup_interval_seconds?: number;
+	queue_cleanup_grace_period_minutes?: number;
+	cleanup_automatic_import_failure?: boolean;
 }
 
 // Helper type for configuration sections
@@ -714,6 +728,7 @@ export interface ConfigSectionInfo {
 // Configuration sections metadata
 // Provider management types
 export interface ProviderTestRequest {
+	provider_id?: string;
 	host: string;
 	port: number;
 	username: string;
@@ -760,15 +775,9 @@ export const CONFIG_SECTIONS: Record<ConfigSection | "system", ConfigSectionInfo
 		icon: "Shield",
 		canEdit: true,
 	},
-	rclone: {
-		title: "Rclone Mount",
-		description: "RClone mount and VFS settings",
-		icon: "HardDrive",
-		canEdit: true,
-	},
-	fuse: {
-		title: "Altmount Native Mount",
-		description: "Configure altmount native FUSE mount settings",
+	mount: {
+		title: "Mount",
+		description: "Configure filesystem mount (RClone or native FUSE)",
 		icon: "HardDrive",
 		canEdit: true,
 	},
@@ -801,6 +810,20 @@ export const CONFIG_SECTIONS: Record<ConfigSection | "system", ConfigSectionInfo
 		description: "Usenet provider configuration for downloads",
 		icon: "Radio",
 		canEdit: true,
+	},
+	rclone: {
+		title: "RClone",
+		description: "RClone configuration",
+		icon: "HardDrive",
+		canEdit: true,
+		hidden: true,
+	},
+	fuse: {
+		title: "FUSE",
+		description: "Native FUSE configuration",
+		icon: "HardDrive",
+		canEdit: true,
+		hidden: true,
 	},
 	sabnzbd: {
 		title: "SABnzbd API",

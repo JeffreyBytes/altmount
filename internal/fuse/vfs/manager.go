@@ -9,24 +9,25 @@ import (
 
 // ManagerConfig holds VFS manager configuration.
 type ManagerConfig struct {
-	Enabled        bool
-	CachePath      string
-	MaxSizeBytes   int64
-	ExpiryDuration time.Duration
-	ChunkSize      int64
-	ReadAheadChunks int
+	Enabled             bool
+	CachePath           string
+	MaxSizeBytes        int64
+	ExpiryDuration      time.Duration
+	ChunkSize           int64
+	ReadAheadChunks     int
+	PrefetchConcurrency int
 }
 
 // Manager manages the VFS disk cache lifecycle.
 type Manager struct {
-	cache   *Cache
-	config  ManagerConfig
-	logger  *slog.Logger
-	stats   Stats
-	files   sync.Map // path → *Downloader
-	ctx     context.Context
-	cancel  context.CancelFunc
-	wg      sync.WaitGroup
+	cache  *Cache
+	config ManagerConfig
+	logger *slog.Logger
+	stats  Stats
+	files  sync.Map // path → *Downloader
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
 }
 
 // NewManager creates a new VFS manager.
@@ -116,6 +117,7 @@ func (m *Manager) Open(ctx context.Context, path string, size int64, opener File
 			size,
 			m.config.ChunkSize,
 			m.config.ReadAheadChunks,
+			m.config.PrefetchConcurrency,
 			m.logger,
 		)
 		m.files.Store(path, dl)

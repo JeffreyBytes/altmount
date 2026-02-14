@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"runtime"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/hanwen/go-fuse/v2/fs"
@@ -19,22 +20,29 @@ import (
 
 // Server manages the FUSE mount
 type Server struct {
-	mountPoint string
-	nzbfs      *nzbfilesystem.NzbFilesystem
-	logger     *slog.Logger
-	server     *fuse.Server
-	config     config.FuseConfig
-	vfsm       *vfs.Manager // VFS disk cache manager (nil if disabled)
+	mountPoint    string
+	nzbfs         *nzbfilesystem.NzbFilesystem
+	logger        *slog.Logger
+	server        *fuse.Server
+	config        config.FuseConfig
+	vfsm          *vfs.Manager // VFS disk cache manager (nil if disabled)
+	streamTracker StreamTracker
+
+	// ValidateMount goroutine leak guard
+	validating   atomic.Int32
+	lastHealthy  atomic.Bool
+	lastHealthTS atomic.Int64 // unix nano timestamp of last validation
 }
 
 // NewServer creates a new FUSE server instance.
 // Takes NzbFilesystem directly (no ContextAdapter needed).
-func NewServer(mountPoint string, nzbfs *nzbfilesystem.NzbFilesystem, logger *slog.Logger, cfg config.FuseConfig) *Server {
+func NewServer(mountPoint string, nzbfs *nzbfilesystem.NzbFilesystem, logger *slog.Logger, cfg config.FuseConfig, st StreamTracker) *Server {
 	return &Server{
-		mountPoint: mountPoint,
-		nzbfs:      nzbfs,
-		logger:     logger,
-		config:     cfg,
+		mountPoint:    mountPoint,
+		nzbfs:         nzbfs,
+		logger:        logger,
+		config:        cfg,
+		streamTracker: st,
 	}
 }
 
@@ -48,9 +56,10 @@ func getIDFromEnv(key string, defaultID int) int {
 	return defaultID
 }
 
-// Mount mounts the filesystem and starts serving
-// This method blocks until the filesystem is unmounted
-func (s *Server) Mount() error {
+// Mount mounts the filesystem and starts serving.
+// The onReady callback is called after the kernel mount is confirmed live (via WaitMount).
+// This method blocks until the filesystem is unmounted.
+func (s *Server) Mount(onReady func()) error {
 	// Try to cleanup stale mount first
 	s.CleanupMount()
 
@@ -77,21 +86,27 @@ func (s *Server) Mount() error {
 
 		chunkSizeMB := s.config.ChunkSizeMB
 		if chunkSizeMB <= 0 {
-			chunkSizeMB = 4
+			chunkSizeMB = 8
 		}
 
 		readAheadChunks := s.config.ReadAheadChunks
 		if readAheadChunks <= 0 {
-			readAheadChunks = 4
+			readAheadChunks = 6
+		}
+
+		prefetchConcurrency := s.config.PrefetchConcurrency
+		if prefetchConcurrency <= 0 {
+			prefetchConcurrency = 3
 		}
 
 		vfsCfg := vfs.ManagerConfig{
-			Enabled:         true,
-			CachePath:       cachePath,
-			MaxSizeBytes:    int64(maxSizeGB) * 1024 * 1024 * 1024,
-			ExpiryDuration:  time.Duration(expiryH) * time.Hour,
-			ChunkSize:       int64(chunkSizeMB) * 1024 * 1024,
-			ReadAheadChunks: readAheadChunks,
+			Enabled:             true,
+			CachePath:           cachePath,
+			MaxSizeBytes:        int64(maxSizeGB) * 1024 * 1024 * 1024,
+			ExpiryDuration:      time.Duration(expiryH) * time.Hour,
+			ChunkSize:           int64(chunkSizeMB) * 1024 * 1024,
+			ReadAheadChunks:     readAheadChunks,
+			PrefetchConcurrency: prefetchConcurrency,
 		}
 
 		var err error
@@ -105,12 +120,13 @@ func (s *Server) Mount() error {
 				"max_size_gb", maxSizeGB,
 				"expiry_hours", expiryH,
 				"chunk_size_mb", chunkSizeMB,
-				"read_ahead_chunks", readAheadChunks)
+				"read_ahead_chunks", readAheadChunks,
+				"prefetch_concurrency", prefetchConcurrency)
 		}
 	}
 	s.vfsm = vfsm
 
-	root := NewDir(s.nzbfs, "", s.logger, uid, gid, vfsm)
+	root := NewDir(s.nzbfs, "", s.logger, uid, gid, vfsm, s.streamTracker)
 
 	// Configure FUSE options
 	attrTimeout := time.Duration(s.config.AttrTimeoutSeconds) * time.Second
@@ -147,7 +163,22 @@ func (s *Server) Mount() error {
 	}
 
 	s.server = server
-	s.logger.Info("FUSE filesystem mounted", "mountpoint", s.mountPoint)
+
+	// Wait until the kernel mount is actually ready before declaring success
+	if err := s.server.WaitMount(); err != nil {
+		s.logger.Error("WaitMount failed, unmounting", "error", err)
+		_ = s.server.Unmount()
+		if vfsm != nil {
+			vfsm.Stop()
+		}
+		return fmt.Errorf("FUSE mount not ready: %w", err)
+	}
+
+	s.logger.Info("FUSE filesystem mounted and ready", "mountpoint", s.mountPoint)
+
+	if onReady != nil {
+		onReady()
+	}
 
 	// Block until unmount
 	s.server.Wait()
@@ -175,25 +206,78 @@ func (s *Server) Unmount() error {
 	return s.ForceUnmount()
 }
 
-// ForceUnmount attempts to lazy/force unmount the mountpoint
+// ForceUnmount attempts to lazy/force unmount the mountpoint using platform-specific commands
 func (s *Server) ForceUnmount() error {
-	if runtime.GOOS == "linux" {
-		// Try fusermount -uz (lazy unmount)
-		if err := exec.Command("fusermount", "-uz", s.mountPoint).Run(); err == nil {
-			s.logger.Info("Successfully lazy unmounted using fusermount")
-			return nil
+	var methods [][]string
+
+	if runtime.GOOS == "darwin" {
+		methods = [][]string{
+			{"umount", "-f", s.mountPoint},
+			{"diskutil", "unmount", "force", s.mountPoint},
+			{"umount", s.mountPoint},
 		}
-		// Fallback to umount -l
-		if err := exec.Command("umount", "-l", s.mountPoint).Run(); err == nil {
-			s.logger.Info("Successfully lazy unmounted using umount")
+	} else {
+		methods = [][]string{
+			{"fusermount", "-uz", s.mountPoint},
+			{"umount", s.mountPoint},
+			{"umount", "-l", s.mountPoint},
+			{"fusermount3", "-uz", s.mountPoint},
+		}
+	}
+
+	for _, method := range methods {
+		if err := exec.Command(method[0], method[1:]...).Run(); err == nil {
+			s.logger.Info("Successfully force unmounted", "command", method, "path", s.mountPoint)
 			return nil
 		}
 	}
-	return fmt.Errorf("failed to force unmount %s", s.mountPoint)
+
+	return fmt.Errorf("all force unmount attempts failed for %s", s.mountPoint)
+}
+
+// ValidateMount checks if the mount point is responsive by stat-ing the directory with a timeout.
+// Uses an atomic guard to prevent multiple concurrent os.Stat goroutines (which leak when the
+// mount is stuck). If a validation is already in-flight, returns the last cached result.
+func (s *Server) ValidateMount() (bool, error) {
+	// If another goroutine is already validating, return cached result
+	if !s.validating.CompareAndSwap(0, 1) {
+		healthy := s.lastHealthy.Load()
+		if !healthy {
+			return false, fmt.Errorf("mount point validation in progress (last check: unhealthy)")
+		}
+		return true, nil
+	}
+
+	type statResult struct {
+		err error
+	}
+
+	ch := make(chan statResult, 1)
+	go func() {
+		defer s.validating.Store(0)
+		_, err := os.Stat(s.mountPoint)
+		ch <- statResult{err: err}
+	}()
+
+	select {
+	case result := <-ch:
+		if result.err != nil {
+			s.lastHealthy.Store(false)
+			s.lastHealthTS.Store(time.Now().UnixNano())
+			return false, fmt.Errorf("mount point stat failed: %w", result.err)
+		}
+		s.lastHealthy.Store(true)
+		s.lastHealthTS.Store(time.Now().UnixNano())
+		return true, nil
+	case <-time.After(5 * time.Second):
+		// Goroutine is leaked but guarded — only one can be in-flight at a time
+		s.lastHealthy.Store(false)
+		s.lastHealthTS.Store(time.Now().UnixNano())
+		return false, fmt.Errorf("mount point not responding (stat timed out after 5s)")
+	}
 }
 
 // CleanupMount checks for and cleans up stale mounts at the mountpoint
 func (s *Server) CleanupMount() {
 	_ = s.ForceUnmount()
 }
-
