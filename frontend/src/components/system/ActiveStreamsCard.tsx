@@ -126,27 +126,48 @@ export function ActiveStreamsCard() {
 
 									<div className="space-y-1">
 										<div className="flex items-center justify-between px-0.5 text-[10px]">
-											<span className="font-medium text-primary">{progress}%</span>
-											<div className="flex items-center gap-2 font-mono opacity-70">
-												{stream.eta > 0 && (
-													<span className="whitespace-nowrap">
-														ETA: {formatDuration(stream.eta)}
-													</span>
-												)}
-												{stream.eta > 0 && stream.bytes_per_second > 0 && (
-													<span className="opacity-30">|</span>
-												)}
-												{stream.bytes_per_second > 0 && (
-													<div className="flex items-center gap-1">
-														<span className="whitespace-nowrap">
-															{formatBytes(stream.bytes_per_second)}/s
+											<div className="flex items-center gap-2">
+												<span className="font-medium text-primary">{progress}%</span>
+												<span className="text-base-content/40">•</span>
+												<span
+													className="text-base-content/40"
+													title="Total downloaded for this session"
+												>
+													DL: {formatBytes(stream.bytes_downloaded)}
+												</span>
+											</div>
+											<div className="flex flex-col items-end gap-1 font-mono opacity-80">
+												{/* Speeds */}
+												<div className="flex items-center gap-2">
+													{/* Download (Input) Speed */}
+													<div className="flex items-center gap-1 text-info">
+														<span className="text-[8px] opacity-60">IN:</span>
+														<span className="whitespace-nowrap font-bold">
+															{formatBytes(stream.download_speed)}/s
 														</span>
-														{stream.bytes_per_second < 512 * 1024 && (
+														{stream.download_speed > 0 && stream.download_speed < 1024 * 1024 && (
 															<div className="badge badge-warning badge-xs h-3 px-1 text-[8px]">
 																SLOW
 															</div>
 														)}
 													</div>
+
+													<span className="opacity-20">|</span>
+
+													{/* Playback (Output) Speed */}
+													<div className="flex items-center gap-1 text-success">
+														<span className="text-[8px] opacity-60">OUT:</span>
+														<span className="whitespace-nowrap font-bold">
+															{formatBytes(stream.bytes_per_second)}/s
+														</span>
+													</div>
+												</div>
+
+												{/* ETA */}
+												{stream.eta > 0 && (
+													<span className="whitespace-nowrap text-[9px] opacity-60">
+														ETA: {formatDuration(stream.eta)}
+													</span>
 												)}
 											</div>
 										</div>

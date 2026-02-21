@@ -20,6 +20,7 @@ import (
 	"github.com/javi11/altmount/internal/arrs"
 	"github.com/javi11/altmount/internal/config"
 	"github.com/javi11/altmount/internal/database"
+	"github.com/javi11/altmount/internal/pathutil"
 )
 
 // getDefaultCategory returns the Default category from config or a fallback
@@ -745,8 +746,12 @@ func (s *Server) handleSABnzbdStatus(c *fiber.Ctx) error {
 	}
 
 	// Get actual disk space for storage directory
-	tempDir := filepath.Join(os.TempDir(), "altmount-uploads")
-	diskFree, diskTotal := getDiskSpace(tempDir)
+	cfg := s.configManager.GetConfig()
+	targetPath := cfg.MountPath
+	if targetPath == "" {
+		targetPath = filepath.Join(os.TempDir(), "altmount-uploads")
+	}
+	diskFree, diskTotal := getDiskSpace(targetPath)
 
 	response := SABnzbdStatusResponse{
 		Status:          true,
@@ -793,7 +798,7 @@ func (s *Server) handleSABnzbdGetConfig(c *fiber.Ctx) error {
 		// Build misc configuration
 		itemBasePath := s.calculateItemBasePath()
 		sabnzbdConfig.Misc = SABnzbdMiscConfig{
-			CompleteDir:            itemBasePath,
+			CompleteDir:            pathutil.JoinAbsPath(itemBasePath, cfg.SABnzbd.CompleteDir),
 			PreCheck:               0,
 			HistoryRetention:       "",
 			HistoryRetentionOption: "all",
@@ -965,7 +970,7 @@ func (s *Server) validateSABnzbdCategory(category string) (string, error) {
 }
 
 // writeSABnzbdResponseFiber writes a successful SABnzbd-compatible response (Fiber version)
-func (s *Server) writeSABnzbdResponseFiber(c *fiber.Ctx, data interface{}) error {
+func (s *Server) writeSABnzbdResponseFiber(c *fiber.Ctx, data any) error {
 	return c.Status(200).JSON(data)
 }
 

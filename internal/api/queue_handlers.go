@@ -295,6 +295,36 @@ func (s *Server) handleGetQueueStats(c *fiber.Ctx) error {
 	return RespondSuccess(c, response)
 }
 
+// handleGetQueueHistoricalStats handles GET /api/queue/stats/history
+func (s *Server) handleGetQueueHistoricalStats(c *fiber.Ctx) error {
+	// Get optional days parameter, default to 1 (24h)
+	days := 1
+	if daysStr := c.Query("days"); daysStr != "" {
+		if d, err := strconv.Atoi(daysStr); err == nil && d > 0 {
+			days = d
+		}
+	}
+
+	// Limit to max 365 days for performance
+	if days > 365 {
+		days = 365
+	}
+
+	dailyStats, err := s.queueRepo.GetImportDailyStats(c.Context(), days)
+	if err != nil {
+		return RespondInternalError(c, "Failed to retrieve queue historical statistics", err.Error())
+	}
+
+	// For 24h view, we want more granular hourly stats for strict rolling window
+	var hourlyStats []*database.ImportHourlyStat
+	if days == 1 {
+		hourlyStats, _ = s.queueRepo.GetImportHourlyStats(c.Context(), 24)
+	}
+
+	response := ToQueueHistoricalStatsResponse(dailyStats, hourlyStats)
+	return RespondSuccess(c, response)
+}
+
 // handleClearCompletedQueue handles DELETE /api/queue/completed
 func (s *Server) handleClearCompletedQueue(c *fiber.Ctx) error {
 	// Clear completed items

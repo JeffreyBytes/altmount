@@ -1,6 +1,7 @@
 package nzbfilesystem
 
 import (
+	"context"
 	"io"
 	"sync"
 	"testing"
@@ -360,6 +361,16 @@ func (m *mockPoolManager) GetMetrics() (pool.MetricsSnapshot, error) {
 	return pool.MetricsSnapshot{}, nil
 }
 
+func (m *mockPoolManager) ResetMetrics(_ context.Context) error {
+	return nil
+}
+
+func (m *mockPoolManager) IncArticlesDownloaded() {}
+
+func (m *mockPoolManager) UpdateDownloadProgress(_ string, _ int64) {}
+
+func (m *mockPoolManager) IncArticlesPosted() {}
+
 func (m *mockPoolManager) AddProvider(_ nntppool.Provider) error {
 	return nil
 }
@@ -591,11 +602,11 @@ func TestConcurrentSegmentIndexAccess(t *testing.T) {
 
 	// Run concurrent lookups
 	var wg sync.WaitGroup
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		wg.Add(1)
 		go func(offset int64) {
 			defer wg.Done()
-			for j := 0; j < 100; j++ {
+			for range 100 {
 				_ = idx.findSegmentForOffset(offset % 3000)
 			}
 		}(int64(i * 30))

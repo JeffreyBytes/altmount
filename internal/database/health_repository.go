@@ -488,7 +488,7 @@ func (r *HealthRepository) CleanupHealthRecords(ctx context.Context, existingFil
 
 	// Create placeholders for IN clause
 	placeholders := make([]string, len(existingFiles))
-	args := make([]interface{}, len(existingFiles))
+	args := make([]any, len(existingFiles))
 	for i, file := range existingFiles {
 		placeholders[i] = "?"
 		args[i] = file
@@ -544,7 +544,7 @@ func (r *HealthRepository) AddFileToHealthCheck(ctx context.Context, filePath st
 
 // AddFileToHealthCheckWithMetadata adds a file to the health database for checking with metadata
 func (r *HealthRepository) AddFileToHealthCheckWithMetadata(ctx context.Context, filePath string, maxRetries int, sourceNzbPath *string, priority HealthPriority, releaseDate *time.Time) error {
-	var releaseDateStr interface{} = nil
+	var releaseDateStr any = nil
 	if releaseDate != nil {
 		releaseDateStr = releaseDate.UTC().Format("2006-01-02 15:04:05")
 	}
@@ -613,12 +613,12 @@ func (r *HealthRepository) ListHealthItems(ctx context.Context, statusFilter *He
 	`, orderClause)
 
 	// Prepare arguments for the query
-	var statusParam interface{} = nil
+	var statusParam any = nil
 	if statusFilter != nil {
 		statusParam = string(*statusFilter)
 	}
 
-	var sinceParam interface{} = nil
+	var sinceParam any = nil
 	if sinceFilter != nil {
 		sinceParam = sinceFilter.Format("2006-01-02 15:04:05")
 	}
@@ -626,7 +626,7 @@ func (r *HealthRepository) ListHealthItems(ctx context.Context, statusFilter *He
 	// Prepare search parameter with wildcards
 	searchPattern := "%" + search + "%"
 
-	args := []interface{}{
+	args := []any{
 		statusParam, statusParam, // status filter (checked twice in WHERE clause)
 		sinceParam, sinceParam, // since filter (checked twice in WHERE clause)
 		search, searchPattern, searchPattern, // search filter (file_path and source_nzb_path)
@@ -674,12 +674,12 @@ func (r *HealthRepository) CountHealthItems(ctx context.Context, statusFilter *H
 	`
 
 	// Prepare arguments for the query
-	var statusParam interface{} = nil
+	var statusParam any = nil
 	if statusFilter != nil {
 		statusParam = string(*statusFilter)
 	}
 
-	var sinceParam interface{} = nil
+	var sinceParam any = nil
 	if sinceFilter != nil {
 		sinceParam = sinceFilter.Format("2006-01-02 15:04:05")
 	}
@@ -687,7 +687,7 @@ func (r *HealthRepository) CountHealthItems(ctx context.Context, statusFilter *H
 	// Prepare search parameter with wildcards
 	searchPattern := "%" + search + "%"
 
-	args := []interface{}{
+	args := []any{
 		statusParam, statusParam, // status filter (checked twice in WHERE clause)
 		sinceParam, sinceParam, // since filter (checked twice in WHERE clause)
 		search, searchPattern, searchPattern, // search filter (file_path and source_nzb_path)
@@ -744,7 +744,7 @@ func (r *HealthRepository) DeleteHealthRecordsBulk(ctx context.Context, filePath
 
 	// Build placeholders for the IN clause
 	placeholders := make([]string, len(filePaths))
-	args := make([]interface{}, len(filePaths))
+	args := make([]any, len(filePaths))
 	for i, path := range filePaths {
 		placeholders[i] = "?"
 		args[i] = strings.TrimPrefix(path, "/")
@@ -777,7 +777,7 @@ func (r *HealthRepository) ResetHealthChecksBulk(ctx context.Context, filePaths 
 
 	// Build placeholders for the IN clause
 	placeholders := make([]string, len(filePaths))
-	args := make([]interface{}, len(filePaths))
+	args := make([]any, len(filePaths))
 	for i, path := range filePaths {
 		placeholders[i] = "?"
 		args[i] = path
@@ -843,12 +843,12 @@ func (r *HealthRepository) DeleteHealthRecordsByDate(ctx context.Context, olderT
 	`
 
 	// Prepare arguments for the query
-	var statusParam interface{} = nil
+	var statusParam any = nil
 	if statusFilter != nil {
 		statusParam = string(*statusFilter)
 	}
 
-	args := []interface{}{
+	args := []any{
 		olderThan.Format("2006-01-02 15:04:05"),
 		statusParam, statusParam, // status filter (checked twice in WHERE clause)
 	}
@@ -1235,10 +1235,7 @@ func (r *HealthRepository) BatchAddAutomaticHealthChecks(ctx context.Context, re
 	const batchSize = 150
 
 	for i := 0; i < len(records); i += batchSize {
-		end := i + batchSize
-		if end > len(records) {
-			end = len(records)
-		}
+		end := min(i+batchSize, len(records))
 
 		batch := records[i:end]
 		if err := r.batchInsertAutomaticHealthChecks(ctx, batch); err != nil {
@@ -1257,11 +1254,11 @@ func (r *HealthRepository) batchInsertAutomaticHealthChecks(ctx context.Context,
 
 	// Build the INSERT query with multiple value sets
 	valueStrings := make([]string, len(records))
-	args := make([]interface{}, 0, len(records)*5)
+	args := make([]any, 0, len(records)*5)
 
 	for i, record := range records {
 		valueStrings[i] = "(?, ?, ?, datetime('now'), 0, 2, 0, 3, ?, ?, ?, datetime('now'), datetime('now'))"
-		var releaseDateStr, scheduledCheckAtStr interface{} = nil, nil
+		var releaseDateStr, scheduledCheckAtStr any = nil, nil
 		if record.ReleaseDate != nil {
 			releaseDateStr = record.ReleaseDate.UTC().Format("2006-01-02 15:04:05")
 		}
@@ -1401,5 +1398,92 @@ func (r *HealthRepository) UpdateLibraryPath(ctx context.Context, filePath strin
 		return fmt.Errorf("no health record found to update: %s", filePath)
 	}
 
+	return nil
+}
+
+// RenameHealthRecord updates the file_path of a health record or records under a directory after a MOVE operation
+func (r *HealthRepository) RenameHealthRecord(ctx context.Context, oldPath, newPath string) error {
+	oldPath = strings.TrimPrefix(oldPath, "/")
+	newPath = strings.TrimPrefix(newPath, "/")
+
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// 1. Rename exact match
+	_, err = tx.ExecContext(ctx, "UPDATE file_health SET file_path = ?, updated_at = datetime('now') WHERE file_path = ?", newPath, oldPath)
+	if err != nil {
+		return err
+	}
+
+	// 2. Rename children if it's a directory
+	oldPrefix := oldPath + "/"
+	newPrefix := newPath + "/"
+	_, err = tx.ExecContext(ctx, `
+		UPDATE file_health 
+		SET file_path = ? || substr(file_path, ?),
+		    updated_at = datetime('now')
+		WHERE file_path LIKE ?`,
+		newPrefix, len(oldPrefix)+1, oldPrefix+"%")
+	if err != nil {
+		return err
+	}
+
+	return tx.Commit()
+}
+
+// RelinkFileByFilename updates the file_path and library_path for a corrupted/triggered record that matches by filename
+func (r *HealthRepository) RelinkFileByFilename(ctx context.Context, filename, filePath, libraryPath string) error {
+	filePath = strings.TrimPrefix(filePath, "/")
+	libraryPath = strings.TrimPrefix(libraryPath, "/")
+	query := `
+		UPDATE file_health
+		SET file_path = ?,
+		    library_path = ?,
+		    status = 'pending',
+		    updated_at = datetime('now'),
+		    scheduled_check_at = datetime('now')
+		WHERE (file_path LIKE ? OR file_path = ?)
+		  AND status IN ('repair_triggered', 'corrupted')
+	`
+
+	likePattern := "%/" + filename
+	_, err := r.db.ExecContext(ctx, query, filePath, libraryPath, likePattern, filename)
+	if err != nil {
+		return fmt.Errorf("failed to relink file by filename: %w", err)
+	}
+
+	return nil
+}
+
+// GetSystemState retrieves a persistent state value
+func (r *HealthRepository) GetSystemState(ctx context.Context, key string) (string, error) {
+	query := `SELECT value FROM system_state WHERE key = ?`
+	var value string
+	err := r.db.QueryRowContext(ctx, query, key).Scan(&value)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return "", nil
+		}
+		return "", fmt.Errorf("failed to get system state: %w", err)
+	}
+	return value, nil
+}
+
+// UpdateSystemState updates or inserts a persistent state value
+func (r *HealthRepository) UpdateSystemState(ctx context.Context, key string, value string) error {
+	query := `
+		INSERT INTO system_state (key, value, updated_at)
+		VALUES (?, ?, datetime('now'))
+		ON CONFLICT(key) DO UPDATE SET
+		value = excluded.value,
+		updated_at = datetime('now')
+	`
+	_, err := r.db.ExecContext(ctx, query, key, value)
+	if err != nil {
+		return fmt.Errorf("failed to update system state: %w", err)
+	}
 	return nil
 }

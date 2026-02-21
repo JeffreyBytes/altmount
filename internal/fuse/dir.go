@@ -9,7 +9,6 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
-	"github.com/javi11/altmount/internal/fuse/vfs"
 	"github.com/javi11/altmount/internal/nzbfilesystem"
 )
 
@@ -20,30 +19,40 @@ var _ fs.NodeLookuper = (*Dir)(nil)
 var _ fs.NodeGetattrer = (*Dir)(nil)
 var _ fs.NodeRenamer = (*Dir)(nil)
 var _ fs.NodeSetattrer = (*Dir)(nil)
+var _ fs.NodeStatfser = (*Dir)(nil)
+var _ fs.NodeMkdirer = (*Dir)(nil)
+var _ fs.NodeUnlinker = (*Dir)(nil)
+var _ fs.NodeRmdirer = (*Dir)(nil)
 
 // Dir represents a directory in the FUSE filesystem.
 // Talks directly to NzbFilesystem with FUSE context propagation.
 type Dir struct {
 	fs.Inode
-	nzbfs     *nzbfilesystem.NzbFilesystem
-	vfsm      *vfs.Manager // VFS disk cache manager (nil if disabled)
-	path      string
-	logger    *slog.Logger
-	isRootDir bool
-	uid       uint32
-	gid       uint32
+	nzbfs         *nzbfilesystem.NzbFilesystem
+	streamTracker StreamTracker
+	path          string
+	logger        *slog.Logger
+	isRootDir     bool
+	uid           uint32
+	gid           uint32
 }
 
 // NewDir creates a new root directory node for the FUSE filesystem.
-func NewDir(nzbfs *nzbfilesystem.NzbFilesystem, path string, logger *slog.Logger, uid, gid uint32, vfsm *vfs.Manager) *Dir {
+func NewDir(
+	nzbfs *nzbfilesystem.NzbFilesystem,
+	path string,
+	logger *slog.Logger,
+	uid, gid uint32,
+	st StreamTracker,
+) *Dir {
 	return &Dir{
-		nzbfs:     nzbfs,
-		vfsm:      vfsm,
-		path:      path,
-		logger:    logger,
-		isRootDir: path == "" || path == "/",
-		uid:       uid,
-		gid:       gid,
+		nzbfs:         nzbfs,
+		streamTracker: st,
+		path:          path,
+		logger:        logger,
+		isRootDir:     path == "" || path == "/",
+		uid:           uid,
+		gid:           gid,
 	}
 }
 
@@ -81,6 +90,52 @@ func (d *Dir) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetAttrIn, 
 	return d.Getattr(ctx, f, out)
 }
 
+// Statfs implements fs.NodeStatfser.
+func (d *Dir) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {
+	// Provide dummy values so 'df' works correctly.
+	// We report a 1PB filesystem.
+	const totalSize = 1024 * 1024 * 1024 * 1024 * 1024 // 1PB
+	const blockSize = 4096
+
+	out.Blocks = totalSize / blockSize
+	out.Bfree = out.Blocks
+	out.Bavail = out.Blocks
+	out.Bsize = blockSize
+	out.NameLen = 255
+	out.Frsize = blockSize
+
+	return 0
+}
+
+// Mkdir implements fs.NodeMkdirer.
+func (d *Dir) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	fullPath := filepath.Join(d.path, name)
+
+	if err := d.nzbfs.Mkdir(ctx, fullPath, os.FileMode(mode)); err != nil {
+		d.logger.ErrorContext(ctx, "Mkdir failed", "path", fullPath, "error", err)
+		return nil, syscall.EIO
+	}
+
+	info, err := d.nzbfs.Stat(ctx, fullPath)
+	if err != nil {
+		d.logger.ErrorContext(ctx, "Mkdir stat failed", "path", fullPath, "error", err)
+		return nil, syscall.EIO
+	}
+
+	fillAttr(info, &out.Attr, d.uid, d.gid)
+
+	node := &Dir{
+		nzbfs:         d.nzbfs,
+		streamTracker: d.streamTracker,
+		path:          fullPath,
+		logger:        d.logger,
+		uid:           d.uid,
+		gid:           d.gid,
+	}
+
+	return d.NewInode(ctx, node, fs.StableAttr{Mode: fuse.S_IFDIR}), 0
+}
+
 // Lookup implements fs.NodeLookuper.
 func (d *Dir) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
 	fullPath := filepath.Join(d.path, name)
@@ -98,24 +153,24 @@ func (d *Dir) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.
 
 	if info.IsDir() {
 		node := &Dir{
-			nzbfs:  d.nzbfs,
-			vfsm:   d.vfsm,
-			path:   fullPath,
-			logger: d.logger,
-			uid:    d.uid,
-			gid:    d.gid,
+			nzbfs:         d.nzbfs,
+			streamTracker: d.streamTracker,
+			path:          fullPath,
+			logger:        d.logger,
+			uid:           d.uid,
+			gid:           d.gid,
 		}
 		return d.NewInode(ctx, node, fs.StableAttr{Mode: fuse.S_IFDIR}), 0
 	}
 
 	node := &File{
-		nzbfs:  d.nzbfs,
-		vfsm:   d.vfsm,
-		path:   fullPath,
-		logger: d.logger,
-		size:   info.Size(),
-		uid:    d.uid,
-		gid:    d.gid,
+		nzbfs:         d.nzbfs,
+		streamTracker: d.streamTracker,
+		path:          fullPath,
+		logger:        d.logger,
+		size:          info.Size(),
+		uid:           d.uid,
+		gid:           d.gid,
 	}
 	return d.NewInode(ctx, node, fs.StableAttr{Mode: fuse.S_IFREG}), 0
 }
@@ -131,14 +186,49 @@ func (d *Dir) Rename(ctx context.Context, oldName string, newParent fs.InodeEmbe
 	newPath := filepath.Join(targetDir.path, newName)
 
 	if err := d.nzbfs.Rename(ctx, oldPath, newPath); err != nil {
-		if os.IsNotExist(err) {
-			return syscall.ENOENT
-		}
-		d.logger.ErrorContext(ctx, "Rename failed", "old", oldPath, "new", newPath, "error", err)
-		return syscall.EIO
+		return mapError(err, d.logger, ctx, "Rename failed", "old", oldPath, "new", newPath)
 	}
 
 	return 0
+}
+
+// Unlink implements fs.NodeUnlinker — removes a file.
+func (d *Dir) Unlink(ctx context.Context, name string) syscall.Errno {
+	fullPath := filepath.Join(d.path, name)
+
+	if err := d.nzbfs.Remove(ctx, fullPath); err != nil {
+		return mapError(err, d.logger, ctx, "Unlink failed", "path", fullPath)
+	}
+
+	return 0
+}
+
+// Rmdir implements fs.NodeRmdirer — removes an empty directory.
+func (d *Dir) Rmdir(ctx context.Context, name string) syscall.Errno {
+	fullPath := filepath.Join(d.path, name)
+
+	if err := d.nzbfs.Remove(ctx, fullPath); err != nil {
+		return mapError(err, d.logger, ctx, "Rmdir failed", "path", fullPath)
+	}
+
+	return 0
+}
+
+// mapError maps os-level errors to FUSE errno values.
+func mapError(err error, logger *slog.Logger, ctx context.Context, msg string, args ...any) syscall.Errno {
+	if os.IsNotExist(err) {
+		return syscall.ENOENT
+	}
+	if os.IsPermission(err) {
+		return syscall.EACCES
+	}
+	if os.IsExist(err) {
+		return syscall.EEXIST
+	}
+	logArgs := append([]any{}, args...)
+	logArgs = append(logArgs, "error", err)
+	logger.ErrorContext(ctx, msg, logArgs...)
+	return syscall.EIO
 }
 
 // Readdir implements fs.NodeReaddirer.

@@ -2,7 +2,13 @@
 export interface APIResponse<T = unknown> {
 	success: boolean;
 	data?: T;
-	error?: string;
+	error?:
+		| string
+		| {
+				code: string;
+				message: string;
+				details: string;
+		  };
 	meta?: APIMeta;
 }
 
@@ -49,6 +55,16 @@ export interface ProgressUpdate {
 	percentage: number;
 }
 
+export interface ImportHistoryItem {
+	id: number;
+	nzb_name: string;
+	file_name: string;
+	virtual_path: string;
+	category?: string;
+	file_size: number;
+	completed_at: string;
+}
+
 export interface QueueStats {
 	total_queued: number;
 	total_processing: number;
@@ -56,6 +72,26 @@ export interface QueueStats {
 	total_failed: number;
 	avg_processing_time_ms: number;
 	last_updated: string;
+}
+
+export interface QueueHistoryRange {
+	completed: number;
+	failed: number;
+	percentage: number;
+}
+
+export interface DailyStat {
+	day: string;
+	completed: number;
+	failed: number;
+}
+
+export interface QueueHistoricalStatsResponse {
+	last_24_hours: QueueHistoryRange;
+	last_7_days: QueueHistoryRange;
+	last_30_days: QueueHistoryRange;
+	last_365_days: QueueHistoryRange;
+	daily: DailyStat[];
 }
 
 // NZBLNK upload types
@@ -339,6 +375,7 @@ export interface ProviderStatus {
 	last_successful_connect: string;
 	failure_reason: string;
 	current_speed_bytes_per_sec: number;
+	ping_ms: number;
 	last_speed_test_mbps: number;
 	last_speed_test_time?: string;
 	missing_count: number;
@@ -355,8 +392,10 @@ export interface ActiveStream {
 	client_ip?: string;
 	user_agent?: string;
 	bytes_sent: number;
+	bytes_downloaded: number;
 	current_offset: number;
 	bytes_per_second: number;
+	download_speed: number;
 	speed_avg: number;
 	total_size: number;
 	eta: number;
@@ -367,6 +406,7 @@ export interface ActiveStream {
 
 export interface PoolMetrics {
 	bytes_downloaded: number;
+	bytes_downloaded_24h: number;
 	bytes_uploaded: number;
 	articles_downloaded: number;
 	articles_posted: number;
@@ -409,4 +449,6 @@ export interface SystemBrowseResponse {
 export interface FuseStatus {
 	status: "stopped" | "starting" | "running" | "error";
 	path: string;
+	healthy?: boolean;
+	health_error?: string;
 }

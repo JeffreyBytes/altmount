@@ -78,9 +78,22 @@ func ValidateSegmentAvailability(
 				if errors.Is(err, ErrLimitReached) {
 					err = nil
 				}
+
+				if err == nil {
+					poolManager.IncArticlesDownloaded()
+					poolManager.UpdateDownloadProgress("", lw.read)
+					if !lw.hasData {
+						err = fmt.Errorf("segment with ID %s contains only zero bytes", seg.Id)
+					}
+				}
 			} else {
 				// Standard mode: only perform STAT command
 				_, err = usenetPool.Stat(checkCtx, seg.Id)
+				if err == nil {
+					poolManager.IncArticlesDownloaded()
+					// Small estimate for STAT command network traffic
+					poolManager.UpdateDownloadProgress("", 100)
+				}
 			}
 			if err != nil {
 				return fmt.Errorf("segment with ID %s unreachable: %w", seg.Id, err)
@@ -173,9 +186,21 @@ func ValidateSegmentAvailabilityDetailed(
 				if errors.Is(err, ErrLimitReached) {
 					err = nil
 				}
+
+				if err == nil {
+					poolManager.IncArticlesDownloaded()
+					poolManager.UpdateDownloadProgress("", lw.read)
+					if !lw.hasData {
+						err = fmt.Errorf("segment with ID %s contains only zero bytes", seg.Id)
+					}
+				}
 			} else {
 				// Standard mode: only perform STAT command
 				_, err = usenetPool.Stat(checkCtx, seg.Id)
+				if err == nil {
+					poolManager.IncArticlesDownloaded()
+					poolManager.UpdateDownloadProgress("", 100)
+				}
 			}
 			if err != nil {
 				atomic.AddInt32(&missingCount, 1)
@@ -213,12 +238,23 @@ func ValidateSegmentAvailabilityDetailed(
 }
 
 // limitedWriter is an io.Writer that stops after reaching a certain byte limit
+// and tracks if any non-zero bytes were seen.
 type limitedWriter struct {
-	limit int64
-	read  int64
+	limit   int64
+	read    int64
+	hasData bool
 }
 
 func (lw *limitedWriter) Write(p []byte) (n int, err error) {
+	if !lw.hasData {
+		for _, b := range p {
+			if b != 0 {
+				lw.hasData = true
+				break
+			}
+		}
+	}
+
 	canWrite := lw.limit - lw.read
 	if canWrite <= 0 {
 		return 0, ErrLimitReached
@@ -247,12 +283,9 @@ func selectSegmentsForValidation(segments []*metapb.SegmentData, samplePercentag
 	totalSegments := len(segments)
 
 	// Calculate target number of segments based on percentage
-	targetSamples := (totalSegments * samplePercentage) / 100
-
-	// Enforce minimum of 5 segments for statistical validity
-	if targetSamples < 5 {
-		targetSamples = 5
-	}
+	targetSamples := max(
+		// Enforce minimum of 5 segments for statistical validity
+		(totalSegments*samplePercentage)/100, 5)
 
 	// Optimization: Cap the number of samples for very large files to prevent
 	// excessive network I/O. 50 random samples + 5 fixed samples is plenty
@@ -269,10 +302,7 @@ func selectSegmentsForValidation(segments []*metapb.SegmentData, samplePercentag
 	var toValidate []*metapb.SegmentData
 
 	// 1. First 3 segments (DMCA/takedown detection)
-	firstCount := 3
-	if firstCount > totalSegments {
-		firstCount = totalSegments
-	}
+	firstCount := min(3, totalSegments)
 	for i := 0; i < firstCount; i++ {
 		toValidate = append(toValidate, segments[i])
 	}
@@ -296,11 +326,7 @@ func selectSegmentsForValidation(segments []*metapb.SegmentData, samplePercentag
 	if middleRange > 0 {
 		// Calculate how many middle segments we need to reach target
 		currentCount := len(toValidate)
-		randomSamples := targetSamples - currentCount
-
-		if randomSamples > middleRange {
-			randomSamples = middleRange
-		}
+		randomSamples := min(targetSamples-currentCount, middleRange)
 
 		if randomSamples > 0 {
 			// Random sampling without replacement from middle section

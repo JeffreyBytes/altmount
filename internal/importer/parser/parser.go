@@ -30,11 +30,11 @@ import (
 // FirstSegmentData holds cached data from the first segment of an NZB file
 // This avoids redundant fetching when both PAR2 extraction and file parsing need the same data
 type FirstSegmentData struct {
-	File                *nzbparser.NzbFile   // Reference to the NZB file (for groups, subject, metadata)
-	Headers             nntppool.YEncMeta    // yEnc headers (FileName, FileSize, PartSize)
-	RawBytes            []byte               // Up to 16KB of raw data for PAR2 detection (may be less if segment is smaller)
-	MissingFirstSegment bool                 // True if first segment download failed (article not found, etc.)
-	OriginalIndex       int                  // Original position in the parsed NZB file list
+	File                *nzbparser.NzbFile // Reference to the NZB file (for groups, subject, metadata)
+	Headers             nntppool.YEncMeta  // yEnc headers (FileName, FileSize, PartSize)
+	RawBytes            []byte             // Up to 16KB of raw data for PAR2 detection (may be less if segment is smaller)
+	MissingFirstSegment bool               // True if first segment download failed (article not found, etc.)
+	OriginalIndex       int                // Original position in the parsed NZB file list
 }
 
 // Parser handles NZB file parsing
@@ -229,6 +229,10 @@ func (p *Parser) ParseFile(ctx context.Context, r io.Reader, nzbPath string) (*P
 // Uses fileInfo for filename, size, and type information
 // firstSegmentSizeCache contains pre-fetched yEnc PartSize values for first segments to avoid redundant fetching
 func (p *Parser) parseFile(ctx context.Context, meta map[string]string, nzbFilename string, info *fileinfo.FileInfo, firstSegmentSizeCache map[string]int64) (*ParsedFile, error) {
+	if len(info.NzbFile.Segments) == 0 {
+		return nil, fmt.Errorf("file has no segments")
+	}
+
 	sort.Sort(info.NzbFile.Segments)
 
 	// Normalize segment sizes using yEnc PartSize headers if needed
@@ -301,23 +305,23 @@ func (p *Parser) parseFile(ctx context.Context, meta map[string]string, nzbFilen
 
 	// Extract extra metadata from subject if present (nzbdav compatibility)
 	if strings.HasPrefix(info.NzbFile.Subject, "NZBDAV_ID:") {
-		parts := strings.Split(info.NzbFile.Subject, " ")
-		for _, part := range parts {
-			if strings.HasPrefix(part, "NZBDAV_ID:") {
-				nzbdavID = strings.TrimPrefix(part, "NZBDAV_ID:")
-			} else if strings.HasPrefix(part, "AES_KEY:") {
-				keyStr := strings.TrimPrefix(part, "AES_KEY:")
+		parts := strings.SplitSeq(info.NzbFile.Subject, " ")
+		for part := range parts {
+			if after, ok := strings.CutPrefix(part, "NZBDAV_ID:"); ok {
+				nzbdavID = after
+			} else if after, ok := strings.CutPrefix(part, "AES_KEY:"); ok {
+				keyStr := after
 				if key, err := base64.StdEncoding.DecodeString(keyStr); err == nil {
 					aesKey = key
 					enc = metapb.Encryption_AES
 				}
-			} else if strings.HasPrefix(part, "AES_IV:") {
-				ivStr := strings.TrimPrefix(part, "AES_IV:")
+			} else if after, ok := strings.CutPrefix(part, "AES_IV:"); ok {
+				ivStr := after
 				if iv, err := base64.StdEncoding.DecodeString(ivStr); err == nil {
 					aesIv = iv
 				}
-			} else if strings.HasPrefix(part, "DECODED_SIZE:") {
-				if size, err := strconv.ParseInt(strings.TrimPrefix(part, "DECODED_SIZE:"), 10, 64); err == nil && size > 0 {
+			} else if after, ok := strings.CutPrefix(part, "DECODED_SIZE:"); ok {
+				if size, err := strconv.ParseInt(after, 10, 64); err == nil && size > 0 {
 					totalSize = size
 				}
 			}
@@ -465,6 +469,11 @@ func (p *Parser) fetchAllFirstSegments(ctx context.Context, files []nzbparser.Nz
 				}, nil
 			}
 
+			if p.poolManager != nil {
+				p.poolManager.IncArticlesDownloaded()
+				p.poolManager.UpdateDownloadProgress("", int64(len(result.Bytes)))
+			}
+
 			headers := result.YEnc
 
 			// Use decoded bytes from result (up to 16KB for PAR2 detection)
@@ -502,6 +511,11 @@ func (p *Parser) fetchAllFirstSegments(ctx context.Context, files []nzbparser.Nz
 							"segment_index", segIdx,
 							"error", err)
 						break // Stop trying, use what we have
+					}
+
+					if p.poolManager != nil {
+						p.poolManager.IncArticlesDownloaded()
+						p.poolManager.UpdateDownloadProgress("", int64(len(segResult.Bytes)))
 					}
 
 					// Copy remaining bytes needed from this segment
@@ -601,12 +615,24 @@ func (p *Parser) fetchYencHeaders(ctx context.Context, segment nzbparser.NzbSegm
 		if headers.PartSize <= 0 {
 			return nntppool.YEncMeta{}, errors.NewNonRetryableError("invalid part size from yenc header", nil)
 		}
+
+		if p.poolManager != nil {
+			p.poolManager.IncArticlesDownloaded()
+			p.poolManager.UpdateDownloadProgress("", int64(headers.PartSize))
+		}
+
 		return headers, nil
 	case result := <-resultCh:
 		// BodyAsync completed before onMeta fired — either error or non-yEnc article
 		if result.Err != nil {
 			return nntppool.YEncMeta{}, errors.NewNonRetryableError("failed to get body", result.Err)
 		}
+
+		if p.poolManager != nil {
+			p.poolManager.IncArticlesDownloaded()
+			p.poolManager.UpdateDownloadProgress("", int64(result.Body.YEnc.PartSize))
+		}
+
 		// onMeta didn't fire but body completed — use headers from result
 		headers := result.Body.YEnc
 		if headers.PartSize <= 0 {
@@ -622,16 +648,24 @@ func (p *Parser) fetchYencHeaders(ctx context.Context, segment nzbparser.NzbSegm
 // This handles cases where NZB segment sizes include yEnc overhead
 // cachedFirstSegmentSize is the pre-fetched PartSize for the first segment (guaranteed to be > 0)
 func (p *Parser) normalizeSegmentSizesWithYenc(ctx context.Context, segments []nzbparser.NzbSegment, cachedFirstSegmentSize int64) error {
+	firstPartSize := cachedFirstSegmentSize
+	if firstPartSize <= 0 {
+		// Fetch PartSize from first segment if not in cache
+		firstPartHeaders, err := p.fetchYencHeaders(ctx, segments[0], nil)
+		if err != nil {
+			return fmt.Errorf("failed to fetch first segment yEnc part size: %w", err)
+		}
+		firstPartSize = int64(firstPartHeaders.PartSize)
+	}
+
 	if len(segments) == 1 {
-		// Use cached first segment size (guaranteed to exist after filtering)
-		segments[0].Bytes = int(cachedFirstSegmentSize)
+		segments[0].Bytes = int(firstPartSize)
 		return nil
 	}
 
 	// Handle files with exactly 2 segments (first and last only)
 	if len(segments) == 2 {
-		// Use cached first segment size (guaranteed to exist after filtering)
-		segments[0].Bytes = int(cachedFirstSegmentSize)
+		segments[0].Bytes = int(firstPartSize)
 
 		// Fetch PartSize from last segment
 		lastPartHeaders, err := p.fetchYencHeaders(ctx, segments[1], nil)
@@ -642,9 +676,6 @@ func (p *Parser) normalizeSegmentSizesWithYenc(ctx context.Context, segments []n
 
 		return nil
 	}
-
-	// Use cached first segment size (guaranteed to exist after filtering)
-	firstPartSize := cachedFirstSegmentSize
 
 	// Fetch PartSize from second segment (this represents the "standard" segment size)
 	secondPartHeaders, err := p.fetchYencHeaders(ctx, segments[1], nil)
@@ -683,6 +714,11 @@ func (p *Parser) fallbackGetFileInfos(files []nzbparser.NzbFile) []*fileinfo.Fil
 	for i, file := range files {
 		// Basic PAR2 skip
 		if fileinfo.IsPar2File(file.Filename) {
+			continue
+		}
+
+		// Skip files without segments
+		if len(file.Segments) == 0 {
 			continue
 		}
 

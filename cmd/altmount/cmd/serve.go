@@ -63,7 +63,6 @@ func runServe(cmd *cobra.Command, args []string) error {
 	defer cancel()
 
 	configManager := config.NewManager(cfg, configFile)
-	poolManager := pool.NewManager(ctx)
 
 	// 3. Initialize core services
 	db, err := initializeDatabase(ctx, cfg)
@@ -76,6 +75,9 @@ func runServe(cmd *cobra.Command, args []string) error {
 			logger.Error("failed to close database", "err", err)
 		}
 	}()
+
+	repos := setupRepositories(ctx, db)
+	poolManager := pool.NewManager(ctx, repos.MainRepo)
 
 	metadataService, metadataReader := initializeMetadata(cfg)
 
@@ -98,7 +100,6 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}
 
 	// 5. Initialize importer and filesystem
-	repos := setupRepositories(ctx, db)
 
 	arrsService := arrs.NewService(configManager.GetConfigGetter(), configManager, repos.UserRepo)
 
@@ -107,7 +108,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	defer progressBroadcaster.Close()
 
 	// Create stream tracker for monitoring active streams
-	streamTracker := api.NewStreamTracker()
+	streamTracker := api.NewStreamTracker(poolManager)
 	defer streamTracker.Stop()
 
 	importerService, err := initializeImporter(ctx, cfg, metadataService, db, poolManager, rcloneRCClient, configManager.GetConfigGetter(), progressBroadcaster, repos.UserRepo, repos.HealthRepo)
@@ -124,7 +125,13 @@ func runServe(cmd *cobra.Command, args []string) error {
 		}
 	}()
 
-	fs := initializeFilesystem(ctx, metadataService, repos.HealthRepo, poolManager, configManager.GetConfigGetter(), streamTracker)
+	// Initialize segment cache (shared between FUSE and WebDAV)
+	segcacheMgr := initializeSegmentCache(ctx, cfg)
+	if segcacheMgr != nil {
+		defer segcacheMgr.Stop()
+	}
+
+	fs := initializeFilesystem(ctx, metadataService, repos.HealthRepo, poolManager, configManager.GetConfigGetter(), streamTracker, segcacheMgr)
 
 	// 6. Setup web services
 	app, debugMode := createFiberApp(ctx, cfg)
@@ -132,7 +139,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 
 	streamTracker.StartCleanup(ctx) // Periodic cleanup of stale streams
 
-	apiServer := setupAPIServer(app, repos, authService, configManager, metadataReader, metadataService, fs, poolManager, importerService, arrsService, mountService, progressBroadcaster, streamTracker)
+	apiServer := setupAPIServer(app, repos, authService, configManager, metadataReader, metadataService, fs, poolManager, importerService, arrsService, mountService, progressBroadcaster, streamTracker, segcacheMgr)
 
 	webdavHandler, err := setupWebDAV(cfg, fs, authService, repos.UserRepo, configManager, streamTracker)
 	if err != nil {
@@ -330,6 +337,7 @@ func setupSPARoutes(app *fiber.App) {
 	}
 
 	// Cli mode - use embedded filesystem
+	//nolint:staticcheck
 	buildFS, err := frontend.GetBuildFS()
 	if err != nil { //nolint:staticcheck
 		// Docker or development - serve static files with SPA fallback

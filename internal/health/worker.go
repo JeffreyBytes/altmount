@@ -15,6 +15,7 @@ import (
 	"github.com/javi11/altmount/internal/database"
 	"github.com/javi11/altmount/internal/metadata"
 	metapb "github.com/javi11/altmount/internal/metadata/proto"
+	"github.com/javi11/altmount/internal/pathutil"
 	"github.com/sourcegraph/conc"
 )
 
@@ -113,11 +114,9 @@ func (hw *HealthWorker) Start(ctx context.Context) error {
 	}
 
 	// Start the main worker goroutine
-	hw.wg.Add(1)
-	go func() {
-		defer hw.wg.Done()
+	hw.wg.Go(func() {
 		hw.run(ctx)
-	}()
+	})
 
 	hw.status = WorkerStatusRunning
 	hw.updateStats(func(s *WorkerStats) {
@@ -369,7 +368,7 @@ func (hw *HealthWorker) prepareUpdateForResult(ctx context.Context, fh *database
 			releaseDate = &fh.CreatedAt
 		}
 
-		nextCheck := CalculateNextCheck(*releaseDate, time.Now().UTC())
+		nextCheck := CalculateNextCheck(releaseDate.UTC(), time.Now().UTC())
 		update.Type = database.UpdateTypeHealthy
 		update.Status = database.HealthStatusHealthy
 		update.ScheduledCheckAt = nextCheck
@@ -671,7 +670,7 @@ func (hw *HealthWorker) runHealthCheckCycle(ctx context.Context) error {
 
 	// Build list of protected directories (categories and complete dir)
 	cfg := hw.configGetter()
-	protected := []string{"complete"} // Always protect 'complete'
+	protected := []string{"complete", "corrupted_metadata"} // Protect 'complete' and safety folder
 	if cfg.SABnzbd.CompleteDir != "" {
 		protected = append(protected, filepath.Base(cfg.SABnzbd.CompleteDir))
 	}
@@ -743,7 +742,7 @@ func (hw *HealthWorker) triggerFileRepair(ctx context.Context, item *database.Fi
 			// Continue with repair attempt if read failed (could be transient), but let's be careful
 		} else if meta == nil {
 			// Metadata is missing -> File is gone.
-			slog.WarnContext(ctx, "File metadata missing during repair trigger - file likely deleted/upgraded externally. Cleaning up zombie record.", 
+			slog.WarnContext(ctx, "File metadata missing during repair trigger - file likely deleted/upgraded externally. Cleaning up zombie record.",
 				"file_path", filePath)
 
 			if delErr := hw.healthRepo.DeleteHealthRecord(ctx, filePath); delErr != nil {
@@ -763,12 +762,23 @@ func (hw *HealthWorker) triggerFileRepair(ctx context.Context, item *database.Fi
 	if item.LibraryPath != nil && *item.LibraryPath != "" {
 		pathForRescan = *item.LibraryPath
 	} else if cfg.Import.ImportDir != nil && *cfg.Import.ImportDir != "" {
-		pathForRescan = filepath.Join(*cfg.Import.ImportDir, strings.TrimPrefix(filePath, "/"))
+		pathForRescan = pathutil.JoinAbsPath(*cfg.Import.ImportDir, filePath)
 	} else {
-		pathForRescan = filepath.Join(hw.configGetter().MountPath, strings.TrimPrefix(filePath, "/"))
+		pathForRescan = pathutil.JoinAbsPath(hw.configGetter().MountPath, filePath)
 	}
 
-	// Step 4: Trigger rescan through the ARR service
+	// Move the metadata file to corrupted folder locally so FUSE/WebDAV stops showing it.
+	// This ensures Sonarr/Radarr actually see the file as missing during their scan.
+	// We need the relative path for metadata move.
+	relativePath := strings.TrimPrefix(filePath, hw.configGetter().MountPath)
+	relativePath = strings.TrimPrefix(relativePath, "/")
+
+	slog.InfoContext(ctx, "Moving metadata file for corrupted item to safety folder to trigger replacement", "file_path", filePath)
+	if moveErr := hw.metadataService.MoveToCorrupted(ctx, relativePath); moveErr != nil {
+		slog.WarnContext(ctx, "Failed to move corrupted metadata file, proceeding with ARR trigger", "error", moveErr)
+	}
+
+	// Step 4: Trigger targeted rescan and search through the ARR service
 	err := hw.arrsService.TriggerFileRescan(ctx, pathForRescan, filePath)
 	if err != nil {
 		if errors.Is(err, arrs.ErrEpisodeAlreadySatisfied) {

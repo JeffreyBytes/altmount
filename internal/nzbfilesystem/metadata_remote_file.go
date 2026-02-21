@@ -20,6 +20,7 @@ import (
 	"github.com/javi11/altmount/internal/encryption/rclone"
 	"github.com/javi11/altmount/internal/metadata"
 	metapb "github.com/javi11/altmount/internal/metadata/proto"
+	"github.com/javi11/altmount/internal/pathutil"
 	"github.com/javi11/altmount/internal/pool"
 	"github.com/javi11/altmount/internal/usenet"
 	"github.com/javi11/altmount/internal/utils"
@@ -30,11 +31,12 @@ import (
 type MetadataRemoteFile struct {
 	metadataService  *metadata.MetadataService
 	healthRepository *database.HealthRepository
-	poolManager      pool.Manager        // Pool manager for dynamic pool access
-	configGetter     config.ConfigGetter // Dynamic config access
-	rcloneCipher     *rclone.RcloneCrypt // For rclone encryption/decryption
-	aesCipher        *aes.AesCipher      // For AES encryption/decryption
-	streamTracker    StreamTracker       // Stream tracker for monitoring active streams
+	poolManager      pool.Manager            // Pool manager for dynamic pool access
+	configGetter     config.ConfigGetter     // Dynamic config access
+	rcloneCipher     *rclone.RcloneCrypt     // For rclone encryption/decryption
+	aesCipher        *aes.AesCipher          // For AES encryption/decryption
+	streamTracker    StreamTracker           // Stream tracker for monitoring active streams
+	segmentStore     usenet.SegmentStore     // Optional segment cache (nil = disabled)
 }
 
 // Configuration is now accessed dynamically through config.ConfigGetter
@@ -47,6 +49,7 @@ func NewMetadataRemoteFile(
 	poolManager pool.Manager,
 	configGetter config.ConfigGetter,
 	streamTracker StreamTracker,
+	segmentStore usenet.SegmentStore,
 ) *MetadataRemoteFile {
 	// Initialize rclone cipher with global credentials for encrypted files
 	cfg := configGetter()
@@ -68,6 +71,7 @@ func NewMetadataRemoteFile(
 		rcloneCipher:     rcloneCipher,
 		aesCipher:        aesCipher,
 		streamTracker:    streamTracker,
+		segmentStore:     segmentStore,
 	}
 }
 
@@ -98,6 +102,12 @@ func (mrf *MetadataRemoteFile) OpenFile(ctx context.Context, name string) (bool,
 	showCorrupted := false
 	if sc, ok := ctx.Value(utils.ShowCorrupted).(bool); ok {
 		showCorrupted = sc
+	}
+
+	// Force showCorrupted if we are inside the corrupted_metadata folder
+	// normalizedName is clean and has no trailing slashes
+	if strings.HasPrefix(normalizedName, "corrupted_metadata/") || normalizedName == "corrupted_metadata" {
+		showCorrupted = true
 	}
 
 	// Check if this is a directory first
@@ -169,7 +179,10 @@ func (mrf *MetadataRemoteFile) OpenFile(ctx context.Context, name string) (bool,
 
 	// Start tracking stream if tracker available
 	streamID := ""
-	if mrf.streamTracker != nil {
+	if suppress, _ := ctx.Value(utils.SuppressStreamTrackingKey).(bool); suppress {
+		// Stream tracking handled at caller level (e.g. FUSE Handle)
+		streamID = ""
+	} else if mrf.streamTracker != nil {
 		// Check if we already have a stream ID in context
 		if id, ok := ctx.Value(utils.StreamIDKey).(string); ok && id != "" {
 			streamID = id
@@ -221,6 +234,7 @@ func (mrf *MetadataRemoteFile) OpenFile(ctx context.Context, name string) (bool,
 		streamTracker:    mrf.streamTracker,
 		streamID:         streamID,
 		segmentIndex:     segmentIndex,
+		segmentStore:     mrf.segmentStore,
 	}
 
 	return true, virtualFile, nil
@@ -257,12 +271,41 @@ func (mrf *MetadataRemoteFile) RemoveFile(ctx context.Context, fileName string) 
 		return false, nil
 	}
 
+	// Try to find the physical path from health record for cleanup
+	var physicalPath string
+	if mrf.healthRepository != nil {
+		if health, err := mrf.healthRepository.GetFileHealth(ctx, normalizedName); err == nil && health != nil {
+			if health.LibraryPath != nil && *health.LibraryPath != "" {
+				physicalPath = *health.LibraryPath
+			}
+		}
+	}
+
 	// Check if we should delete the source NZB file
 	cfg := mrf.configGetter()
 	deleteSourceNzb := cfg.Metadata.DeleteSourceNzbOnRemoval != nil && *cfg.Metadata.DeleteSourceNzbOnRemoval
 
 	// Use MetadataService's file delete operation with optional NZB deletion
-	return true, mrf.metadataService.DeleteFileMetadataWithSourceNzb(ctx, normalizedName, deleteSourceNzb)
+	err := mrf.metadataService.DeleteFileMetadataWithSourceNzb(ctx, normalizedName, deleteSourceNzb)
+	if err != nil {
+		return true, err
+	}
+
+	// Clean up empty physical directories if we found a physical path
+	if physicalPath != "" {
+		var rootPath string
+		if cfg.Health.LibraryDir != nil && *cfg.Health.LibraryDir != "" {
+			rootPath = *cfg.Health.LibraryDir
+		} else {
+			rootPath = cfg.MountPath
+		}
+
+		if rootPath != "" {
+			pathutil.RemoveEmptyDirs(rootPath, filepath.Dir(physicalPath))
+		}
+	}
+
+	return true, nil
 }
 
 // RenameFile renames a virtual file or directory in the metadata
@@ -291,6 +334,24 @@ func (mrf *MetadataRemoteFile) RenameFile(ctx context.Context, oldName, newName 
 		if err := os.Rename(oldDirPath, newDirPath); err != nil {
 			return false, fmt.Errorf("failed to rename directory: %w", err)
 		}
+
+		// Update health records for all files under the renamed directory
+		if mrf.healthRepository != nil {
+			if err := mrf.healthRepository.RenameHealthRecord(ctx, normalizedOld, normalizedNew); err != nil {
+				slog.WarnContext(ctx, "Failed to update health records for renamed directory", "old", normalizedOld, "new", normalizedNew, "error", err)
+			}
+		}
+
+		// Update ID symlinks for all files with NzbdavId under the renamed directory
+		_ = mrf.metadataService.WalkDirectoryFiles(normalizedNew, func(fileVirtualPath string, meta *metapb.FileMetadata) error {
+			if meta.NzbdavId != "" {
+				if err := mrf.metadataService.UpdateIDSymlink(meta.NzbdavId, fileVirtualPath); err != nil {
+					slog.WarnContext(ctx, "Failed to update ID symlink after directory rename", "id", meta.NzbdavId, "path", fileVirtualPath, "error", err)
+				}
+			}
+			return nil
+		})
+
 		return true, nil
 	}
 
@@ -301,30 +362,31 @@ func (mrf *MetadataRemoteFile) RenameFile(ctx context.Context, oldName, newName 
 		return false, nil
 	}
 
-	// Read existing metadata
+	// Read metadata first to get NzbdavId before rename
 	fileMeta, err := mrf.metadataService.ReadFileMetadata(normalizedOld)
 	if err != nil {
 		return false, fmt.Errorf("failed to read old metadata: %w", err)
 	}
 
-	// Write to new location
-	if err := mrf.metadataService.WriteFileMetadata(normalizedNew, fileMeta); err != nil {
-		return false, fmt.Errorf("failed to write new metadata: %w", err)
-	}
-
-	// Delete old location
-	cfg := mrf.configGetter()
-	deleteSourceNzb := cfg.Metadata.DeleteSourceNzbOnRemoval != nil && *cfg.Metadata.DeleteSourceNzbOnRemoval
-	if err := mrf.metadataService.DeleteFileMetadataWithSourceNzb(ctx, normalizedOld, deleteSourceNzb); err != nil {
-		return false, fmt.Errorf("failed to delete old metadata: %w", err)
+	// Use atomic rename instead of read-write-delete
+	if err := mrf.metadataService.RenameFileMetadata(normalizedOld, normalizedNew); err != nil {
+		return false, fmt.Errorf("failed to rename metadata: %w", err)
 	}
 
 	slog.InfoContext(ctx, "MOVE operation successful", "source", normalizedOld, "destination", normalizedNew)
 
-	// Clean up any health records for the new location and optionally for the directory
+	// Update ID symlink if file has a NzbdavId
+	if fileMeta != nil && fileMeta.NzbdavId != "" {
+		if err := mrf.metadataService.UpdateIDSymlink(fileMeta.NzbdavId, normalizedNew); err != nil {
+			slog.WarnContext(ctx, "Failed to update ID symlink during MOVE", "id", fileMeta.NzbdavId, "error", err)
+		}
+	}
+
+	// Update health records
 	if mrf.healthRepository != nil {
-		// Remove health record for the specific resulting file (the new one)
-		_ = mrf.healthRepository.DeleteHealthRecord(ctx, normalizedNew)
+		if err := mrf.healthRepository.RenameHealthRecord(ctx, normalizedOld, normalizedNew); err != nil {
+			slog.WarnContext(ctx, "Failed to update health record path during MOVE", "old", normalizedOld, "new", normalizedNew, "error", err)
+		}
 
 		// Check if we should resolve other repairs in the same directory
 		cfg := mrf.configGetter()
@@ -465,7 +527,7 @@ func (mfi *MetadataFileInfo) Size() int64        { return mfi.size }
 func (mfi *MetadataFileInfo) Mode() os.FileMode  { return mfi.mode }
 func (mfi *MetadataFileInfo) ModTime() time.Time { return mfi.modTime }
 func (mfi *MetadataFileInfo) IsDir() bool        { return mfi.isDir }
-func (mfi *MetadataFileInfo) Sys() interface{}   { return nil }
+func (mfi *MetadataFileInfo) Sys() any           { return nil }
 
 // MetadataSegmentLoader adapts metadata segments to the usenet.SegmentLoader interface
 type MetadataSegmentLoader struct {
@@ -652,6 +714,7 @@ type MetadataVirtualFile struct {
 	globalSalt       string
 	streamTracker    StreamTracker
 	streamID         string
+	segmentStore     usenet.SegmentStore // optional segment cache
 
 	// Reader state and position tracking
 	reader            io.ReadCloser
@@ -664,7 +727,8 @@ type MetadataVirtualFile struct {
 	// Segment offset index for O(1) offset→segment lookup
 	segmentIndex *segmentOffsetIndex
 
-	mu sync.Mutex
+	mu      sync.Mutex
+	closeWg sync.WaitGroup // tracks background reader closes during seek
 }
 
 // segmentOffsetIndex provides O(1) lookup for offset→segment mapping using binary search
@@ -791,6 +855,7 @@ func (mvf *MetadataVirtualFile) Read(p []byte) (n int, err error) {
 
 		if totalRead > 0 && mvf.streamTracker != nil && mvf.streamID != "" {
 			mvf.streamTracker.UpdateProgress(mvf.streamID, int64(totalRead))
+			mvf.streamTracker.UpdateCurrentOffset(mvf.streamID, mvf.position)
 
 			// Update buffered offset if available
 			if ur, ok := mvf.reader.(interface{ GetBufferedOffset() int64 }); ok {
@@ -852,8 +917,12 @@ func (mvf *MetadataVirtualFile) ReadAt(p []byte, off int64) (n int, err error) {
 	}
 	defer reader.Close()
 
-	// Read the requested data
-	n, err = io.ReadFull(reader, p[:end-off+1])
+	// Read the requested data using a context-aware wrapper.
+	// This ensures reads are cancelled if the FUSE context expires,
+	// even if the underlying reader blocks.
+	ctx := mvf.ctx
+	buf := p[:end-off+1]
+	n, err = readFullContext(ctx, reader, buf)
 	if err == io.ErrUnexpectedEOF {
 		// Partial read is acceptable for ReadAt at end of file
 		err = nil
@@ -973,6 +1042,9 @@ func (mvf *MetadataVirtualFile) Seek(offset int64, whence int) (int64, error) {
 	// on next read. This prevents stale range information from being reused after seek.
 	if abs != mvf.position {
 		mvf.originalRangeEnd = 0
+		if mvf.streamTracker != nil && mvf.streamID != "" {
+			mvf.streamTracker.UpdateCurrentOffset(mvf.streamID, abs)
+		}
 	}
 
 	mvf.position = abs
@@ -988,13 +1060,16 @@ func (mvf *MetadataVirtualFile) Close() error {
 	}
 
 	mvf.mu.Lock()
-	defer mvf.mu.Unlock()
 	if mvf.reader != nil {
-		err := mvf.reader.Close()
+		mvf.reader.Close()
 		mvf.reader = nil
 		mvf.readerInitialized = false
-		return err
 	}
+	mvf.mu.Unlock()
+
+	// Wait for any background reader closes from previous seeks
+	mvf.closeWg.Wait()
+
 	return nil
 }
 
@@ -1075,11 +1150,15 @@ func (mvf *MetadataVirtualFile) hasMoreDataToRead() bool {
 	return false
 }
 
-// closeCurrentReader closes the current reader and resets reader state
+// closeCurrentReader detaches the current reader and closes it in the background.
+// This avoids blocking Seek on UsenetReader.Close() which may wait for in-flight downloads.
 func (mvf *MetadataVirtualFile) closeCurrentReader() {
 	if mvf.reader != nil {
-		mvf.reader.Close()
+		reader := mvf.reader
 		mvf.reader = nil
+		mvf.closeWg.Go(func() {
+			reader.Close()
+		})
 	}
 	mvf.readerInitialized = false
 }
@@ -1205,7 +1284,7 @@ func (mvf *MetadataVirtualFile) createUsenetReader(ctx context.Context, start, e
 		}
 	}
 
-	return usenet.NewUsenetReader(ctx, mvf.poolManager.GetPool, rg, mvf.maxPrefetch)
+	return usenet.NewUsenetReader(ctx, mvf.poolManager.GetPool, rg, mvf.maxPrefetch, mvf.streamTracker, mvf.streamID, mvf.segmentStore)
 }
 
 // wrapWithEncryption wraps a usenet reader with encryption using metadata
@@ -1318,6 +1397,29 @@ func (mvf *MetadataVirtualFile) updateFileHealthOnError(dataCorruptionErr *usene
 		noRetry,
 	); err != nil {
 		slog.WarnContext(ctx, "Failed to update file health", "file", mvf.name, "error", err)
+	}
+}
+
+// readFullContext reads exactly len(buf) bytes from r, but returns early
+// if ctx is cancelled. This prevents io.ReadFull from blocking indefinitely
+// when the underlying reader is stuck (e.g., waiting for network data).
+func readFullContext(ctx context.Context, r io.Reader, buf []byte) (int, error) {
+	type result struct {
+		n   int
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		n, err := io.ReadFull(r, buf)
+		ch <- result{n, err}
+	}()
+	select {
+	case res := <-ch:
+		return res.n, res.err
+	case <-ctx.Done():
+		// Context cancelled — the goroutine will finish eventually when
+		// the reader is closed by the caller's defer reader.Close().
+		return 0, ctx.Err()
 	}
 }
 

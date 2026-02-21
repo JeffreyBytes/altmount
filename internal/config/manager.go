@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -21,24 +22,46 @@ const MountProvider = "altmount"
 const DefaultCategoryName = "Default"
 const DefaultCategoryDir = "complete"
 
+// MountType represents the active mount system
+type MountType string
+
+const (
+	MountTypeNone           MountType = "none"
+	MountTypeRClone         MountType = "rclone"
+	MountTypeFuse           MountType = "fuse"
+	MountTypeRCloneExternal MountType = "rclone_external"
+)
+
 // Config represents the complete application configuration
 type Config struct {
-	WebDAV          WebDAVConfig     `yaml:"webdav" mapstructure:"webdav" json:"webdav"`
-	API             APIConfig        `yaml:"api" mapstructure:"api" json:"api"`
-	Auth            AuthConfig       `yaml:"auth" mapstructure:"auth" json:"auth"`
-	Database        DatabaseConfig   `yaml:"database" mapstructure:"database" json:"database"`
-	Metadata        MetadataConfig   `yaml:"metadata" mapstructure:"metadata" json:"metadata"`
-	Streaming       StreamingConfig  `yaml:"streaming" mapstructure:"streaming" json:"streaming"`
-	Health          HealthConfig     `yaml:"health" mapstructure:"health" json:"health,omitempty"`
-	RClone          RCloneConfig     `yaml:"rclone" mapstructure:"rclone" json:"rclone"`
-	Import          ImportConfig     `yaml:"import" mapstructure:"import" json:"import"`
-	Log             LogConfig        `yaml:"log" mapstructure:"log" json:"log,omitempty"`
-	SABnzbd         SABnzbdConfig    `yaml:"sabnzbd" mapstructure:"sabnzbd" json:"sabnzbd"`
-	Arrs            ArrsConfig       `yaml:"arrs" mapstructure:"arrs" json:"arrs"`
-	Fuse            FuseConfig       `yaml:"fuse" mapstructure:"fuse" json:"fuse"`
-	Providers       []ProviderConfig `yaml:"providers" mapstructure:"providers" json:"providers"`
-	MountPath       string           `yaml:"mount_path" mapstructure:"mount_path" json:"mount_path"` // WebDAV mount path
-	ProfilerEnabled bool             `yaml:"profiler_enabled" mapstructure:"profiler_enabled" json:"profiler_enabled" default:"false"`
+	WebDAV          WebDAVConfig        `yaml:"webdav" mapstructure:"webdav" json:"webdav"`
+	API             APIConfig           `yaml:"api" mapstructure:"api" json:"api"`
+	Auth            AuthConfig          `yaml:"auth" mapstructure:"auth" json:"auth"`
+	Database        DatabaseConfig      `yaml:"database" mapstructure:"database" json:"database"`
+	Metadata        MetadataConfig      `yaml:"metadata" mapstructure:"metadata" json:"metadata"`
+	Streaming       StreamingConfig     `yaml:"streaming" mapstructure:"streaming" json:"streaming"`
+	Health          HealthConfig        `yaml:"health" mapstructure:"health" json:"health"`
+	RClone          RCloneConfig        `yaml:"rclone" mapstructure:"rclone" json:"rclone"`
+	Import          ImportConfig        `yaml:"import" mapstructure:"import" json:"import"`
+	Log             LogConfig           `yaml:"log" mapstructure:"log" json:"log"`
+	SABnzbd         SABnzbdConfig       `yaml:"sabnzbd" mapstructure:"sabnzbd" json:"sabnzbd"`
+	Arrs            ArrsConfig          `yaml:"arrs" mapstructure:"arrs" json:"arrs"`
+	Fuse            FuseConfig          `yaml:"fuse" mapstructure:"fuse" json:"fuse"`
+	SegmentCache    SegmentCacheConfig  `yaml:"segment_cache" mapstructure:"segment_cache" json:"segment_cache"`
+	Providers       []ProviderConfig    `yaml:"providers" mapstructure:"providers" json:"providers"`
+	MountPath       string              `yaml:"mount_path" mapstructure:"mount_path" json:"mount_path"`
+	MountType       MountType           `yaml:"mount_type" mapstructure:"mount_type" json:"mount_type"`
+	ProfilerEnabled bool                `yaml:"profiler_enabled" mapstructure:"profiler_enabled" json:"profiler_enabled" default:"false"`
+}
+
+// SegmentCacheConfig configures the segment-aligned disk cache shared by FUSE and WebDAV.
+// When enabled, this cache replaces the FUSE VFS disk cache and additionally benefits WebDAV.
+// Cache key: Usenet message ID. Cache unit: ~750KB decoded segment (matches one NNTP article).
+type SegmentCacheConfig struct {
+	Enabled     *bool  `yaml:"enabled" mapstructure:"enabled" json:"enabled"`
+	CachePath   string `yaml:"cache_path" mapstructure:"cache_path" json:"cache_path"`
+	MaxSizeGB   int    `yaml:"max_size_gb" mapstructure:"max_size_gb" json:"max_size_gb"`
+	ExpiryHours int    `yaml:"expiry_hours" mapstructure:"expiry_hours" json:"expiry_hours"`
 }
 
 // WebDAVConfig represents WebDAV server configuration
@@ -59,14 +82,6 @@ type FuseConfig struct {
 	EntryTimeoutSeconds int    `yaml:"entry_timeout_seconds" mapstructure:"entry_timeout_seconds" json:"entry_timeout_seconds"`
 	MaxCacheSizeMB      int    `yaml:"max_cache_size_mb" mapstructure:"max_cache_size_mb" json:"max_cache_size_mb"`
 	MaxReadAheadMB      int    `yaml:"max_read_ahead_mb" mapstructure:"max_read_ahead_mb" json:"max_read_ahead_mb"`
-
-	// VFS disk cache configuration
-	DiskCacheEnabled   *bool  `yaml:"disk_cache_enabled" mapstructure:"disk_cache_enabled" json:"disk_cache_enabled"`
-	DiskCachePath      string `yaml:"disk_cache_path" mapstructure:"disk_cache_path" json:"disk_cache_path"`
-	DiskCacheMaxSizeGB int    `yaml:"disk_cache_max_size_gb" mapstructure:"disk_cache_max_size_gb" json:"disk_cache_max_size_gb"`
-	DiskCacheExpiryH   int    `yaml:"disk_cache_expiry_hours" mapstructure:"disk_cache_expiry_hours" json:"disk_cache_expiry_hours"`
-	ChunkSizeMB        int    `yaml:"chunk_size_mb" mapstructure:"chunk_size_mb" json:"chunk_size_mb"`
-	ReadAheadChunks    int    `yaml:"read_ahead_chunks" mapstructure:"read_ahead_chunks" json:"read_ahead_chunks"`
 }
 
 // APIConfig represents REST API configuration
@@ -213,6 +228,8 @@ type HealthConfig struct {
 	LibrarySyncConcurrency        int     `yaml:"library_sync_concurrency" mapstructure:"library_sync_concurrency" json:"library_sync_concurrency,omitempty"`
 	ResolveRepairOnImport         *bool   `yaml:"resolve_repair_on_import" mapstructure:"resolve_repair_on_import" json:"resolve_repair_on_import,omitempty"`
 	VerifyData                    *bool   `yaml:"verify_data" mapstructure:"verify_data" json:"verify_data,omitempty"`
+	CheckAllSegments              *bool   `yaml:"check_all_segments" mapstructure:"check_all_segments" json:"check_all_segments,omitempty"`
+	AcceptableMissingSegmentsPercentage float64 `yaml:"acceptable_missing_segments_percentage" mapstructure:"acceptable_missing_segments_percentage" json:"acceptable_missing_segments_percentage,omitempty"`
 }
 
 // GenerateProviderID creates a unique ID based on host, port, and username
@@ -238,6 +255,7 @@ type ProviderConfig struct {
 	ProxyURL          string     `yaml:"proxy_url" mapstructure:"proxy_url" json:"proxy_url,omitempty"`
 	Enabled           *bool      `yaml:"enabled" mapstructure:"enabled" json:"enabled,omitempty"`
 	IsBackupProvider  *bool      `yaml:"is_backup_provider" mapstructure:"is_backup_provider" json:"is_backup_provider,omitempty"`
+	LastRTTMs         int64      `yaml:"last_rtt_ms" mapstructure:"last_rtt_ms" json:"last_rtt_ms,omitempty"`
 	LastSpeedTestMbps float64    `yaml:"last_speed_test_mbps" mapstructure:"last_speed_test_mbps" json:"last_speed_test_mbps,omitempty"`
 	LastSpeedTestTime *time.Time `yaml:"last_speed_test_time" mapstructure:"last_speed_test_time" json:"last_speed_test_time,omitempty"`
 }
@@ -380,13 +398,7 @@ func (c *Config) Validate() error {
 	// Validate log level (both old and new config)
 	if c.Log.Level != "" {
 		validLevels := []string{"debug", "info", "warn", "error"}
-		isValid := false
-		for _, level := range validLevels {
-			if c.Log.Level == level {
-				isValid = true
-				break
-			}
-		}
+		isValid := slices.Contains(validLevels, c.Log.Level)
 		if !isValid {
 			return fmt.Errorf("log_level must be one of: debug, info, warn, error")
 		}
@@ -395,13 +407,7 @@ func (c *Config) Validate() error {
 	// Validate log configuration
 	if c.Log.Level != "" {
 		validLevels := []string{"debug", "info", "warn", "error"}
-		isValid := false
-		for _, level := range validLevels {
-			if c.Log.Level == level {
-				isValid = true
-				break
-			}
-		}
+		isValid := slices.Contains(validLevels, c.Log.Level)
 		if !isValid {
 			return fmt.Errorf("log.level must be one of: debug, info, warn, error")
 		}
@@ -483,23 +489,41 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	// Auto-enable RC when mount is enabled (mount requires RC to function)
-	if c.RClone.MountEnabled != nil && *c.RClone.MountEnabled {
-		if c.RClone.RCEnabled == nil || !*c.RClone.RCEnabled {
-			// Auto-enable RC since mount requires it
-			enabled := true
-			c.RClone.RCEnabled = &enabled
-		}
-	}
-
-	// Validate RClone Mount configuration
-	if c.RClone.MountEnabled != nil && *c.RClone.MountEnabled {
+	// Enforce mutual exclusion via MountType and sync legacy flags
+	falseVal := false
+	trueVal := true
+	switch c.MountType {
+	case MountTypeNone, "":
+		c.RClone.MountEnabled = &falseVal
+		c.RClone.RCEnabled = &falseVal
+		c.Fuse.Enabled = &falseVal
+	case MountTypeRClone:
 		if c.MountPath == "" {
-			return fmt.Errorf("rclone mount_path cannot be empty when mount is enabled")
+			return fmt.Errorf("mount_path cannot be empty when mount type is rclone")
 		}
 		if !filepath.IsAbs(c.MountPath) {
-			return fmt.Errorf("rclone mount_path must be an absolute path")
+			return fmt.Errorf("mount_path must be an absolute path")
 		}
+		c.RClone.MountEnabled = &trueVal
+		c.RClone.RCEnabled = &trueVal // mount requires RC
+		c.Fuse.Enabled = &falseVal
+	case MountTypeFuse:
+		if c.MountPath == "" {
+			return fmt.Errorf("mount_path cannot be empty when mount type is fuse")
+		}
+		if !filepath.IsAbs(c.MountPath) {
+			return fmt.Errorf("mount_path must be an absolute path")
+		}
+		c.RClone.MountEnabled = &falseVal
+		c.RClone.RCEnabled = &falseVal
+		c.Fuse.Enabled = &trueVal
+		c.Fuse.MountPath = c.MountPath
+	case MountTypeRCloneExternal:
+		c.RClone.MountEnabled = &falseVal
+		c.RClone.RCEnabled = &trueVal
+		c.Fuse.Enabled = &falseVal
+	default:
+		return fmt.Errorf("invalid mount_type: %s (must be none, rclone, fuse, or rclone_external)", c.MountType)
 	}
 
 	// Validate SABnzbd configuration
@@ -581,11 +605,6 @@ func (c *Config) Validate() error {
 		c.Fuse.MaxReadAheadMB = 128 // Default 128MB
 	}
 
-	// Validate FUSE mount_path is set when enabled
-	if c.Fuse.Enabled != nil && *c.Fuse.Enabled && c.Fuse.MountPath == "" {
-		return fmt.Errorf("fuse.mount_path is required when fuse is enabled")
-	}
-
 	return nil
 }
 
@@ -657,7 +676,7 @@ func (p *ProviderConfig) ToNNTPProvider() nntppool.Provider {
 
 	inflight := p.InflightRequests
 	if inflight <= 0 {
-		inflight = 3
+		inflight = 10
 	}
 
 	return nntppool.Provider{
@@ -966,6 +985,19 @@ func (m *Manager) ReloadConfig() error {
 		config.Fuse.Enabled = &defaultEnabled
 	}
 
+	// Migrate: infer mount_type from legacy enabled flags if not set
+	if config.MountType == "" {
+		if config.RClone.MountEnabled != nil && *config.RClone.MountEnabled {
+			config.MountType = MountTypeRClone
+		} else if config.Fuse.Enabled != nil && *config.Fuse.Enabled {
+			config.MountType = MountTypeFuse
+		} else if config.RClone.RCEnabled != nil && *config.RClone.RCEnabled {
+			config.MountType = MountTypeRCloneExternal
+		} else {
+			config.MountType = MountTypeNone
+		}
+	}
+
 	// Validate configuration
 	if err := config.Validate(); err != nil {
 		return fmt.Errorf("config validation failed: %w", err)
@@ -1182,6 +1214,7 @@ func DefaultConfig(configDir ...string) *Config {
 			SegmentSamplePercentage:       5,                      // Default: 5% segment sampling
 			LibrarySyncIntervalMinutes:    360,                    // Default: sync every 6 hours
 			ResolveRepairOnImport:         &resolveRepairOnImport, // Enabled by default
+			AcceptableMissingSegmentsPercentage: 0,                // Default: no missing segments allowed
 		},
 		SABnzbd: SABnzbdConfig{
 			Enabled:               &sabnzbdEnabled,
@@ -1232,7 +1265,8 @@ func DefaultConfig(configDir ...string) *Config {
 			MaxCacheSizeMB:      128,
 			MaxReadAheadMB:      128,
 		},
-		MountPath: "", // Empty by default - required when ARRs is enabled
+		MountPath: "",            // Empty by default - required when ARRs is enabled
+		MountType: MountTypeNone, // No mount system active by default
 	}
 }
 
@@ -1315,6 +1349,19 @@ func LoadConfig(configFile string) (*Config, error) {
 	if config.Fuse.Enabled == nil {
 		defaultEnabled := false
 		config.Fuse.Enabled = &defaultEnabled
+	}
+
+	// Migrate: infer mount_type from legacy enabled flags if not set
+	if config.MountType == "" {
+		if config.RClone.MountEnabled != nil && *config.RClone.MountEnabled {
+			config.MountType = MountTypeRClone
+		} else if config.Fuse.Enabled != nil && *config.Fuse.Enabled {
+			config.MountType = MountTypeFuse
+		} else if config.RClone.RCEnabled != nil && *config.RClone.RCEnabled {
+			config.MountType = MountTypeRCloneExternal
+		} else {
+			config.MountType = MountTypeNone
+		}
 	}
 
 	// If log file was not explicitly set in the config file and we have a specific config file path,

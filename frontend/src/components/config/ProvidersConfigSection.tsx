@@ -1,40 +1,55 @@
-import { formatDistanceToNowStrict } from "date-fns";
 import {
+	AlertTriangle,
 	Edit,
 	Gauge,
 	GripVertical,
 	Plus,
 	Power,
 	PowerOff,
+	Save,
 	Trash2,
 	Wifi,
-	WifiOff,
 } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useConfirm } from "../../contexts/ModalContext";
 import { useToast } from "../../contexts/ToastContext";
 import { useProviders } from "../../hooks/useProviders";
 import type { ConfigResponse, ProviderConfig } from "../../types/config";
+import { LoadingSpinner } from "../ui/LoadingSpinner";
 import { ProviderModal } from "./ProviderModal";
 
 interface ProvidersConfigSectionProps {
 	config: ConfigResponse;
+	onUpdate?: (section: string, data: ProviderConfig[]) => Promise<void>;
+	isUpdating?: boolean;
 }
 
-export function ProvidersConfigSection({ config }: ProvidersConfigSectionProps) {
+export function ProvidersConfigSection({
+	config,
+	onUpdate,
+	isUpdating = false,
+}: ProvidersConfigSectionProps) {
 	const [isModalOpen, setIsModalOpen] = useState(false);
 	const [editingProvider, setEditingProvider] = useState<ProviderConfig | null>(null);
 	const [modalMode, setModalMode] = useState<"create" | "edit">("create");
 	const [draggedProvider, setDraggedProvider] = useState<string | null>(null);
 	const [dragOverProvider, setDragOverProvider] = useState<string | null>(null);
-	const [togglingProviderId, setTogglingProviderId] = useState<string | null>(null);
 	const [deletingProviderId, setDeletingProviderId] = useState<string | null>(null);
 	const [testingSpeedProviderId, setTestingSpeedProviderId] = useState<string | null>(null);
 
-	const { deleteProvider, updateProvider, reorderProviders, testProviderSpeed } = useProviders();
+	const [formData, setFormData] = useState<ProviderConfig[]>(config.providers);
+	const [hasChanges, setHasChanges] = useState(false);
+
+	const { deleteProvider, reorderProviders, testProviderSpeed } = useProviders();
 	const isReordering = reorderProviders.isPending;
 	const { confirmDelete } = useConfirm();
 	const { showToast } = useToast();
+
+	// Sync with config when it changes
+	useEffect(() => {
+		setFormData(config.providers);
+		setHasChanges(false);
+	}, [config.providers]);
 
 	const handleCreate = () => {
 		setEditingProvider(null);
@@ -96,22 +111,44 @@ export function ProvidersConfigSection({ config }: ProvidersConfigSectionProps) 
 		}
 	};
 
-	const handleToggleEnabled = async (provider: ProviderConfig) => {
-		setTogglingProviderId(provider.id);
-		try {
-			await updateProvider.mutateAsync({
-				id: provider.id,
-				data: { enabled: !provider.enabled },
-			});
-		} catch (error) {
-			console.error("Failed to toggle provider:", error);
-			showToast({
-				type: "error",
-				title: "Update Failed",
-				message: "Failed to update provider. Please try again.",
-			});
-		} finally {
-			setTogglingProviderId(null);
+	const handleToggleEnabled = (provider: ProviderConfig) => {
+		handleFieldChange(provider.id, "enabled", !provider.enabled);
+	};
+
+	const handleFieldChange = (
+		providerId: string,
+		field: keyof ProviderConfig,
+		// biome-ignore lint/suspicious/noExplicitAny: accepts various field types
+		value: any,
+	) => {
+		const newFormData = formData.map((p) => {
+			if (p.id === providerId) {
+				return { ...p, [field]: value };
+			}
+			return p;
+		});
+		setFormData(newFormData);
+		setHasChanges(JSON.stringify(newFormData) !== JSON.stringify(config.providers));
+	};
+
+	const handleSave = async () => {
+		if (onUpdate && hasChanges) {
+			try {
+				await onUpdate("providers", formData);
+				setHasChanges(false);
+				showToast({
+					type: "success",
+					title: "Configuration Saved",
+					message: "NNTP providers updated successfully.",
+				});
+			} catch (error) {
+				console.error("Failed to save providers:", error);
+				showToast({
+					type: "error",
+					title: "Save Failed",
+					message: "Failed to save NNTP providers. Please try again.",
+				});
+			}
 		}
 	};
 
@@ -133,11 +170,9 @@ export function ProvidersConfigSection({ config }: ProvidersConfigSectionProps) 
 	};
 
 	const handleDragLeave = (e: React.DragEvent) => {
-		// Only clear drag over if leaving the provider card
 		const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
 		const x = e.clientX;
 		const y = e.clientY;
-
 		if (x < rect.left || x > rect.right || y < rect.top || y > rect.bottom) {
 			setDragOverProvider(null);
 		}
@@ -146,28 +181,20 @@ export function ProvidersConfigSection({ config }: ProvidersConfigSectionProps) 
 	const handleDrop = async (e: React.DragEvent, targetProviderId: string) => {
 		e.preventDefault();
 		const draggedProviderId = e.dataTransfer.getData("text/plain");
-
 		setDraggedProvider(null);
 		setDragOverProvider(null);
-
-		if (!draggedProviderId || draggedProviderId === targetProviderId) {
-			return;
-		}
-
-		// Find current positions
+		if (!draggedProviderId || draggedProviderId === targetProviderId) return;
 		const draggedIndex = config.providers.findIndex((p) => p.id === draggedProviderId);
 		const targetIndex = config.providers.findIndex((p) => p.id === targetProviderId);
+		if (draggedIndex === -1 || targetIndex === -1) return;
+		const reorderedProviders = [...formData];
+		const [draggedProviderObj] = reorderedProviders.splice(draggedIndex, 1);
+		reorderedProviders.splice(targetIndex, 0, draggedProviderObj);
 
-		if (draggedIndex === -1 || targetIndex === -1) {
-			return;
-		}
+		// Update local state immediately for visual responsiveness
+		setFormData(reorderedProviders);
+		setHasChanges(JSON.stringify(reorderedProviders) !== JSON.stringify(config.providers));
 
-		// Create new order
-		const reorderedProviders = [...config.providers];
-		const [draggedProvider] = reorderedProviders.splice(draggedIndex, 1);
-		reorderedProviders.splice(targetIndex, 0, draggedProvider);
-
-		// Send reorder request
 		try {
 			await reorderProviders.mutateAsync({
 				provider_ids: reorderedProviders.map((p) => p.id),
@@ -188,67 +215,58 @@ export function ProvidersConfigSection({ config }: ProvidersConfigSectionProps) 
 	};
 
 	return (
-		<div className="space-y-6">
+		<div className="space-y-8">
 			{/* Header */}
-			<div className="flex items-center justify-between">
+			<div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
 				<div>
-					<h3 className="font-semibold text-lg">NNTP Providers</h3>
-					<p className="text-base-content/70 text-sm">
-						Manage Usenet provider connections for downloading
-					</p>
-					{config.providers.length > 1 && (
-						<p className="mt-1 text-base-content/50 text-xs">
-							<GripVertical className="mr-1 inline h-3 w-3" />
-							Drag to reorder • Higher priority providers are used first
-						</p>
-					)}
+					<h3 className="font-bold text-base-content text-xl tracking-tight">NNTP Providers</h3>
+					<p className="mt-1 text-base-content/50 text-xs">Drag cards to adjust priority order.</p>
 				</div>
-				<button type="button" className="btn btn-primary btn-sm" onClick={handleCreate}>
+				<button
+					type="button"
+					className="btn btn-primary btn-sm px-6 shadow-lg shadow-primary/20"
+					onClick={handleCreate}
+				>
 					<Plus className="h-4 w-4" />
 					Add Provider
 				</button>
 			</div>
 
 			{/* Providers List */}
-			{config.providers.length === 0 ? (
-				<div className="rounded-lg bg-base-200 py-12 text-center">
-					<Wifi className="mx-auto mb-4 h-12 w-12 text-base-content/30" />
-					<h4 className="mb-2 font-medium text-lg">No Providers Configured</h4>
-					<p className="mb-4 text-base-content/70">
-						Add NNTP providers to enable downloading from Usenet
-					</p>
-					<button type="button" className="btn btn-primary" onClick={handleCreate}>
-						<Plus className="h-4 w-4" />
+			{formData.length === 0 ? (
+				<div className="rounded-2xl border-2 border-base-300 border-dashed bg-base-200/30 py-16 text-center">
+					<Wifi className="mx-auto mb-4 h-12 w-12 text-base-content/20" />
+					<h4 className="font-bold text-lg opacity-60">No Providers Configured</h4>
+					<p className="mb-6 text-sm opacity-40">Add a Usenet provider to enable downloading.</p>
+					<button type="button" className="btn btn-primary px-8" onClick={handleCreate}>
 						Add First Provider
 					</button>
 				</div>
 			) : (
 				<div className="relative">
-					{/* Loading overlay */}
 					{isReordering && (
-						<div className="absolute inset-0 z-10 flex items-center justify-center rounded-lg bg-base-300/50 backdrop-blur-sm">
-							<div className="flex flex-col items-center gap-2">
-								<div className="loading loading-spinner loading-lg text-primary" />
-								<p className="font-medium text-sm">Reordering providers...</p>
+						<div className="absolute inset-0 z-10 flex items-center justify-center rounded-2xl bg-base-300/40 backdrop-blur-[2px]">
+							<div className="flex flex-col items-center gap-3">
+								<LoadingSpinner size="lg" />
+								<p className="font-black text-[10px] text-primary uppercase tracking-widest">
+									Reordering...
+								</p>
 							</div>
 						</div>
 					)}
 
 					<div className="grid gap-4">
-						{config.providers.map((provider, index) => (
-							// biome-ignore lint/a11y/useSemanticElements: <a button can not be a child of a button>
-							<div
+						{formData.map((provider, index) => (
+							<section
 								key={provider.id}
 								draggable={!isReordering}
-								role="button"
-								tabIndex={0}
-								aria-label={`Reorder provider ${provider.host}:${provider.port}@${provider.username}`}
+								aria-label={`Provider ${provider.host}`}
 								onDragStart={(e) => !isReordering && handleDragStart(e, provider.id)}
 								onDragOver={(e) => !isReordering && handleDragOver(e, provider.id)}
 								onDragLeave={!isReordering ? handleDragLeave : undefined}
 								onDrop={(e) => !isReordering && handleDrop(e, provider.id)}
 								onDragEnd={!isReordering ? handleDragEnd : undefined}
-								className={`card border-2 bg-base-100 transition-all duration-200 ${
+								className={`group relative overflow-hidden rounded-2xl border-2 bg-base-100/50 transition-all duration-300 hover:shadow-md ${
 									isReordering ? "cursor-not-allowed opacity-60" : "cursor-move"
 								} ${
 									provider.enabled
@@ -256,181 +274,200 @@ export function ProvidersConfigSection({ config }: ProvidersConfigSectionProps) 
 											? "border-warning/20"
 											: "border-success/20"
 										: "border-base-300"
-								} ${draggedProvider === provider.id ? "scale-95 opacity-50" : ""} ${
+								} ${draggedProvider === provider.id ? "scale-95 opacity-50 ring-2 ring-primary" : ""} ${
 									dragOverProvider === provider.id
-										? "border-primary border-dashed bg-primary/5"
+										? "translate-y-1 border-primary border-dashed bg-primary/5"
 										: ""
 								}`}
 							>
-								<div className="card-body p-4">
-									<div className="flex items-center justify-between">
-										<div className="flex items-center space-x-3">
-											<div className="flex items-center space-x-2">
-												<GripVertical className="h-4 w-4 text-base-content/40" />
-												<div
-													className={`h-3 w-3 rounded-full ${
-														provider.enabled ? "bg-success" : "bg-base-300"
-													}`}
-												/>
-												<div className="text-base-content/50 text-xs">#{index + 1}</div>
+								{/* Priority Indicator Line */}
+								<div
+									className={`absolute top-0 bottom-0 left-0 w-1.5 ${provider.enabled ? (provider.is_backup_provider ? "bg-warning" : "bg-success") : "bg-base-300"}`}
+								/>
+
+								<div className="p-5 pl-7">
+									<div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+										<div className="flex min-w-0 items-center gap-4">
+											<div className="rounded-lg bg-base-200/50 p-2 opacity-40 transition-opacity group-hover:opacity-100">
+												<GripVertical className="h-4 w-4" />
 											</div>
-											<div>
-												<h4 className="font-semibold">
-													{provider.host}:{provider.port}@{provider.username}
-												</h4>
+											<div className="min-w-0 flex-1">
+												<div className="flex items-center gap-2">
+													<span className="font-black font-mono text-[10px] opacity-30">
+														#{index + 1}
+													</span>
+													<h4 className="break-all font-bold text-base text-base-content tracking-tight">
+														{provider.host}
+													</h4>
+												</div>
+												<div className="mt-1 flex items-center gap-2">
+													<div
+														className={`h-2 w-2 rounded-full ${provider.enabled ? "bg-success shadow-[0_0_8px_rgba(34,197,94,0.5)]" : "bg-base-300"}`}
+													/>
+													<span className="truncate font-bold text-[10px] uppercase tracking-wider opacity-50">
+														{provider.port} • {provider.username}
+													</span>
+												</div>
 											</div>
 										</div>
 
-										<div className="flex items-center space-x-2">
-											{/* Status Badge */}
-											<div
-												className={`badge ${provider.enabled ? "badge-success" : "badge-neutral"}`}
-											>
-												{provider.enabled ? "Enabled" : "Disabled"}
-											</div>
-
-											{/* Backup Provider Badge */}
+										<div className="flex flex-wrap items-center gap-2">
 											{provider.is_backup_provider && (
-												<div className="badge badge-warning badge-sm">Backup</div>
+												<div className="badge badge-warning badge-sm px-3 py-2 font-black text-[9px] uppercase tracking-widest shadow-sm">
+													Backup
+												</div>
 											)}
 
-											{/* Actions */}
-											<div className="join">
+											<div className="join rounded-xl bg-base-200/50 p-0.5">
 												<button
 													type="button"
-													className={`btn btn-sm join-item ${
-														provider.enabled ? "btn-warning" : "btn-success"
+													className={`btn btn-xs sm:btn-sm join-item border-none ${
+														provider.enabled
+															? "bg-warning/10 text-warning hover:bg-warning/20"
+															: "bg-success/10 text-success hover:bg-success/20"
 													}`}
 													onClick={() => handleToggleEnabled(provider)}
-													title={provider.enabled ? "Disable" : "Enable"}
-													disabled={togglingProviderId === provider.id}
 												>
-													{togglingProviderId === provider.id ? (
-														<span className="loading loading-spinner loading-xs" />
-													) : provider.enabled ? (
-														<PowerOff className="h-4 w-4" />
+													{provider.enabled ? (
+														<PowerOff className="h-3.5 w-3.5" />
 													) : (
-														<Power className="h-4 w-4" />
+														<Power className="h-3.5 w-3.5" />
 													)}
 												</button>
 												<button
 													type="button"
-													className="btn btn-sm btn-info join-item"
+													className="btn btn-xs sm:btn-sm join-item border-none bg-info/10 text-info hover:bg-info/20"
 													onClick={() => handleSpeedTest(provider)}
-													title="Speed Test"
 													disabled={testingSpeedProviderId === provider.id || !provider.enabled}
 												>
 													{testingSpeedProviderId === provider.id ? (
 														<span className="loading loading-spinner loading-xs" />
 													) : (
-														<Gauge className="h-4 w-4" />
+														<Gauge className="h-3.5 w-3.5" />
 													)}
 												</button>
 												<button
 													type="button"
-													className="btn btn-sm btn-outline join-item"
+													className="btn btn-xs sm:btn-sm join-item border-none bg-base-content/5 text-base-content hover:bg-base-content/10"
 													onClick={() => handleEdit(provider)}
-													title="Edit"
 												>
-													<Edit className="h-4 w-4" />
+													<Edit className="h-3.5 w-3.5" />
 												</button>
 												<button
 													type="button"
-													className="btn btn-sm btn-error join-item"
+													className="btn btn-xs sm:btn-sm join-item border-none bg-error/10 text-error hover:bg-error/20"
 													onClick={() => handleDelete(provider.id)}
-													title="Delete"
 													disabled={deletingProviderId === provider.id}
 												>
 													{deletingProviderId === provider.id ? (
 														<span className="loading loading-spinner loading-xs" />
 													) : (
-														<Trash2 className="h-4 w-4" />
+														<Trash2 className="h-3.5 w-3.5" />
 													)}
 												</button>
 											</div>
 										</div>
 									</div>
 
-									{/* Provider Details */}
-									<div className="mt-3 border-base-300 border-t pt-3">
-										<div className="grid grid-cols-2 gap-4 text-sm md:grid-cols-5">
-											<div>
-												<span className="text-base-content/60">Username:</span>
-												<div className="font-mono">{provider.username}</div>
+									{/* Quick Details Grid */}
+									<div className="mt-5 grid grid-cols-2 gap-x-6 gap-y-4 rounded-xl bg-base-200/30 p-4 text-[11px] md:grid-cols-5">
+										<div className="min-w-0">
+											<span className="mb-1 block font-black text-[9px] uppercase tracking-widest opacity-30">
+												Max Conn
+											</span>
+											<div className="flex items-center gap-2">
+												<input
+													type="number"
+													className="input input-xs input-bordered w-full max-w-[50px] bg-base-100 font-bold font-mono"
+													value={provider.max_connections}
+													onChange={(e) =>
+														handleFieldChange(
+															provider.id,
+															"max_connections",
+															Number.parseInt(e.target.value, 10) || 1,
+														)
+													}
+													min={1}
+													max={100}
+												/>
 											</div>
-											<div>
-												<span className="text-base-content/60">Max Connections:</span>
-												<div className="font-mono">{provider.max_connections}</div>
+										</div>
+										<div className="min-w-0">
+											<span className="mb-1 block font-black text-[9px] uppercase tracking-widest opacity-30">
+												Pipeline
+											</span>
+											<div className="flex items-center gap-2">
+												<input
+													type="number"
+													className="input input-xs input-bordered w-full max-w-[50px] bg-base-100 font-bold font-mono"
+													value={provider.inflight_requests || 10}
+													onChange={(e) =>
+														handleFieldChange(
+															provider.id,
+															"inflight_requests",
+															Number.parseInt(e.target.value, 10) || 1,
+														)
+													}
+													min={1}
+													max={100}
+												/>
 											</div>
-											<div>
-												<span className="text-base-content/60">Pipeline:</span>
-												<div className="font-mono">{provider.inflight_requests || 3}</div>
+										</div>
+										<div className="min-w-0">
+											<span className="mb-1 block font-black text-[9px] uppercase tracking-widest opacity-30">
+												Role
+											</span>
+											<div
+												className={`badge badge-xs h-6 p-1.5 font-black ${provider.is_backup_provider ? "badge-warning/20 text-warning" : "badge-success/20 text-success"}`}
+											>
+												{provider.is_backup_provider ? "BACKUP" : "PRIMARY"}
 											</div>
-											<div>
-												<span className="text-base-content/60">TLS:</span>
-												<div className="flex items-center space-x-1">
-													{provider.tls ? (
-														<>
-															<Wifi className="h-4 w-4 text-success" />
-															<span>Enabled</span>
-														</>
-													) : (
-														<>
-															<WifiOff className="h-4 w-4 text-warning" />
-															<span>Disabled</span>
-														</>
-													)}
-												</div>
+										</div>
+										<div className="min-w-0">
+											<span className="mb-1 block font-black text-[9px] uppercase tracking-widest opacity-30">
+												Latency
+											</span>
+											<div className="flex h-6 items-center font-bold font-mono">
+												{provider.last_rtt_ms !== undefined ? `${provider.last_rtt_ms}ms` : "---"}
 											</div>
-											<div>
-												<span className="text-base-content/60">Password:</span>
-												<div className="flex items-center space-x-1">
-													{provider.password_set ? (
-														<span className="badge badge-success badge-sm">Set</span>
-													) : (
-														<span className="badge badge-error badge-sm">Not Set</span>
-													)}
-												</div>
+										</div>
+										<div className="col-span-2 min-w-0 md:col-span-1">
+											<span className="mb-1 block font-black text-[9px] uppercase tracking-widest opacity-30">
+												Last Speed
+											</span>
+											<div className="flex h-6 items-center truncate font-bold font-mono">
+												{provider.last_speed_test_mbps !== undefined
+													? `${provider.last_speed_test_mbps.toFixed(1)} MB/s`
+													: "---"}
 											</div>
-											<div>
-												<span className="text-base-content/60">Type:</span>
-												<div className="flex items-center space-x-1">
-													{provider.is_backup_provider ? (
-														<span className="badge badge-warning badge-sm">Backup</span>
-													) : (
-														<span className="badge badge-primary badge-sm">Primary</span>
-													)}
-												</div>
-											</div>
-											{provider.last_speed_test_mbps !== undefined && (
-												<div>
-													<span className="text-base-content/60">Last Speed Test:</span>
-													<div className="font-mono">
-														{provider.last_speed_test_mbps.toFixed(2)} MB/s
-														{provider.last_speed_test_time && (
-															<span className="text-base-content/50 text-xs">
-																{" "}
-																(
-																{formatDistanceToNowStrict(
-																	new Date(provider.last_speed_test_time),
-																	{
-																		addSuffix: true,
-																	},
-																)}
-																)
-															</span>
-														)}
-													</div>
-												</div>
-											)}
 										</div>
 									</div>
 								</div>
-							</div>
+							</section>
 						))}
 					</div>
 				</div>
 			)}
+
+			{/* Save & Validation */}
+			<div className="space-y-4 border-base-200 border-t pt-6">
+				{hasChanges && (
+					<div className="fade-in slide-in-from-bottom-2 flex animate-in items-center justify-end gap-4">
+						<div className="flex items-center gap-2 font-bold text-warning text-xs">
+							<AlertTriangle className="h-4 w-4" /> Unsaved Changes
+						</div>
+						<button
+							type="button"
+							className="btn btn-primary px-10 shadow-lg shadow-primary/20"
+							onClick={handleSave}
+							disabled={isUpdating}
+						>
+							{isUpdating ? <LoadingSpinner size="sm" /> : <Save className="h-4 w-4" />}
+							{isUpdating ? "Saving..." : "Save Changes"}
+						</button>
+					</div>
+				)}
+			</div>
 
 			{/* Provider Modal */}
 			{isModalOpen && (
