@@ -90,7 +90,7 @@ type FileHealth struct {
 	FilePath         string       `db:"file_path"`
 	LibraryPath      *string      `db:"library_path"` // Path to file in library directory (symlink or .strm file)
 	Status           HealthStatus `db:"status"`
-	LastChecked      time.Time    `db:"last_checked"`
+	LastChecked      *time.Time   `db:"last_checked"`
 	LastError        *string      `db:"last_error"`
 	RetryCount       int          `db:"retry_count"`        // Health check retry count
 	MaxRetries       int          `db:"max_retries"`        // Max health check retries
@@ -104,6 +104,9 @@ type FileHealth struct {
 	ReleaseDate      *time.Time     `db:"release_date"`       // Cached from metadata for scheduling
 	ScheduledCheckAt *time.Time     `db:"scheduled_check_at"` // Next check time
 	Priority         HealthPriority `db:"priority"`           // Priority level for health checks
+	// Failure masking fields
+	StreamingFailureCount int  `db:"streaming_failure_count"`
+	IsMasked              bool `db:"is_masked"`
 }
 
 // User represents a user account in the system
@@ -134,4 +137,42 @@ type MediaFile struct {
 	FileSize     *int64    `db:"file_size"`     // File size in bytes (nullable)
 	CreatedAt    time.Time `db:"created_at"`    // When record was created
 	UpdatedAt    time.Time `db:"updated_at"`    // When record was last updated
+}
+
+// SystemStat represents a persistent system statistic
+type SystemStat struct {
+	Key       string    `db:"key"`
+	Value     int64     `db:"value"`
+	UpdatedAt time.Time `db:"updated_at"`
+}
+
+// ImportDailyStat represents historical import statistics for a specific day
+type ImportDailyStat struct {
+	Day             time.Time `db:"day"`
+	CompletedCount  int       `db:"completed_count"`
+	FailedCount     int       `db:"failed_count"`
+	BytesDownloaded int64     `db:"bytes_downloaded"`
+	UpdatedAt       time.Time `db:"updated_at"`
+}
+
+// ImportHourlyStat represents historical import statistics for a specific hour
+type ImportHourlyStat struct {
+	Hour            time.Time `db:"hour"`
+	CompletedCount  int       `db:"completed_count"`
+	FailedCount     int       `db:"failed_count"`
+	BytesDownloaded int64     `db:"bytes_downloaded"`
+	UpdatedAt       time.Time `db:"updated_at"`
+}
+
+// ImportHistory represents a persistent record of a single imported file
+type ImportHistory struct {
+	ID           int64     `db:"id"`
+	NzbID        *int64    `db:"nzb_id"` // Nullable if queue item deleted
+	NzbName      string    `db:"nzb_name"`
+	FileName     string    `db:"file_name"`
+	FileSize     int64     `db:"file_size"`
+	VirtualPath  string    `db:"virtual_path"`
+	LibraryPath  *string   `db:"library_path"` // Added to show final location from file_health
+	Category     *string   `db:"category"`
+	CompletedAt  time.Time `db:"completed_at"`
 }

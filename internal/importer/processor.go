@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/javi11/altmount/internal/config"
+	"github.com/javi11/altmount/internal/database"
 	"github.com/javi11/altmount/internal/importer/archive/rar"
 	"github.com/javi11/altmount/internal/importer/archive/sevenzip"
 	"github.com/javi11/altmount/internal/importer/filesystem"
@@ -38,37 +39,43 @@ type Processor struct {
 	maxImportConnections    int // Maximum concurrent NNTP connections for validation and archive processing
 	segmentSamplePercentage int // Percentage of segments to check when sampling (1-100)
 	validationTimeout       time.Duration
+	maxDownloadPrefetch     int           // Prefetch depth for Usenet segment reads (used by ISO reader)
+	readTimeout             time.Duration // Read timeout for Usenet data (used by ISO reader)
 	allowedFileExtensions   []string
+	expandBlurayIso         bool // Whether to expand Bluray ISO files inside archives
 	log                     *slog.Logger
 	broadcaster             *progress.ProgressBroadcaster // WebSocket progress broadcaster
+	recorder                HistoryRecorder
 
 	// Pre-compiled regex patterns for RAR file sorting
-	rarPartPattern    *regexp.Regexp // pattern.part###.rar
-	rarRPattern       *regexp.Regexp // pattern.r### or pattern.r##
-	rarNumericPattern *regexp.Regexp // pattern.### (numeric extensions)
+	rarPartPattern  *regexp.Regexp // pattern.part###.rar
+	rarPartPattern2 *regexp.Regexp // pattern.r###
 }
 
 // NewProcessor creates a new NZB processor using metadata storage
-func NewProcessor(metadataService *metadata.MetadataService, poolManager pool.Manager, maxImportConnections int, segmentSamplePercentage int, allowedFileExtensions []string, maxDownloadPrefetch int, readTimeout time.Duration, broadcaster *progress.ProgressBroadcaster, configGetter config.ConfigGetter) *Processor {
+func NewProcessor(metadataService *metadata.MetadataService, poolManager pool.Manager, maxImportConnections int, segmentSamplePercentage int, allowedFileExtensions []string, maxDownloadPrefetch int, readTimeout time.Duration, broadcaster *progress.ProgressBroadcaster, configGetter config.ConfigGetter, recorder HistoryRecorder, allowNestedRarExtraction bool, expandBlurayIso bool) *Processor {
 	return &Processor{
 		parser:                  parser.NewParser(poolManager),
 		strmParser:              parser.NewStrmParser(),
 		metadataService:         metadataService,
-		rarProcessor:            rar.NewProcessor(poolManager, maxImportConnections, maxDownloadPrefetch, readTimeout),
-		sevenZipProcessor:       sevenzip.NewProcessor(poolManager, maxDownloadPrefetch, readTimeout),
+		rarProcessor:            rar.NewProcessor(poolManager, maxImportConnections, maxDownloadPrefetch, readTimeout, allowNestedRarExtraction),
+		sevenZipProcessor:       sevenzip.NewProcessor(poolManager, maxDownloadPrefetch, readTimeout, allowNestedRarExtraction),
 		poolManager:             poolManager,
 		configGetter:            configGetter,
 		maxImportConnections:    maxImportConnections,
 		segmentSamplePercentage: segmentSamplePercentage,
-		validationTimeout:       5 * time.Second, // Default validation timeout for imports
+		validationTimeout:       30 * time.Second, // Default validation timeout for imports
+		maxDownloadPrefetch:     maxDownloadPrefetch,
+		readTimeout:             readTimeout,
 		allowedFileExtensions:   allowedFileExtensions,
+		expandBlurayIso:         expandBlurayIso,
 		log:                     slog.Default().With("component", "nzb-processor"),
 		broadcaster:             broadcaster,
+		recorder:                recorder,
 
 		// Initialize pre-compiled regex patterns for RAR file sorting
-		rarPartPattern:    regexp.MustCompile(`^(.+)\.part(\d+)\.rar$`), // filename.part001.rar
-		rarRPattern:       regexp.MustCompile(`^(.+)\.r(\d+)$`),         // filename.r00, filename.r01
-		rarNumericPattern: regexp.MustCompile(`^(.+)\.(\d+)$`),          // filename.001, filename.002
+		rarPartPattern:  regexp.MustCompile(`(?i)^(.+)\.part(\d+)\.rar$`), // filename.part001.rar
+		rarPartPattern2: regexp.MustCompile(`(?i)^(.+)\.r(\d+)$`),         // filename.r00
 	}
 }
 
@@ -76,14 +83,18 @@ func NewProcessor(metadataService *metadata.MetadataService, poolManager pool.Ma
 func (proc *Processor) getCleanNzbName(nzbPath string, queueID int) string {
 	baseName := filepath.Base(nzbPath)
 	prefix := fmt.Sprintf("%d_", queueID)
-	if strings.HasPrefix(baseName, prefix) {
-		return strings.TrimPrefix(baseName, prefix)
+	if after, ok := strings.CutPrefix(baseName, prefix); ok {
+		return after
 	}
 	return baseName
 }
 
 func (proc *Processor) SetSegmentSamplePercentage(percentage int) {
 	proc.segmentSamplePercentage = percentage
+}
+
+func (proc *Processor) SetRecorder(recorder HistoryRecorder) {
+	proc.recorder = recorder
 }
 
 func (proc *Processor) isCategoryFolder(path string) bool {
@@ -104,8 +115,12 @@ func (proc *Processor) isCategoryFolder(path string) bool {
 		}
 
 		// Check match with complete_dir prefix (e.g. complete/tv)
-		if completeDir != "" && normalizedPath == strings.Trim(completeDir+"/"+name, "/") {
-			return true
+		// We must ensure it's at a directory boundary
+		if completeDir != "" {
+			prefix := strings.Trim(completeDir+"/"+name, "/")
+			if normalizedPath == prefix {
+				return true
+			}
 		}
 
 		return false
@@ -148,7 +163,7 @@ func (proc *Processor) checkCancellation(ctx context.Context) error {
 }
 
 // ProcessNzbFile processes an NZB or STRM file maintaining the folder structure relative to relative path
-func (proc *Processor) ProcessNzbFile(ctx context.Context, filePath, relativePath string, queueID int, allowedExtensionsOverride *[]string, virtualDirOverride *string, extractedFiles []parser.ExtractedFileInfo) (string, error) {
+func (proc *Processor) ProcessNzbFile(ctx context.Context, filePath, relativePath string, queueID int, allowedExtensionsOverride *[]string, virtualDirOverride *string, extractedFiles []parser.ExtractedFileInfo, category *string) (string, error) {
 	// Determine max connections to use
 	maxConnections := proc.maxImportConnections
 
@@ -228,28 +243,38 @@ func (proc *Processor) ProcessNzbFile(ctx context.Context, filePath, relativePat
 		return "", err
 	}
 
-	// Step 4: Process based on file type
+	// Step 4: For NZB-based imports, ensure at least one NNTP provider is configured.
+	// STRM files are served via HTTP and don't require an NNTP pool.
+	if parsed.Type != parser.NzbTypeStrm {
+		if !proc.poolManager.HasPool() {
+			proc.log.WarnContext(ctx, "No NNTP providers configured, deferring item processing",
+				"file_path", filePath, "queue_id", queueID)
+			return "", fmt.Errorf("no NNTP providers configured - item will be retried when providers are added")
+		}
+	}
+
+	// Step 5: Process based on file type
 	var result string
 	switch parsed.Type {
 	case parser.NzbTypeSingleFile:
 		proc.updateProgress(queueID, 30)
-		result, err = proc.processSingleFile(ctx, virtualDir, regularFiles, par2Files, parsed.Path, queueID, maxConnections, allowedExtensions, proc.validationTimeout)
+		result, err = proc.processSingleFile(ctx, virtualDir, regularFiles, par2Files, parsed.Path, queueID, maxConnections, allowedExtensions, proc.validationTimeout, category)
 
 	case parser.NzbTypeMultiFile:
 		proc.updateProgress(queueID, 30)
-		result, err = proc.processMultiFile(ctx, virtualDir, regularFiles, par2Files, parsed.Path, queueID, maxConnections, allowedExtensions, proc.validationTimeout)
+		result, err = proc.processMultiFile(ctx, virtualDir, regularFiles, par2Files, parsed.Path, queueID, maxConnections, allowedExtensions, proc.validationTimeout, category)
 
 	case parser.NzbTypeRarArchive:
 		proc.updateProgress(queueID, 30)
-		result, err = proc.processRarArchive(ctx, virtualDir, regularFiles, archiveFiles, parsed, queueID, maxConnections, allowedExtensions, proc.validationTimeout, parsed.ExtractedFiles)
+		result, err = proc.processRarArchive(ctx, virtualDir, regularFiles, archiveFiles, parsed, queueID, maxConnections, allowedExtensions, proc.validationTimeout, parsed.ExtractedFiles, category)
 
 	case parser.NzbType7zArchive:
 		proc.updateProgress(queueID, 30)
-		result, err = proc.processSevenZipArchive(ctx, virtualDir, regularFiles, archiveFiles, parsed, queueID, maxConnections, allowedExtensions, proc.validationTimeout, parsed.ExtractedFiles)
+		result, err = proc.processSevenZipArchive(ctx, virtualDir, regularFiles, archiveFiles, parsed, queueID, maxConnections, allowedExtensions, proc.validationTimeout, parsed.ExtractedFiles, category)
 
 	case parser.NzbTypeStrm:
 		proc.updateProgress(queueID, 30)
-		result, err = proc.processSingleFile(ctx, virtualDir, regularFiles, par2Files, parsed.Path, queueID, maxConnections, allowedExtensions, proc.validationTimeout)
+		result, err = proc.processSingleFile(ctx, virtualDir, regularFiles, par2Files, parsed.Path, queueID, maxConnections, allowedExtensions, proc.validationTimeout, category)
 
 	default:
 		return "", NewNonRetryableError(fmt.Sprintf("unknown file type: %s", parsed.Type), nil)
@@ -274,6 +299,7 @@ func (proc *Processor) processSingleFile(
 	maxConnections int,
 	allowedExtensions []string,
 	timeout time.Duration,
+	category *string,
 ) (string, error) {
 	if len(regularFiles) == 0 {
 		return "", fmt.Errorf("no regular files to process")
@@ -347,6 +373,21 @@ func (proc *Processor) processSingleFile(
 	if err != nil {
 		return "", err
 	}
+
+	// Record history
+	if proc.recorder != nil {
+		nzbID := int64(queueID)
+		_ = proc.recorder.AddImportHistory(ctx, &database.ImportHistory{
+			NzbID:       &nzbID,
+			NzbName:     nzbName,
+			FileName:    finalName,
+			FileSize:    regularFiles[0].Size,
+			VirtualPath: result,
+			Category:    category,
+			CompletedAt: time.Now(),
+		})
+	}
+
 	return result, nil
 }
 
@@ -361,6 +402,7 @@ func (proc *Processor) processMultiFile(
 	maxConnections int,
 	allowedExtensions []string,
 	timeout time.Duration,
+	category *string,
 ) (string, error) {
 	// If there's only one regular file (and the rest are likely PAR2s), avoid creating a redundant
 	// NZB-named directory that matches the file itself. Instead, keep the file directly under the
@@ -369,10 +411,9 @@ func (proc *Processor) processMultiFile(
 	// the NZB folder to ensure Radarr/Sonarr can find the job folder correctly.
 	singleLike := len(regularFiles) == 1 && !proc.isCategoryFolder(virtualDir)
 	targetBaseDir := virtualDir
+	nzbName := proc.getCleanNzbName(nzbPath, queueID)
 
 	if singleLike {
-		nzbName := proc.getCleanNzbName(nzbPath, queueID)
-
 		// Rename the leaf to the release name (prevents ext duplication) but keep NZB-provided subfolders.
 		originalDir := filepath.Dir(regularFiles[0].Filename)
 		normalizedBase := normalizeReleaseFilename(nzbName, filepath.Base(regularFiles[0].Filename))
@@ -388,7 +429,7 @@ func (proc *Processor) processMultiFile(
 		}
 	} else {
 		// Create NZB folder for true multi-file imports
-		nzbFolder, err := filesystem.CreateNzbFolder(virtualDir, proc.getCleanNzbName(nzbPath, queueID), proc.metadataService)
+		nzbFolder, err := filesystem.CreateNzbFolder(virtualDir, nzbName, proc.metadataService)
 		if err != nil {
 			return "", err
 		}
@@ -420,6 +461,26 @@ func (proc *Processor) processMultiFile(
 	); err != nil {
 		return "", err
 	}
+
+	// Record history
+	if proc.recorder != nil {
+		nzbID := int64(queueID)
+		var totalSize int64
+		for _, f := range regularFiles {
+			totalSize += f.Size
+		}
+
+		_ = proc.recorder.AddImportHistory(ctx, &database.ImportHistory{
+			NzbID:       &nzbID,
+			NzbName:     nzbName,
+			FileName:    filepath.Base(targetBaseDir),
+			FileSize:    totalSize,
+			VirtualPath: targetBaseDir,
+			Category:    category,
+			CompletedAt: time.Now(),
+		})
+	}
+
 	return targetBaseDir, nil
 }
 
@@ -435,17 +496,19 @@ func (proc *Processor) processRarArchive(
 	allowedExtensions []string,
 	timeout time.Duration,
 	extractedFiles []parser.ExtractedFileInfo,
+	category *string,
 ) (string, error) {
 	// Create NZB folder
-	nzbFolder, err := filesystem.CreateNzbFolder(virtualDir, proc.getCleanNzbName(parsed.Path, queueID), proc.metadataService)
+	nzbName := proc.getCleanNzbName(parsed.Path, queueID)
+	nzbFolder, err := filesystem.CreateNzbFolder(virtualDir, nzbName, proc.metadataService)
 	if err != nil {
-		return "", err
+		return nzbFolder, err
 	}
 
 	// Process regular files first if any
 	if len(regularFiles) > 0 {
 		if err := filesystem.CreateDirectoriesForFiles(nzbFolder, regularFiles, proc.metadataService); err != nil {
-			return "", err
+			return nzbFolder, err
 		}
 
 		if err := multifile.ProcessRegularFiles(
@@ -465,26 +528,19 @@ func (proc *Processor) processRarArchive(
 		}
 	}
 
-	// Analyze and process RAR archive
 	if len(archiveFiles) > 0 {
 		proc.updateProgress(queueID, 50)
 
-		// Create progress tracker for 50-80% range (archive analysis)
-		archiveProgressTracker := proc.broadcaster.CreateTracker(queueID, 50, 80)
-
-		// Get release date from first archive file
-		var releaseDate int64
-		if len(archiveFiles) > 0 {
-			releaseDate = archiveFiles[0].ReleaseDate.Unix()
+		// Lazy tracker allocation: nil *progress.Tracker is safe (nil-receiver guard).
+		var archiveProgressTracker, validationProgressTracker *progress.Tracker
+		if proc.broadcaster != nil && proc.broadcaster.HasSubscribers() {
+			archiveProgressTracker = proc.broadcaster.CreateTracker(queueID, 50, 80)
+			validationProgressTracker = proc.broadcaster.CreateTracker(queueID, 80, 95)
 		}
 
-		// Create progress tracker for 80-95% range (validation only, metadata handled separately)
-		validationProgressTracker := proc.broadcaster.CreateTracker(queueID, 80, 95)
-
-		// Determine sample percentage based on skipHealthCheck
+		releaseDate := archiveFiles[0].ReleaseDate.Unix()
 		samplePercentage := proc.segmentSamplePercentage
 
-		// Process archive with unified aggregator
 		err := rar.ProcessArchive(
 			ctx,
 			nzbFolder,
@@ -502,10 +558,34 @@ func (proc *Processor) processRarArchive(
 			allowedExtensions,
 			timeout,
 			extractedFiles,
+			proc.maxDownloadPrefetch,
+			proc.readTimeout,
+			proc.expandBlurayIso,
 		)
 		if err != nil {
-			return "", err
-		} // Archive analysis complete, validation and finalization will happen in aggregator (80-100%)
+			return nzbFolder, err
+		}
+	}
+
+	if proc.recorder != nil {
+		nzbID := int64(queueID)
+		var totalSize int64
+		for _, f := range regularFiles {
+			totalSize += f.Size
+		}
+		for _, f := range archiveFiles {
+			totalSize += f.Size
+		}
+
+		_ = proc.recorder.AddImportHistory(ctx, &database.ImportHistory{
+			NzbID:       &nzbID,
+			NzbName:     nzbName,
+			FileName:    filepath.Base(nzbFolder),
+			FileSize:    totalSize,
+			VirtualPath: nzbFolder,
+			Category:    category,
+			CompletedAt: time.Now(),
+		})
 	}
 
 	return nzbFolder, nil
@@ -523,17 +603,19 @@ func (proc *Processor) processSevenZipArchive(
 	allowedExtensions []string,
 	timeout time.Duration,
 	extractedFiles []parser.ExtractedFileInfo,
+	category *string,
 ) (string, error) {
 	// Create NZB folder
-	nzbFolder, err := filesystem.CreateNzbFolder(virtualDir, proc.getCleanNzbName(parsed.Path, queueID), proc.metadataService)
+	nzbName := proc.getCleanNzbName(parsed.Path, queueID)
+	nzbFolder, err := filesystem.CreateNzbFolder(virtualDir, nzbName, proc.metadataService)
 	if err != nil {
-		return "", err
+		return nzbFolder, err
 	}
 
 	// Process regular files first if any
 	if len(regularFiles) > 0 {
 		if err := filesystem.CreateDirectoriesForFiles(nzbFolder, regularFiles, proc.metadataService); err != nil {
-			return "", err
+			return nzbFolder, err
 		}
 
 		if err := multifile.ProcessRegularFiles(
@@ -553,26 +635,18 @@ func (proc *Processor) processSevenZipArchive(
 		}
 	}
 
-	// Analyze and process 7zip archive
 	if len(archiveFiles) > 0 {
 		proc.updateProgress(queueID, 50)
 
-		// Create progress tracker for 50-80% range (archive analysis)
-		archiveProgressTracker := proc.broadcaster.CreateTracker(queueID, 50, 80)
-
-		// Get release date from first archive file
-		var releaseDate int64
-		if len(archiveFiles) > 0 {
-			releaseDate = archiveFiles[0].ReleaseDate.Unix()
+		var archiveProgressTracker, validationProgressTracker *progress.Tracker
+		if proc.broadcaster != nil && proc.broadcaster.HasSubscribers() {
+			archiveProgressTracker = proc.broadcaster.CreateTracker(queueID, 50, 80)
+			validationProgressTracker = proc.broadcaster.CreateTracker(queueID, 80, 95)
 		}
 
-		// Create progress tracker for 80-95% range (validation only, metadata handled separately)
-		validationProgressTracker := proc.broadcaster.CreateTracker(queueID, 80, 95)
-
-		// Determine sample percentage based on skipHealthCheck
+		releaseDate := archiveFiles[0].ReleaseDate.Unix()
 		samplePercentage := proc.segmentSamplePercentage
 
-		// Process archive with unified aggregator
 		err := sevenzip.ProcessArchive(
 			ctx,
 			nzbFolder,
@@ -590,10 +664,34 @@ func (proc *Processor) processSevenZipArchive(
 			allowedExtensions,
 			timeout,
 			extractedFiles,
+			proc.maxDownloadPrefetch,
+			proc.readTimeout,
+			proc.expandBlurayIso,
 		)
 		if err != nil {
-			return "", err
-		} // Archive analysis complete, validation and finalization will happen in aggregator (80-100%)
+			return nzbFolder, err
+		}
+	}
+
+	if proc.recorder != nil {
+		nzbID := int64(queueID)
+		var totalSize int64
+		for _, f := range regularFiles {
+			totalSize += f.Size
+		}
+		for _, f := range archiveFiles {
+			totalSize += f.Size
+		}
+
+		_ = proc.recorder.AddImportHistory(ctx, &database.ImportHistory{
+			NzbID:       &nzbID,
+			NzbName:     nzbName,
+			FileName:    filepath.Base(nzbFolder),
+			FileSize:    totalSize,
+			VirtualPath: nzbFolder,
+			Category:    category,
+			CompletedAt: time.Now(),
+		})
 	}
 
 	return nzbFolder, nil

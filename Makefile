@@ -77,7 +77,17 @@ docker-build-ci: build-frontend
 
 .PHONY: build-frontend
 build-frontend:
-	cd frontend && bun install --frozen-lockfile && bun run build
+	@VERSION=$$(git describe --tags --always --dirty 2>/dev/null || echo "dev"); \
+	COMMIT=$$(git rev-parse --short HEAD 2>/dev/null || echo "unknown"); \
+	cd frontend && bun install --frozen-lockfile && APP_VERSION=$$VERSION GIT_COMMIT=$$COMMIT bun run build
+
+.PHONY: build-docs
+build-docs:
+	cd docs && bun install && bun run build
+
+.PHONY: serve-docs
+serve-docs:
+	cd docs && bun run start
 
 .PHONY: build-cli
 build-cli: build-frontend
@@ -88,7 +98,7 @@ build-cli: build-frontend
 	CGO_ENABLED=1 $(GO) build \
 		-trimpath \
 		-tags=cli \
-		-ldflags="-s -w -X 'main.Version=$$VERSION' -X 'main.GitCommit=$$COMMIT' -X 'main.Timestamp=$$TIMESTAMP'" \
+		-ldflags="-s -w -X 'github.com/javi11/altmount/internal/version.Version=$$VERSION' -X 'github.com/javi11/altmount/internal/version.GitCommit=$$COMMIT' -X 'github.com/javi11/altmount/internal/version.Timestamp=$$TIMESTAMP'" \
 		-o altmount \
 		./cmd/altmount/main.go
 

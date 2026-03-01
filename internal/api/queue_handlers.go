@@ -295,6 +295,36 @@ func (s *Server) handleGetQueueStats(c *fiber.Ctx) error {
 	return RespondSuccess(c, response)
 }
 
+// handleGetQueueHistoricalStats handles GET /api/queue/stats/history
+func (s *Server) handleGetQueueHistoricalStats(c *fiber.Ctx) error {
+	// Get optional days parameter, default to 1 (24h)
+	days := 1
+	if daysStr := c.Query("days"); daysStr != "" {
+		if d, err := strconv.Atoi(daysStr); err == nil && d > 0 {
+			days = d
+		}
+	}
+
+	// Limit to max 365 days for performance
+	if days > 365 {
+		days = 365
+	}
+
+	dailyStats, err := s.queueRepo.GetImportDailyStats(c.Context(), days)
+	if err != nil {
+		return RespondInternalError(c, "Failed to retrieve queue historical statistics", err.Error())
+	}
+
+	// For 24h view, we want more granular hourly stats for strict rolling window
+	var hourlyStats []*database.ImportHourlyStat
+	if days == 1 {
+		hourlyStats, _ = s.queueRepo.GetImportHourlyStats(c.Context(), 24)
+	}
+
+	response := ToQueueHistoricalStatsResponse(dailyStats, hourlyStats)
+	return RespondSuccess(c, response)
+}
+
 // handleClearCompletedQueue handles DELETE /api/queue/completed
 func (s *Server) handleClearCompletedQueue(c *fiber.Ctx) error {
 	// Clear completed items
@@ -406,7 +436,9 @@ func (s *Server) handleUploadToQueue(c *fiber.Ctx) error {
 	}
 
 	// Save the uploaded file to temporary location
-	tempFile := filepath.Join(uploadDir, file.Filename)
+	// Use filepath.Base to strip any path components from the filename
+	safeFilename := filepath.Base(file.Filename)
+	tempFile := filepath.Join(uploadDir, safeFilename)
 	if err := c.SaveFile(file, tempFile); err != nil {
 		return RespondInternalError(c, "Failed to save file", err.Error())
 	}
@@ -825,6 +857,53 @@ func (s *Server) handleAddTestQueueItem(c *fiber.Ctx) error {
 
 	response := ToQueueItemResponse(item)
 	return RespondCreated(c, response)
+}
+
+// handleUpdateQueueItemPriority handles PATCH /api/queue/{id}/priority
+func (s *Server) handleUpdateQueueItemPriority(c *fiber.Ctx) error {
+	idStr := c.Params("id")
+	if idStr == "" {
+		return RespondBadRequest(c, "Queue item ID is required", "")
+	}
+
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		return RespondBadRequest(c, "Invalid queue item ID", "ID must be a valid integer")
+	}
+
+	var req struct {
+		Priority int `json:"priority"`
+	}
+	if err := c.BodyParser(&req); err != nil {
+		return RespondBadRequest(c, "Invalid request body", err.Error())
+	}
+
+	// Validate priority: 1=high, 2=normal, 3=low
+	if req.Priority < 1 || req.Priority > 3 {
+		return RespondValidationError(c, "Invalid priority value", "Valid values: 1 (high), 2 (normal), 3 (low)")
+	}
+
+	item, err := s.queueRepo.GetQueueItem(c.Context(), id)
+	if err != nil {
+		return RespondInternalError(c, "Failed to check queue item", err.Error())
+	}
+	if item == nil {
+		return RespondNotFound(c, "Queue item", "")
+	}
+	if item.Status == database.QueueStatusProcessing {
+		return RespondConflict(c, "Cannot change priority of item currently being processed", "")
+	}
+
+	if err := s.queueRepo.UpdateQueueItemPriority(c.Context(), id, database.QueuePriority(req.Priority)); err != nil {
+		return RespondInternalError(c, "Failed to update priority", err.Error())
+	}
+
+	updated, err := s.queueRepo.GetQueueItem(c.Context(), id)
+	if err != nil {
+		return RespondInternalError(c, "Failed to retrieve updated queue item", err.Error())
+	}
+
+	return RespondSuccess(c, ToQueueItemResponse(updated))
 }
 
 // handleDownloadNZB handles GET /api/queue/{id}/download

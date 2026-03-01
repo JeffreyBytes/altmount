@@ -13,6 +13,7 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/javi11/altmount/internal/config"
 	"github.com/javi11/altmount/internal/database"
+	"github.com/javi11/altmount/internal/pathutil"
 )
 
 // handleListHealth handles GET /api/health
@@ -287,14 +288,14 @@ func (s *Server) handleRepairHealth(c *fiber.Ctx) error {
 	// Determine final path for ARR rescan
 	pathForRescan := libraryPath
 	if pathForRescan == "" && cfg.Import.ImportStrategy == config.ImportStrategySYMLINK && cfg.Import.ImportDir != nil && *cfg.Import.ImportDir != "" {
-		pathForRescan = filepath.Join(*cfg.Import.ImportDir, strings.TrimPrefix(item.FilePath, "/"))
+		pathForRescan = pathutil.JoinAbsPath(*cfg.Import.ImportDir, item.FilePath)
 		slog.InfoContext(ctx, "Using symlink import path for manual repair",
 			"file_path", item.FilePath,
 			"symlink_path", pathForRescan)
 	}
 	if pathForRescan == "" {
 		// Fallback to mount path if no library path found
-		pathForRescan = filepath.Join(cfg.MountPath, strings.TrimPrefix(item.FilePath, "/"))
+		pathForRescan = pathutil.JoinAbsPath(cfg.MountPath, item.FilePath)
 		slog.InfoContext(ctx, "Using mount path fallback for manual repair",
 			"file_path", item.FilePath,
 			"mount_path", pathForRescan)
@@ -381,7 +382,7 @@ func (s *Server) handleRepairHealthBulk(c *fiber.Ctx) error {
 
 		pathForRescan := libraryPath
 		if pathForRescan == "" {
-			pathForRescan = filepath.Join(cfg.MountPath, strings.TrimPrefix(item.FilePath, "/"))
+			pathForRescan = pathutil.JoinAbsPath(cfg.MountPath, item.FilePath)
 		}
 
 		// Trigger rescan
@@ -442,10 +443,7 @@ func (s *Server) handleListCorrupted(c *fiber.Ctx) error {
 	if pagination.Offset >= len(corruptedItems) {
 		corruptedItems = []*database.FileHealth{}
 	} else {
-		end := pagination.Offset + pagination.Limit
-		if end > len(corruptedItems) {
-			end = len(corruptedItems)
-		}
+		end := min(pagination.Offset+pagination.Limit, len(corruptedItems))
 		corruptedItems = corruptedItems[pagination.Offset:end]
 	}
 
@@ -595,11 +593,7 @@ func (s *Server) cleanupHealthRecords(ctx context.Context, olderThan time.Time, 
 				pathToDelete = *item.LibraryPath
 			} else {
 				// Fallback to mount path
-				if filepath.IsAbs(item.FilePath) {
-					pathToDelete = item.FilePath
-				} else {
-					pathToDelete = filepath.Join(mountPath, item.FilePath)
-				}
+				pathToDelete = pathutil.JoinAbsPath(mountPath, item.FilePath)
 			}
 
 			// Attempt to delete the physical file using os.Remove
@@ -608,6 +602,24 @@ func (s *Server) cleanupHealthRecords(ctx context.Context, olderThan time.Time, 
 				fileErrors = append(fileErrors, fmt.Sprintf("%s: %v", item.FilePath, deleteErr))
 			} else {
 				deletedFileCount++
+
+				// Clean up empty parent directories
+				var rootPath string
+				if item.LibraryPath != nil && *item.LibraryPath != "" {
+					// Use library directory as root if available
+					if cfg.Health.LibraryDir != nil && *cfg.Health.LibraryDir != "" {
+						rootPath = *cfg.Health.LibraryDir
+					} else {
+						// Fallback to the directory containing the file if root not known
+						rootPath = filepath.Dir(filepath.Dir(pathToDelete))
+					}
+				} else {
+					rootPath = mountPath
+				}
+
+				if rootPath != "" {
+					pathutil.RemoveEmptyDirs(rootPath, filepath.Dir(pathToDelete))
+				}
 			}
 		}
 
@@ -836,7 +848,7 @@ func (s *Server) handleRestartHealthChecksBulk(c *fiber.Ctx) error {
 		return RespondNotFound(c, "Health records", "No health records found to restart")
 	}
 
-	response := map[string]interface{}{
+	response := map[string]any{
 		"message":         "Health checks restarted successfully",
 		"restarted_count": restartedCount,
 		"file_paths":      req.FilePaths,
@@ -892,7 +904,7 @@ func (s *Server) handleCancelHealthCheck(c *fiber.Ctx) error {
 		return RespondInternalError(c, "Failed to retrieve updated health record", err.Error())
 	}
 
-	response := map[string]interface{}{
+	response := map[string]any{
 		"message":      "Health check cancelled",
 		"id":           id,
 		"file_path":    item.FilePath,
@@ -900,6 +912,53 @@ func (s *Server) handleCancelHealthCheck(c *fiber.Ctx) error {
 		"new_status":   string(updatedItem.Status),
 		"cancelled_at": time.Now().Format(time.RFC3339),
 		"health_data":  ToHealthItemResponse(updatedItem),
+	}
+
+	return RespondSuccess(c, response)
+}
+
+// handleUnmaskHealth handles POST /api/health/{id}/unmask
+func (s *Server) handleUnmaskHealth(c *fiber.Ctx) error {
+	// Extract ID from path parameter
+	idStr := c.Params("id")
+	if idStr == "" {
+		return RespondBadRequest(c, "Health record identifier is required", "")
+	}
+
+	// Parse as numeric ID
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		return RespondBadRequest(c, "Invalid health record ID", "ID must be a valid integer")
+	}
+
+	// Check if item exists in health database
+	item, err := s.healthRepo.GetFileHealthByID(c.Context(), id)
+	if err != nil {
+		return RespondInternalError(c, "Failed to check health record", err.Error())
+	}
+
+	if item == nil {
+		return RespondNotFound(c, "Health record", "")
+	}
+
+	// Unmask file
+	err = s.healthRepo.UnmaskFile(c.Context(), item.FilePath)
+	if err != nil {
+		return RespondInternalError(c, "Failed to unmask file", err.Error())
+	}
+
+	// Get the updated health record
+	updatedItem, err := s.healthRepo.GetFileHealthByID(c.Context(), id)
+	if err != nil {
+		return RespondInternalError(c, "Failed to retrieve updated health record", err.Error())
+	}
+
+	response := map[string]any{
+		"message":     "File unmasked successfully",
+		"id":          id,
+		"file_path":   item.FilePath,
+		"updated_at":  time.Now().Format(time.RFC3339),
+		"health_data": ToHealthItemResponse(updatedItem),
 	}
 
 	return RespondSuccess(c, response)
@@ -950,7 +1009,7 @@ func (s *Server) handleSetHealthPriority(c *fiber.Ctx) error {
 		return RespondInternalError(c, "Failed to retrieve updated health record", err.Error())
 	}
 
-	response := map[string]interface{}{
+	response := map[string]any{
 		"message":     "Health priority updated",
 		"id":          id,
 		"file_path":   item.FilePath,
@@ -970,7 +1029,7 @@ func (s *Server) handleResetAllHealthChecks(c *fiber.Ctx) error {
 		return RespondInternalError(c, "Failed to reset all health checks", err.Error())
 	}
 
-	response := map[string]interface{}{
+	response := map[string]any{
 		"message":         "All health checks reset successfully",
 		"restarted_count": restartedCount,
 		"restarted_at":    time.Now().Format(time.RFC3339),
@@ -1015,10 +1074,10 @@ func (s *Server) handleRegenerateSymlinks(c *fiber.Ctx) error {
 
 	for _, file := range files {
 		// Build the actual file path in the mount
-		actualPath := filepath.Join(cfg.MountPath, strings.TrimPrefix(file.FilePath, "/"))
+		actualPath := pathutil.JoinAbsPath(cfg.MountPath, file.FilePath)
 
 		// Build the symlink path in the import directory
-		symlinkPath := filepath.Join(*cfg.Import.ImportDir, strings.TrimPrefix(file.FilePath, "/"))
+		symlinkPath := pathutil.JoinAbsPath(*cfg.Import.ImportDir, file.FilePath)
 
 		// Create directory if needed
 		baseDir := filepath.Dir(symlinkPath)

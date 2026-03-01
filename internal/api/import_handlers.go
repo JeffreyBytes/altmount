@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -151,6 +152,15 @@ func (s *Server) handleManualImportFile(c *fiber.Ctx) error {
 		})
 	}
 
+	// Sanitize and validate the path to prevent path traversal
+	req.FilePath = filepath.Clean(req.FilePath)
+	if !filepath.IsAbs(req.FilePath) {
+		return c.Status(422).JSON(fiber.Map{
+			"success": false,
+			"message": "File path must be absolute",
+		})
+	}
+
 	// Check if file exists and is accessible
 	fileInfo, err := os.Stat(req.FilePath)
 	if err != nil {
@@ -232,6 +242,28 @@ func (s *Server) handleManualImportFile(c *fiber.Ctx) error {
 	})
 }
 
+// handleGetImportHistory handles GET /api/import/history
+func (s *Server) handleGetImportHistory(c *fiber.Ctx) error {
+	limit := 50
+	if l := c.Query("limit"); l != "" {
+		if _, err := fmt.Sscanf(l, "%d", &limit); err != nil {
+			limit = 50
+		}
+	}
+
+	history, err := s.queueRepo.ListImportHistory(c.Context(), limit, 0, "", "")
+	if err != nil {
+		return RespondInternalError(c, "Failed to list import history", err.Error())
+	}
+
+	response := make([]*ImportHistoryResponse, len(history))
+	for i, h := range history {
+		response[i] = ToImportHistoryResponse(h)
+	}
+
+	return RespondSuccess(c, response)
+}
+
 // toScanStatusResponse converts importer.ScanInfo to ScanStatusResponse
 func toScanStatusResponse(scanInfo importer.ScanInfo) *ScanStatusResponse {
 	return &ScanStatusResponse{
@@ -243,4 +275,15 @@ func toScanStatusResponse(scanInfo importer.ScanInfo) *ScanStatusResponse {
 		CurrentFile: scanInfo.CurrentFile,
 		LastError:   scanInfo.LastError,
 	}
+}
+
+// handleClearImportHistory handles DELETE /api/import/history
+func (s *Server) handleClearImportHistory(c *fiber.Ctx) error {
+	if err := s.queueRepo.ClearImportHistory(c.Context()); err != nil {
+		return RespondInternalError(c, "Failed to clear import history", err.Error())
+	}
+
+	return RespondSuccess(c, fiber.Map{
+		"message": "Import history cleared successfully",
+	})
 }

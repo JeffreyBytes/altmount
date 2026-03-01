@@ -102,7 +102,6 @@ export function ProviderHealth() {
 									<th>Missing</th>
 									<th>Current Speed</th>
 									<th>Top Speed</th>
-									<th>Last Activity</th>
 								</tr>
 							</thead>
 							<tbody>
@@ -187,11 +186,6 @@ export function ProviderHealth() {
 											) : (
 												<span className="text-base-content/50">-</span>
 											)}
-										</td>
-										<td className="text-base-content/70 text-sm">
-											{provider.last_successful_connect
-												? formatRelativeTime(provider.last_successful_connect)
-												: "Never"}
 										</td>
 									</tr>
 								))}

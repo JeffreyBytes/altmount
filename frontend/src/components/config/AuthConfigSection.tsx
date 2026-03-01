@@ -1,6 +1,7 @@
-import { AlertTriangle, Save } from "lucide-react";
+import { AlertTriangle, Save, ShieldCheck } from "lucide-react";
 import { useEffect, useState } from "react";
 import type { AuthConfig, ConfigResponse } from "../../types/config";
+import { LoadingSpinner } from "../ui/LoadingSpinner";
 
 interface AuthConfigSectionProps {
 	config: ConfigResponse;
@@ -43,60 +44,68 @@ export function AuthConfigSection({
 	};
 
 	return (
-		<div className="space-y-4">
-			<h3 className="font-semibold text-lg">Authentication</h3>
+		<div className="space-y-10">
+			<div>
+				<h3 className="font-bold text-base-content text-lg tracking-tight">Security & Access</h3>
+				<p className="break-words text-base-content/50 text-sm">
+					Control how users authenticate with the AltMount web interface.
+				</p>
+			</div>
 
-			{/* Login Required Setting */}
-			<fieldset className="fieldset">
-				<legend className="fieldset-legend">Login Required</legend>
-				<div className="space-y-3">
-					<label className="label cursor-pointer">
-						<span className="label-text">
-							Require user authentication to access the web application
-						</span>
+			<div className="space-y-8">
+				{/* Login Required Toggle */}
+				<div className="space-y-6 rounded-2xl border-2 border-base-300/80 bg-base-200/60 p-6">
+					<div className="flex items-center gap-2">
+						<ShieldCheck className="h-4 w-4 text-base-content/60" />
+						<h4 className="font-bold text-base-content/40 text-xs uppercase tracking-widest">
+							Authentication
+						</h4>
+						<div className="h-px flex-1 bg-base-300/50" />
+					</div>
+
+					<div className="flex items-start items-center justify-between gap-4">
+						<div className="min-w-0 flex-1">
+							<h5 className="break-words font-bold text-sm">Require Login</h5>
+							<p className="mt-1 break-words text-[11px] text-base-content/50 leading-relaxed">
+								Force users to sign in before accessing the dashboard or settings.
+							</p>
+						</div>
 						<input
 							type="checkbox"
-							className="checkbox"
+							className="toggle toggle-primary mt-1 shrink-0"
 							checked={formData.login_required}
 							disabled={isReadOnly}
 							onChange={(e) => handleToggle(e.target.checked)}
 						/>
-					</label>
-					<p className="label">
-						When enabled, users must log in to access the web interface. When disabled, anyone can
-						access the application without authentication.
-					</p>
+					</div>
 
 					{!formData.login_required && (
-						<div className="alert alert-warning">
-							<AlertTriangle className="h-6 w-6" />
-							<div>
-								<div className="font-bold">Security Warning</div>
-								<div className="text-sm">
-									Disabling login requirement will allow anyone to access your application without
-									authentication. Only disable this if you have other security measures in place
-									(firewall, VPN, etc.).
+						<div className="alert zoom-in-95 animate-in items-start rounded-xl border border-warning/20 bg-warning/5 px-4 py-3">
+							<AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-warning" />
+							<div className="min-w-0">
+								<div className="font-bold text-warning text-xs uppercase tracking-wider">
+									Security Risk
+								</div>
+								<div className="mt-1 break-words text-[11px] leading-relaxed opacity-80">
+									Your interface is currently public. Anyone with network access can change your
+									configuration and download clients. Ensure you have external security (e.g., VPN).
 								</div>
 							</div>
 						</div>
 					)}
 				</div>
-			</fieldset>
+			</div>
 
 			{/* Save Button */}
 			{!isReadOnly && (
-				<div className="flex justify-end">
+				<div className="flex justify-end border-base-200 border-t pt-4">
 					<button
 						type="button"
-						className="btn btn-primary"
+						className={`btn btn-primary px-10 shadow-lg shadow-primary/20 ${!hasChanges && "btn-ghost border-base-300"}`}
 						onClick={handleSave}
 						disabled={!hasChanges || isUpdating}
 					>
-						{isUpdating ? (
-							<span className="loading loading-spinner loading-sm" />
-						) : (
-							<Save className="h-4 w-4" />
-						)}
+						{isUpdating ? <LoadingSpinner size="sm" /> : <Save className="h-4 w-4" />}
 						{isUpdating ? "Saving..." : "Save Changes"}
 					</button>
 				</div>

@@ -11,9 +11,9 @@ import (
 // DBQuerier defines the interface for database query operations
 // Both *sql.DB and *sql.Tx implement this interface
 type DBQuerier interface {
-	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
-	QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error)
-	QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
 // Repository provides database operations for NZB and file management
@@ -273,21 +273,25 @@ func (r *Repository) AddBatchToQueue(ctx context.Context, items []*ImportQueueIt
 func (r *Repository) UpdateQueueItemStatus(ctx context.Context, id int64, status QueueStatus, errorMessage *string) error {
 	now := time.Now()
 	var query string
-	var args []interface{}
+	var args []any
 
 	switch status {
 	case QueueStatusProcessing:
 		query = `UPDATE import_queue SET status = ?, started_at = ?, updated_at = ? WHERE id = ?`
-		args = []interface{}{status, now, now, id}
+		args = []any{status, now, now, id}
 	case QueueStatusCompleted:
 		query = `UPDATE import_queue SET status = ?, completed_at = ?, updated_at = ?, error_message = NULL WHERE id = ?`
-		args = []interface{}{status, now, now, id}
+		args = []any{status, now, now, id}
+		// Track successful import
+		_ = r.IncrementDailyStat(ctx, "completed")
 	case QueueStatusFailed:
 		query = `UPDATE import_queue SET status = ?, error_message = ?, updated_at = ? WHERE id = ?`
-		args = []interface{}{status, errorMessage, now, id}
+		args = []any{status, errorMessage, now, id}
+		// Track failed import
+		_ = r.IncrementDailyStat(ctx, "failed")
 	default:
 		query = `UPDATE import_queue SET status = ?, error_message = ?, updated_at = ? WHERE id = ?`
-		args = []interface{}{status, errorMessage, now, id}
+		args = []any{status, errorMessage, now, id}
 	}
 
 	_, err := r.db.ExecContext(ctx, query, args...)
@@ -296,6 +300,25 @@ func (r *Repository) UpdateQueueItemStatus(ctx context.Context, id int64, status
 	}
 
 	return nil
+}
+
+// IncrementDailyStat increments the completed or failed count for the current day
+func (r *Repository) IncrementDailyStat(ctx context.Context, statType string) error {
+	column := "completed_count"
+	if statType == "failed" {
+		column = "failed_count"
+	}
+
+	query := fmt.Sprintf(`
+		INSERT INTO import_daily_stats (day, %s, updated_at)
+		VALUES (date('now'), 1, datetime('now'))
+		ON CONFLICT(day) DO UPDATE SET
+		%s = %s + 1,
+		updated_at = datetime('now')
+	`, column, column, column)
+
+	_, err := r.db.ExecContext(ctx, query)
+	return err
 }
 
 // GetQueueItem retrieves a specific queue item by ID
@@ -384,7 +407,7 @@ func (r *Repository) RemoveFromQueueBulk(ctx context.Context, ids []int64) (*Bul
 
 	// Build placeholders for the IN clause
 	placeholders := make([]string, len(ids))
-	args := make([]interface{}, len(ids))
+	args := make([]any, len(ids))
 	for i, id := range ids {
 		placeholders[i] = "?"
 		args[i] = id
@@ -438,7 +461,7 @@ func (r *Repository) RestartQueueItemsBulk(ctx context.Context, ids []int64) err
 
 	// Build placeholders for the IN clause
 	placeholders := make([]string, len(ids))
-	args := make([]interface{}, len(ids))
+	args := make([]any, len(ids))
 	for i, id := range ids {
 		placeholders[i] = "?"
 		args[i] = id
@@ -558,7 +581,7 @@ func (r *Repository) UpdateQueueStats(ctx context.Context) error {
 		WHERE id = (SELECT MAX(id) FROM queue_stats)
 	`
 
-	var avgTime interface{}
+	var avgTime any
 	if avgProcessingTime.Valid {
 		avgTime = avgProcessingTime.Int64
 	} else {
@@ -576,14 +599,14 @@ func (r *Repository) UpdateQueueStats(ctx context.Context) error {
 // ListQueueItems retrieves queue items with optional filtering
 func (r *Repository) ListQueueItems(ctx context.Context, status *QueueStatus, search string, category string, limit, offset int, sortBy, sortOrder string) ([]*ImportQueueItem, error) {
 	var query string
-	var args []interface{}
+	var args []any
 
 	baseSelect := `SELECT id, nzb_path, relative_path, category, priority, status, created_at, updated_at,
 	               started_at, completed_at, retry_count, max_retries, error_message, batch_id, metadata, file_size, storage_path
 	               FROM import_queue`
 
 	var conditions []string
-	var conditionArgs []interface{}
+	var conditionArgs []any
 
 	if status != nil {
 		conditions = append(conditions, "status = ?")
@@ -656,14 +679,14 @@ func (r *Repository) ListQueueItems(ctx context.Context, status *QueueStatus, se
 // ListActiveQueueItems retrieves pending and processing queue items
 func (r *Repository) ListActiveQueueItems(ctx context.Context, search string, category string, limit, offset int, sortBy, sortOrder string) ([]*ImportQueueItem, error) {
 	var query string
-	var args []interface{}
+	var args []any
 
 	baseSelect := `SELECT id, nzb_path, relative_path, category, priority, status, created_at, updated_at,
 	               started_at, completed_at, retry_count, max_retries, error_message, batch_id, metadata, file_size, storage_path
 	               FROM import_queue`
 
 	conditions := []string{"(status = 'pending' OR status = 'processing' OR status = 'paused')"}
-	var conditionArgs []interface{}
+	var conditionArgs []any
 
 	if search != "" {
 		conditions = append(conditions, "(nzb_path LIKE ? OR relative_path LIKE ?)")
@@ -727,12 +750,12 @@ func (r *Repository) ListActiveQueueItems(ctx context.Context, search string, ca
 // CountQueueItems counts the total number of queue items matching the given filters
 func (r *Repository) CountQueueItems(ctx context.Context, status *QueueStatus, search string, category string) (int, error) {
 	var query string
-	var args []interface{}
+	var args []any
 
 	baseQuery := `SELECT COUNT(*) FROM import_queue`
 
 	var conditions []string
-	var conditionArgs []interface{}
+	var conditionArgs []any
 
 	if status != nil {
 		conditions = append(conditions, "status = ?")
@@ -770,12 +793,12 @@ func (r *Repository) CountQueueItems(ctx context.Context, status *QueueStatus, s
 // CountActiveQueueItems counts the total number of pending and processing queue items
 func (r *Repository) CountActiveQueueItems(ctx context.Context, search string, category string) (int, error) {
 	var query string
-	var args []interface{}
+	var args []any
 
 	baseQuery := `SELECT COUNT(*) FROM import_queue WHERE (status = 'pending' OR status = 'processing' OR status = 'paused')`
 
 	var conditions []string
-	var conditionArgs []interface{}
+	var conditionArgs []any
 
 	if search != "" {
 		conditions = append(conditions, "(nzb_path LIKE ? OR relative_path LIKE ?)")
@@ -893,16 +916,13 @@ func (r *Repository) FilterExistingNzbdavIds(ctx context.Context, ids []string) 
 	existingIds := make([]string, 0)
 
 	for i := 0; i < len(ids); i += batchSize {
-		end := i + batchSize
-		if end > len(ids) {
-			end = len(ids)
-		}
+		end := min(i+batchSize, len(ids))
 
 		batchIds := ids[i:end]
 
 		// Build placeholders for the IN clause
 		placeholders := make([]string, len(batchIds))
-		args := make([]interface{}, len(batchIds))
+		args := make([]any, len(batchIds))
 		for j, id := range batchIds {
 			placeholders[j] = "?"
 			args[j] = id
@@ -946,3 +966,443 @@ func (r *Repository) UpdateQueueItemPriority(ctx context.Context, id int64, prio
 	}
 	return nil
 }
+
+// AddImportHistory records a successful file import in the persistent history table
+func (r *Repository) AddImportHistory(ctx context.Context, history *ImportHistory) error {
+	query := `
+		INSERT INTO import_history (nzb_id, nzb_name, file_name, file_size, virtual_path, category, completed_at)
+		VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+	`
+	_, err := r.db.ExecContext(ctx, query,
+		history.NzbID, history.NzbName, history.FileName, history.FileSize,
+		history.VirtualPath, history.Category)
+	if err != nil {
+		return fmt.Errorf("failed to add import history: %w", err)
+	}
+	return nil
+}
+
+// ListImportHistory retrieves import history items with optional filtering and pagination
+func (r *Repository) ListImportHistory(ctx context.Context, limit, offset int, search string, category string) ([]*ImportHistory, error) {
+	query := `
+		SELECT h.id, h.nzb_id, h.nzb_name, h.file_name, h.file_size, h.virtual_path, f.library_path, h.category, h.completed_at
+		FROM import_history h
+		LEFT JOIN file_health f ON h.virtual_path = f.file_path
+		WHERE (? = '' OR h.nzb_name LIKE ? OR h.file_name LIKE ? OR h.virtual_path LIKE ?)
+		  AND (? = '' OR h.category = ?)
+		ORDER BY h.completed_at DESC
+		LIMIT ? OFFSET ?
+	`
+
+	searchPattern := "%" + search + "%"
+	rows, err := r.db.QueryContext(ctx, query, search, searchPattern, searchPattern, searchPattern, category, category, limit, offset)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list import history: %w", err)
+	}
+	defer rows.Close()
+
+	var history []*ImportHistory
+	for rows.Next() {
+		var h ImportHistory
+		err := rows.Scan(&h.ID, &h.NzbID, &h.NzbName, &h.FileName, &h.FileSize, &h.VirtualPath, &h.LibraryPath, &h.Category, &h.CompletedAt)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan import history: %w", err)
+		}
+		history = append(history, &h)
+	}
+
+	return history, rows.Err()
+}
+
+// GetImportDailyStats retrieves import statistics for the specified number of days
+func (r *Repository) GetImportDailyStats(ctx context.Context, days int) ([]*ImportDailyStat, error) {
+	query := `
+		SELECT day, completed_count, failed_count, bytes_downloaded, updated_at
+		FROM import_daily_stats
+		WHERE day >= date('now', ?)
+		ORDER BY day ASC
+	`
+
+	rows, err := r.db.QueryContext(ctx, query, fmt.Sprintf("-%d days", days))
+	if err != nil {
+		return nil, fmt.Errorf("failed to get import daily stats: %w", err)
+	}
+	defer rows.Close()
+
+	var stats []*ImportDailyStat
+	for rows.Next() {
+		var s ImportDailyStat
+		err := rows.Scan(&s.Day, &s.CompletedCount, &s.FailedCount, &s.BytesDownloaded, &s.UpdatedAt)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan import daily stat: %w", err)
+		}
+		stats = append(stats, &s)
+	}
+
+	return stats, rows.Err()
+}
+
+// GetImportHourlyStats retrieves import statistics for the specified number of hours
+func (r *Repository) GetImportHourlyStats(ctx context.Context, hours int) ([]*ImportHourlyStat, error) {
+	query := `
+		SELECT hour, completed_count, failed_count, bytes_downloaded, updated_at
+		FROM import_hourly_stats
+		WHERE hour >= datetime('now', ?)
+		ORDER BY hour ASC
+	`
+
+	rows, err := r.db.QueryContext(ctx, query, fmt.Sprintf("-%d hours", hours))
+	if err != nil {
+		return nil, fmt.Errorf("failed to get import hourly stats: %w", err)
+	}
+	defer rows.Close()
+
+	var stats []*ImportHourlyStat
+	for rows.Next() {
+		var s ImportHourlyStat
+		err := rows.Scan(&s.Hour, &s.CompletedCount, &s.FailedCount, &s.BytesDownloaded, &s.UpdatedAt)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan import hourly stat: %w", err)
+		}
+		stats = append(stats, &s)
+	}
+
+	return stats, rows.Err()
+}
+
+// AddBytesDownloadedToDailyStat increments the bytes_downloaded counter for the current day
+func (r *Repository) AddBytesDownloadedToDailyStat(ctx context.Context, bytes int64) error {
+	if bytes <= 0 {
+		return nil
+	}
+
+	// Also add to hourly stat for rolling 24h calculation
+	_ = r.AddBytesDownloadedToHourlyStat(ctx, bytes)
+
+	query := `
+		INSERT INTO import_daily_stats (day, bytes_downloaded, updated_at)
+		VALUES (date('now'), ?, datetime('now'))
+		ON CONFLICT(day) DO UPDATE SET
+		bytes_downloaded = bytes_downloaded + excluded.bytes_downloaded,
+		updated_at = datetime('now')
+	`
+
+	_, err := r.db.ExecContext(ctx, query, bytes)
+	return err
+}
+
+// AddBytesDownloadedToHourlyStat increments the bytes_downloaded counter for the current hour
+func (r *Repository) AddBytesDownloadedToHourlyStat(ctx context.Context, bytes int64) error {
+	if bytes <= 0 {
+		return nil
+	}
+
+	// Calculate start of current hour: YYYY-MM-DD HH:00:00
+	currentHour := time.Now().UTC().Truncate(time.Hour)
+
+	query := `
+		INSERT INTO import_hourly_stats (hour, bytes_downloaded, updated_at)
+		VALUES (?, ?, datetime('now'))
+		ON CONFLICT(hour) DO UPDATE SET
+		bytes_downloaded = bytes_downloaded + excluded.bytes_downloaded,
+		updated_at = datetime('now')
+	`
+
+	_, err := r.db.ExecContext(ctx, query, currentHour, bytes)
+	return err
+}
+
+// IncrementHourlyStat increments the completed or failed count for the current hour
+func (r *Repository) IncrementHourlyStat(ctx context.Context, statType string) error {
+	column := "completed_count"
+	if statType == "failed" {
+		column = "failed_count"
+	}
+
+	// Calculate start of current hour
+	currentHour := time.Now().UTC().Truncate(time.Hour)
+
+	query := fmt.Sprintf(`
+		INSERT INTO import_hourly_stats (hour, %s, updated_at)
+		VALUES (?, 1, datetime('now'))
+		ON CONFLICT(hour) DO UPDATE SET
+		%s = %s + 1,
+		updated_at = datetime('now')
+	`, column, column, column)
+
+	_, err := r.db.ExecContext(ctx, query, currentHour)
+	return err
+}
+
+
+// GetImportHistory retrieves historical import statistics for the last N days (Alias for GetImportDailyStats)
+func (r *Repository) GetImportHistory(ctx context.Context, days int) ([]*ImportDailyStat, error) {
+	return r.GetImportDailyStats(ctx, days)
+}
+
+// GetImportHistoryItem retrieves a specific import history item by ID
+func (r *Repository) GetImportHistoryItem(ctx context.Context, id int64) (*ImportHistory, error) {
+	query := `
+		SELECT h.id, h.nzb_id, h.nzb_name, h.file_name, h.file_size, h.virtual_path, f.library_path, h.category, h.completed_at
+		FROM import_history h
+		LEFT JOIN file_health f ON h.virtual_path = f.file_path
+		WHERE h.id = ?
+	`
+
+	var h ImportHistory
+	err := r.db.QueryRowContext(ctx, query, id).Scan(&h.ID, &h.NzbID, &h.NzbName, &h.FileName, &h.FileSize, &h.VirtualPath, &h.LibraryPath, &h.Category, &h.CompletedAt)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to get import history item: %w", err)
+	}
+
+	return &h, nil
+}
+
+// GetSystemStats retrieves all system statistics as a map
+func (r *Repository) GetSystemStats(ctx context.Context) (map[string]int64, error) {
+	query := `SELECT key, value FROM system_stats`
+	rows, err := r.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get system stats: %w", err)
+	}
+	defer rows.Close()
+
+	stats := make(map[string]int64)
+	for rows.Next() {
+		var key string
+		var value int64
+		if err := rows.Scan(&key, &value); err != nil {
+			return nil, fmt.Errorf("failed to scan system stat: %w", err)
+		}
+		stats[key] = value
+	}
+
+	return stats, nil
+}
+
+// UpdateSystemStat updates or inserts a single system statistic
+func (r *Repository) UpdateSystemStat(ctx context.Context, key string, value int64) error {
+	query := `
+		INSERT INTO system_stats (key, value, updated_at)
+		VALUES (?, ?, datetime('now'))
+		ON CONFLICT(key) DO UPDATE SET
+		value = excluded.value,
+		updated_at = datetime('now')
+	`
+	_, err := r.db.ExecContext(ctx, query, key, value)
+	if err != nil {
+		return fmt.Errorf("failed to update system stat %s: %w", key, err)
+	}
+	return nil
+}
+
+// BatchUpdateSystemStats updates multiple system statistics in a single transaction
+func (r *Repository) BatchUpdateSystemStats(ctx context.Context, stats map[string]int64) error {
+	if len(stats) == 0 {
+		return nil
+	}
+
+	// Cast to *sql.DB to access BeginTx method
+	sqlDB, ok := r.db.(*sql.DB)
+	if !ok {
+		return fmt.Errorf("repository not connected to sql.DB, cannot begin transaction")
+	}
+
+	tx, err := sqlDB.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	query := `
+		INSERT INTO system_stats (key, value, updated_at)
+		VALUES (?, ?, datetime('now'))
+		ON CONFLICT(key) DO UPDATE SET
+		value = excluded.value,
+		updated_at = datetime('now')
+	`
+
+	stmt, err := tx.PrepareContext(ctx, query)
+	if err != nil {
+		return fmt.Errorf("failed to prepare statement: %w", err)
+	}
+	defer stmt.Close()
+
+	for key, value := range stats {
+		if _, err := stmt.ExecContext(ctx, key, value); err != nil {
+			return fmt.Errorf("failed to execute statement for key %s: %w", key, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	return nil
+}
+
+// UpdateSystemState updates a system state string (JSON) by key
+func (r *Repository) UpdateSystemState(ctx context.Context, key string, value string) error {
+	query := `
+		INSERT INTO system_state (key, value, updated_at)
+		VALUES (?, ?, datetime('now'))
+		ON CONFLICT(key) DO UPDATE SET
+		value = excluded.value,
+		updated_at = datetime('now')
+	`
+	_, err := r.db.ExecContext(ctx, query, key, value)
+	if err != nil {
+		return fmt.Errorf("failed to update system state %s: %w", key, err)
+	}
+	return nil
+}
+
+// GetSystemState retrieves a system state string by key
+func (r *Repository) GetSystemState(ctx context.Context, key string) (string, error) {
+	query := `SELECT value FROM system_state WHERE key = ?`
+	var value string
+	err := r.db.QueryRowContext(ctx, query, key).Scan(&value)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return "", nil
+		}
+		return "", fmt.Errorf("failed to get system state %s: %w", key, err)
+	}
+	return value, nil
+}
+
+// ClearImportHistory deletes all records from the import_history and import_daily_stats tables
+func (r *Repository) ClearImportHistory(ctx context.Context) error {
+	// Clear history records
+	queryHistory := `DELETE FROM import_history`
+	if _, err := r.db.ExecContext(ctx, queryHistory); err != nil {
+		return fmt.Errorf("failed to clear import history: %w", err)
+	}
+
+	// Also clear daily stats
+	return r.ClearDailyStats(ctx)
+}
+
+// ClearImportHistorySince deletes records from the import_history and import_queue tables
+// since the specified time, and adjusts the import_daily_stats accordingly.
+func (r *Repository) ClearImportHistorySince(ctx context.Context, since time.Time) error {
+	return r.WithTransaction(ctx, func(txRepo *Repository) error {
+		// 1. Count completed items in history per day
+		queryHistoryCounts := `
+			SELECT date(completed_at) as day, COUNT(*) as count
+			FROM import_history
+			WHERE completed_at >= ?
+			GROUP BY day
+		`
+		rows, err := txRepo.db.QueryContext(ctx, queryHistoryCounts, since)
+		if err != nil {
+			return fmt.Errorf("failed to query history counts: %w", err)
+		}
+		defer rows.Close()
+
+		type dayCount struct {
+			day   string
+			count int
+		}
+		var historyCounts []dayCount
+		for rows.Next() {
+			var dc dayCount
+			if err := rows.Scan(&dc.day, &dc.count); err != nil {
+				return err
+			}
+			historyCounts = append(historyCounts, dc)
+		}
+		rows.Close()
+
+		// 2. Count failed items in queue per day
+		queryFailedCounts := `
+			SELECT date(updated_at) as day, COUNT(*) as count
+			FROM import_queue
+			WHERE status = 'failed' AND updated_at >= ?
+			GROUP BY day
+		`
+		rows, err = txRepo.db.QueryContext(ctx, queryFailedCounts, since)
+		if err != nil {
+			return fmt.Errorf("failed to query failed counts: %w", err)
+		}
+		defer rows.Close()
+
+		var failedCounts []dayCount
+		for rows.Next() {
+			var dc dayCount
+			if err := rows.Scan(&dc.day, &dc.count); err != nil {
+				return err
+			}
+			failedCounts = append(failedCounts, dc)
+		}
+		rows.Close()
+
+		// 3. Decrement daily stats for completed items
+		for _, hc := range historyCounts {
+			queryUpdate := `
+				UPDATE import_daily_stats 
+				SET completed_count = MAX(0, completed_count - ?), updated_at = datetime('now')
+				WHERE day = ?
+			`
+			if _, err := txRepo.db.ExecContext(ctx, queryUpdate, hc.count, hc.day); err != nil {
+				return fmt.Errorf("failed to decrement completed daily stats: %w", err)
+			}
+		}
+
+		// 4. Decrement daily stats for failed items
+		for _, fc := range failedCounts {
+			queryUpdate := `
+				UPDATE import_daily_stats 
+				SET failed_count = MAX(0, failed_count - ?), updated_at = datetime('now')
+				WHERE day = ?
+			`
+			if _, err := txRepo.db.ExecContext(ctx, queryUpdate, fc.count, fc.day); err != nil {
+				return fmt.Errorf("failed to decrement failed daily stats: %w", err)
+			}
+		}
+
+		// 5. Delete from import_history
+		queryDeleteHistory := `DELETE FROM import_history WHERE completed_at >= ?`
+		if _, err := txRepo.db.ExecContext(ctx, queryDeleteHistory, since); err != nil {
+			return fmt.Errorf("failed to delete from import history: %w", err)
+		}
+
+		// 6. Delete from import_queue (completed and failed items)
+		queryDeleteQueue := `
+			DELETE FROM import_queue 
+			WHERE status IN ('completed', 'failed') 
+			  AND (
+				(status = 'completed' AND completed_at >= ?) OR 
+				(status = 'failed' AND updated_at >= ?)
+			  )
+		`
+		if _, err := txRepo.db.ExecContext(ctx, queryDeleteQueue, since, since); err != nil {
+			return fmt.Errorf("failed to delete from import queue: %w", err)
+		}
+
+		return nil
+	})
+}
+
+// ClearDailyStats deletes all records from the import_daily_stats and import_hourly_stats tables
+func (r *Repository) ClearDailyStats(ctx context.Context) error {
+	queryDaily := `DELETE FROM import_daily_stats`
+	if _, err := r.db.ExecContext(ctx, queryDaily); err != nil {
+		return fmt.Errorf("failed to clear daily stats: %w", err)
+	}
+
+	return r.ClearHourlyStats(ctx)
+}
+
+// ClearHourlyStats deletes all records from the import_hourly_stats table
+func (r *Repository) ClearHourlyStats(ctx context.Context) error {
+	queryHourly := `DELETE FROM import_hourly_stats`
+	if _, err := r.db.ExecContext(ctx, queryHourly); err != nil {
+		return fmt.Errorf("failed to clear hourly stats: %w", err)
+	}
+	return nil
+}
+

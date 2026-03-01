@@ -25,10 +25,18 @@ database:
 metadata:
   root_path: '/config/metadata' # Directory to store metadata files (required)
   delete_source_nzb_on_removal: false # Delete source NZB file when metadata is removed (default: false)
+  backup:
+    enabled: false # Enable automatic metadata backups
+    interval_hours: 24 # Backup interval in hours
+    keep_backups: 1 # Number of old backups to keep
+    path: '/config/backups' # Absolute path to store backups
 
 # Streaming and download configuration
 streaming:
-  max_cache_size_mb: 32 # Maximum cache size in MB for ahead download chunks (default: 32MB)
+  max_prefetch: 30 # Number of segments to prefetch ahead of current read position
+  failure_masking:
+    enabled: true # Automatically hide files from mounts after repeated failures
+    threshold: 3 # Number of streaming failures before masking a file
 
 # RClone configuration (optional)
 rclone:
@@ -152,12 +160,13 @@ health:
   check_interval_seconds: 5 # Health check interval in seconds (default: 5)
   max_connections_for_health_checks: 5 # Number of NNTP connections for health checks (default: 5)
   segment_sample_percentage: 5 # Percentage of segments to sample for health validation (1-100, default: 5)
+  acceptable_missing_segments_percentage: 0 # Percentage of missing segments allowed before a file is marked as corrupted (0-100, default: 0)
   library_sync_interval_minutes: 360 # Library synchronization interval in minutes (default: 360 = 6 hours)
   library_sync_concurrency: 1 # Number of concurrent library sync operations (default: 1)
   resolve_repair_on_import: false # Automatically resolve pending repairs in the same directory when a new file is imported (default: false)
 
 # WebDAV mount path configuration
-mount_path: '' # WebDAV mount path, Example: '/mnt/altmount' or '/mnt/unionfs'. Must be an absolute path starting with /
+mount_path: '' # WebDAV mount path, Example: '/mnt/remotes/altmount' or '/mnt/unionfs'. Must be an absolute path starting with /
 
 # SABnzbd-compatible API configuration
 sabnzbd:
@@ -232,7 +241,7 @@ providers:
     username: 'your_username' # Replace with your username
     password: 'your_password' # Replace with your password
     max_connections: 20
-    inflight_requests: 3 # Concurrent requests per connection (pipelining, default: 3)
+    inflight_requests: 10 # Concurrent requests per connection (pipelining, default: 3)
     tls: true
     insecure_tls: false
     enabled: true # Enable/disable this provider (default: true)
@@ -245,7 +254,7 @@ providers:
     username: 'your_username' # Replace with your username
     password: 'your_password' # Replace with your password
     max_connections: 10
-    inflight_requests: 3 # Concurrent requests per connection (pipelining, default: 3)
+    inflight_requests: 10 # Concurrent requests per connection (pipelining, default: 3)
     tls: false
     insecure_tls: false
     enabled: true
@@ -343,7 +352,7 @@ providers:
 #     - Global WebDAV mount path configuration
 #     - Used by ARRs service to strip mount prefix from file paths
 #     - Must be an absolute path when ARRs is enabled
-#     - Example: '/mnt/altmount' or '/mnt/unionfs'
+#     - Example: '/mnt/remotes/altmount' or '/mnt/unionfs'
 #
 # 13. ARRs Service:
 #     - Automatically index files from Radarr and Sonarr instances

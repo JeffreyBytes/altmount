@@ -104,7 +104,7 @@ func (s *Service) GetFirstAdminAPIKey(ctx context.Context) string {
 	if s.userRepo == nil {
 		return ""
 	}
-	users, err := s.userRepo.ListUsers(ctx, 100, 0)
+	users, err := s.userRepo.GetAllUsers(ctx)
 
 	// If no users exist and auth is disabled, bootstrap a default admin
 	if (err == nil && len(users) == 0) || (err != nil && strings.Contains(err.Error(), "no such table")) {
@@ -207,16 +207,16 @@ func (s *Service) TestConnection(ctx context.Context, instanceType, url, apiKey 
 }
 
 // GetHealth retrieves health checks from all enabled ARR instances
-func (s *Service) GetHealth(ctx context.Context) (map[string]interface{}, error) {
+func (s *Service) GetHealth(ctx context.Context) (map[string]any, error) {
 	instances := s.instances.GetAllInstances()
-	results := make(map[string]interface{})
+	results := make(map[string]any)
 
 	for _, instance := range instances {
 		if !instance.Enabled {
 			continue
 		}
 
-		var health interface{}
+		var health any
 
 		switch instance.Type {
 		case "radarr":

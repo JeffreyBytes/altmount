@@ -2,11 +2,15 @@ package api
 
 import (
 	"context"
+	"os"
 	"runtime"
+	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
+	"github.com/gofiber/fiber/v2/middleware/limiter"
 	"github.com/gofiber/fiber/v2/middleware/recover"
 	"github.com/javi11/altmount/internal/arrs"
 	"github.com/javi11/altmount/internal/auth"
@@ -15,9 +19,11 @@ import (
 	"github.com/javi11/altmount/internal/importer"
 	"github.com/javi11/altmount/internal/metadata"
 	"github.com/javi11/altmount/internal/nzbfilesystem"
+	"github.com/javi11/altmount/internal/nzbfilesystem/segcache"
 	"github.com/javi11/altmount/internal/pool"
 	"github.com/javi11/altmount/internal/progress"
 	"github.com/javi11/altmount/internal/rclone"
+	"github.com/javi11/altmount/internal/version"
 	"github.com/javi11/altmount/pkg/rclonecli"
 )
 
@@ -56,6 +62,8 @@ type Server struct {
 	progressBroadcaster *progress.ProgressBroadcaster
 	streamTracker       *StreamTracker
 	fuseManager         *FuseManager
+	segcacheMgr         *segcache.Manager // nil if segment cache is disabled
+	ready               atomic.Bool
 }
 
 // NewServer creates a new API server that can optionally register routes on the provided mux (for backwards compatibility)
@@ -76,6 +84,7 @@ func NewServer(
 	mountService *rclone.MountService,
 	progressBroadcaster *progress.ProgressBroadcaster,
 	streamTracker *StreamTracker,
+	segcacheMgr *segcache.Manager,
 ) *Server {
 	if config == nil {
 		config = DefaultConfig()
@@ -99,7 +108,8 @@ func NewServer(
 		startTime:           time.Now(),
 		progressBroadcaster: progressBroadcaster,
 		streamTracker:       streamTracker,
-		fuseManager:         NewFuseManager(),
+		segcacheMgr:         segcacheMgr,
+		fuseManager:         NewFuseManager(newMountFactory(nzbFilesystem, configManager, streamTracker)),
 	}
 
 	return server
@@ -113,6 +123,16 @@ func (s *Server) SetHealthWorker(healthWorker *health.HealthWorker) {
 // SetLibrarySyncWorker sets the library sync worker reference for the server
 func (s *Server) SetLibrarySyncWorker(librarySyncWorker *health.LibrarySyncWorker) {
 	s.librarySyncWorker = librarySyncWorker
+}
+
+// SetReady sets the server as ready to accept requests
+func (s *Server) SetReady(ready bool) {
+	s.ready.Store(ready)
+}
+
+// IsReady returns true if the server is ready to accept requests
+func (s *Server) IsReady() bool {
+	return s.ready.Load()
 }
 
 // SetRcloneClient sets the rclone client reference for the server
@@ -130,21 +150,37 @@ func (s *Server) SetupRoutes(app *fiber.App) {
 	app.Use("/sabnzbd", s.handleSABnzbd)
 
 	api := app.Group(s.config.Prefix)
-	// Import do not need user authentication
+
+	// Public endpoints (authentication handled inside or not required)
 	api.Post("/import/file", s.handleManualImportFile)
-	api.Post("/import/nzbdav", s.handleImportNzbdav)
-	api.Post("/import/nzbdav/reset", s.handleResetNzbdavImportStatus)
-	api.Get("/import/nzbdav/status", s.handleGetNzbdavImportStatus)
-	api.Delete("/import/nzbdav", s.handleCancelNzbdavImport)
 	api.Post("/arrs/webhook", s.handleArrsWebhook)
 
-	// Apply global middleware
-	api.Use(cors.New())
+	cfg := s.configManager.GetConfig()
+
+	// Apply global middleware — derive allowed CORS origins from COOKIE_DOMAIN env var,
+	// explicit api.allowed_origins config, or fall back to wildcard.
+	corsOrigins := "*"
+
+	if cookieDomain := os.Getenv("COOKIE_DOMAIN"); cookieDomain != "" {
+		// Allow both http and https on the configured domain
+		corsOrigins = "http://" + cookieDomain + ",https://" + cookieDomain
+	}
+
+	if cfg != nil && len(cfg.API.AllowedOrigins) > 0 {
+		// Explicit config overrides the env-derived value
+		corsOrigins = strings.Join(cfg.API.AllowedOrigins, ",")
+	}
+
+	api.Use(cors.New(cors.Config{
+		AllowOrigins:     corsOrigins,
+		AllowHeaders:     "Origin, Content-Type, Accept, Authorization",
+		AllowMethods:     "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+		AllowCredentials: true,
+	}))
 	api.Use(recover.New())
 
 	// Apply JWT authentication middleware globally except for public auth routes
 	// Only apply if login is required (default: true)
-	cfg := s.configManager.GetConfig()
 	loginRequired := true // Default to true if not set
 	if cfg != nil && cfg.Auth.LoginRequired != nil {
 		loginRequired = *cfg.Auth.LoginRequired
@@ -166,9 +202,16 @@ func (s *Server) SetupRoutes(app *fiber.App) {
 		}
 	}
 
+	// NZBDav Imports (now protected by JWT auth)
+	api.Post("/import/nzbdav", s.handleImportNzbdav)
+	api.Post("/import/nzbdav/reset", s.handleResetNzbdavImportStatus)
+	api.Get("/import/nzbdav/status", s.handleGetNzbdavImportStatus)
+	api.Delete("/import/nzbdav", s.handleCancelNzbdavImport)
+
 	// Queue endpoints
 	api.Get("/queue", s.handleListQueue)
 	api.Get("/queue/stats", s.handleGetQueueStats)
+	api.Get("/queue/stats/history", s.handleGetQueueHistoricalStats)
 	api.Get("/queue/progress/stream", s.handleProgressStream) // SSE endpoint for real-time progress
 	api.Delete("/queue/completed", s.handleClearCompletedQueue)
 	api.Delete("/queue/failed", s.handleClearFailedQueue)
@@ -183,6 +226,7 @@ func (s *Server) SetupRoutes(app *fiber.App) {
 	api.Delete("/queue/:id", s.handleDeleteQueue)
 	api.Post("/queue/:id/retry", s.handleRetryQueue)
 	api.Post("/queue/:id/cancel", s.handleCancelQueue)
+	api.Patch("/queue/:id/priority", s.handleUpdateQueueItemPriority)
 	api.Get("/queue/:id/download", s.handleDownloadNZB)
 
 	// Health endpoints
@@ -198,6 +242,7 @@ func (s *Server) SetupRoutes(app *fiber.App) {
 	api.Post("/health/check", s.handleAddHealthCheck)
 	api.Get("/health/worker/status", s.handleGetHealthWorkerStatus)
 	api.Post("/health/:id/repair", s.handleRepairHealth)
+	api.Post("/health/:id/unmask", s.handleUnmaskHealth)
 	api.Post("/health/:id/check-now", s.handleDirectHealthCheck)
 	api.Post("/health/:id/priority", s.handleSetHealthPriority)
 	api.Post("/health/:id/cancel", s.handleCancelHealthCheck)
@@ -222,13 +267,19 @@ func (s *Server) SetupRoutes(app *fiber.App) {
 	api.Post("/import/scan", s.handleStartManualScan)
 	api.Get("/import/scan/status", s.handleGetScanStatus)
 	api.Delete("/import/scan", s.handleCancelScan)
+	api.Get("/import/history", s.handleGetImportHistory)
+	api.Delete("/import/history", s.handleClearImportHistory)
 	// System endpoints
 	api.Get("/system/stats", s.handleGetSystemStats)
 	api.Get("/system/health", s.handleGetSystemHealth)
 	api.Get("/system/browse", s.handleSystemBrowse)
 	api.Get("/system/pool/metrics", s.handleGetPoolMetrics)
+	api.Post("/system/stats/reset", s.handleResetSystemStats)
 	api.Post("/system/cleanup", s.handleSystemCleanup)
 	api.Post("/system/restart", s.handleSystemRestart)
+
+	// Update endpoints
+	api.Get("/system/update/status", s.handleGetUpdateStatus)
 
 	api.Get("/config", s.handleGetConfig)
 	api.Put("/config", s.handleUpdateConfig)
@@ -239,6 +290,7 @@ func (s *Server) SetupRoutes(app *fiber.App) {
 	// FUSE endpoints
 	api.Post("/fuse/start", s.handleStartFuseMount)
 	api.Post("/fuse/stop", s.handleStopFuseMount)
+	api.Post("/fuse/force-stop", s.handleForceStopFuseMount)
 	api.Get("/fuse/status", s.handleGetFuseStatus)
 
 	// Provider management endpoints
@@ -259,9 +311,25 @@ func (s *Server) SetupRoutes(app *fiber.App) {
 	api.Post("/arrs/download-client/register", s.handleRegisterArrsDownloadClients)
 	api.Post("/arrs/download-client/test", s.handleTestArrsDownloadClients)
 
-	// Direct authentication endpoints (converted to native Fiber)
-	api.Post("/auth/login", s.handleDirectLogin)
-	api.Post("/auth/register", s.handleRegister)
+	// Direct authentication endpoints — rate-limited to prevent brute-force attacks
+	authLimiter := limiter.New(limiter.Config{
+		Max:        10,
+		Expiration: 1 * time.Minute,
+		KeyGenerator: func(c *fiber.Ctx) string {
+			return c.IP()
+		},
+		LimitReached: func(c *fiber.Ctx) error {
+			return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{
+				"success": false,
+				"error": fiber.Map{
+					"code":    "TOO_MANY_REQUESTS",
+					"message": "Too many login attempts. Please wait a minute before trying again.",
+				},
+			})
+		},
+	})
+	api.Post("/auth/login", authLimiter, s.handleDirectLogin)
+	api.Post("/auth/register", authLimiter, s.handleRegister)
 	api.Get("/auth/registration-status", s.handleCheckRegistration)
 	api.Get("/auth/config", s.handleGetAuthConfig)
 
@@ -270,21 +338,7 @@ func (s *Server) SetupRoutes(app *fiber.App) {
 	api.Post("/user/refresh", s.handleAuthRefresh)
 	api.Post("/user/logout", s.handleAuthLogout)
 	api.Post("/user/api-key/regenerate", s.handleRegenerateAPIKey)
-
-	// Admin endpoints - apply RequireAdmin middleware to this group
-	if loginRequired && s.authService != nil && s.userRepo != nil {
-		tokenService := s.authService.TokenService()
-		if tokenService != nil {
-			adminRoutes := api.Group("/admin")
-			adminRoutes.Use(auth.RequireAdmin(tokenService, s.userRepo))
-			adminRoutes.Get("/users", s.handleListUsers)
-			adminRoutes.Put("/users/:user_id/admin", s.handleUpdateUserAdmin)
-		}
-	}
-
-	// Legacy admin endpoints (kept for backward compatibility, admin check inside handlers)
-	api.Get("/users", s.handleListUsers)
-	api.Put("/users/:user_id/admin", s.handleUpdateUserAdmin)
+	api.Put("/user/password", s.handleChangeOwnPassword)
 }
 
 // Shutdown shuts down the API server and its managed resources
@@ -329,6 +383,8 @@ func (s *Server) handleGetActiveStreams(c *fiber.Ctx) error {
 func (s *Server) getSystemInfo() SystemInfoResponse {
 	uptime := time.Since(s.startTime)
 	return SystemInfoResponse{
+		Version:   version.Version,
+		GitCommit: version.GitCommit,
 		StartTime: s.startTime,
 		Uptime:    uptime.String(),
 		GoVersion: runtime.Version(),

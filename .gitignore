@@ -29,7 +29,6 @@ go.work.sum
 
 # Editor/IDE
 # .idea/
-.vscode/
 example/
 
 ./altmount
@@ -39,3 +38,4 @@ example/
 *debug*
 rclone.conf
 db.sqlite
+config/config.yaml

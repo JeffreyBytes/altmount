@@ -7,10 +7,12 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/javi11/altmount/internal/encryption/aes"
+	"github.com/javi11/altmount/internal/importer/archive/iso"
 	"github.com/javi11/altmount/internal/importer/parser"
 	"github.com/javi11/altmount/internal/importer/utils"
 	"github.com/javi11/altmount/internal/importer/validation"
@@ -27,6 +29,32 @@ var (
 	ErrNoFilesProcessed = errors.New("no files were successfully processed (all files failed validation)")
 )
 
+// getContentSegmentCount returns the total number of segments for a Content,
+// counting NestedSources segments for encrypted nested RAR content.
+func getContentSegmentCount(content Content) int {
+	if len(content.NestedSources) > 0 {
+		total := 0
+		for _, ns := range content.NestedSources {
+			total += len(ns.Segments)
+		}
+		return total
+	}
+	return len(content.Segments)
+}
+
+// getContentSegments returns all segments for a Content,
+// collecting from NestedSources for encrypted nested RAR content.
+func getContentSegments(content Content) []*metapb.SegmentData {
+	if len(content.NestedSources) > 0 {
+		var all []*metapb.SegmentData
+		for _, ns := range content.NestedSources {
+			all = append(all, ns.Segments...)
+		}
+		return all
+	}
+	return content.Segments
+}
+
 // calculateSegmentsToValidate calculates the actual number of segments that will be validated
 // based on the validation mode (full or sampling) and sample percentage.
 // This mirrors the logic in usenet.ValidateSegmentAvailability which uses selectSegmentsForValidation.
@@ -37,7 +65,7 @@ func calculateSegmentsToValidate(rarContents []Content, samplePercentage int) in
 			continue
 		}
 
-		segmentCount := len(content.Segments)
+		segmentCount := getContentSegmentCount(content)
 		if samplePercentage == 100 {
 			// Full validation mode: all segments will be validated
 			total += segmentCount
@@ -58,6 +86,27 @@ func calculateSegmentsToValidate(rarContents []Content, samplePercentage int) in
 		}
 	}
 	return total
+}
+
+// newErrNoAllowedFiles builds a descriptive error showing which extensions were found
+// vs which are allowed, making it actionable when imports fail silently.
+func newErrNoAllowedFiles(rarContents []Content, allowedExtensions []string) error {
+	extSet := make(map[string]struct{})
+	for _, c := range rarContents {
+		if c.IsDirectory {
+			continue
+		}
+		ext := strings.ToLower(filepath.Ext(c.Filename))
+		if ext == "" {
+			ext = "(no extension)"
+		}
+		extSet[ext] = struct{}{}
+	}
+	found := make([]string, 0, len(extSet))
+	for ext := range extSet {
+		found = append(found, ext)
+	}
+	return fmt.Errorf("archive contains no files with allowed extensions (found: %v, allowed: %v)", found, allowedExtensions)
 }
 
 // hasAllowedFiles checks if any files within RAR archive contents match allowed extensions
@@ -96,6 +145,9 @@ func ProcessArchive(
 	allowedFileExtensions []string,
 	timeout time.Duration,
 	extractedFiles []parser.ExtractedFileInfo,
+	maxPrefetch int,
+	readTimeout time.Duration,
+	expandBlurayIso bool,
 ) error {
 	if len(archiveFiles) == 0 {
 		return nil
@@ -113,10 +165,17 @@ func ProcessArchive(
 		return err
 	}
 
+	// Expand ISO files found inside the RAR archive into their inner media files
+	rarContents, err = expandISOContents(ctx, expandBlurayIso, rarContents, poolManager, maxPrefetch, readTimeout, allowedFileExtensions)
+	if err != nil {
+		slog.WarnContext(ctx, "ISO expansion failed, proceeding without ISO contents", "error", err)
+	}
+
 	// Validate file extensions before processing
 	if !hasAllowedFiles(rarContents, allowedFileExtensions) {
-		slog.WarnContext(ctx, "RAR archive contains no files with allowed extensions", "allowed_extensions", allowedFileExtensions)
-		return ErrNoAllowedFiles
+		err := newErrNoAllowedFiles(rarContents, allowedFileExtensions)
+		slog.WarnContext(ctx, "RAR archive contains no files with allowed extensions", "error", err)
+		return err
 	}
 
 	// Calculate total segments to validate for accurate progress tracking
@@ -146,6 +205,14 @@ func ProcessArchive(
 	nzbName := filepath.Base(nzbPath)
 	shouldNormalizeName := mediaFilesCount == 1
 
+	// Count ISO-expanded files so single-file ISOs omit the index suffix.
+	isoExpandedCount := 0
+	for _, c := range rarContents {
+		if c.ISOExpansionIndex > 0 {
+			isoExpandedCount++
+		}
+	}
+
 	for _, rarContent := range rarContents {
 		// Skip directories
 		if rarContent.IsDirectory {
@@ -163,10 +230,23 @@ func ProcessArchive(
 			continue
 		}
 
-		// Normalize filename to match NZB if it's the only media file
-		if shouldNormalizeName && (utils.IsAllowedFile(rarContent.InternalPath, rarContent.Size, allowedFileExtensions) ||
+		// Rename ISO-expanded files using the NZB release name.
+		// For multiple files: releaseName_1.ext (largest), releaseName_2.ext, ...
+		// For a single file: releaseName.ext (no index).
+		if rarContent.ISOExpansionIndex > 0 {
+			ext := filepath.Ext(rarContent.Filename)
+			releaseName := strings.TrimSuffix(filepath.Base(nzbPath), filepath.Ext(filepath.Base(nzbPath)))
+			if isoExpandedCount == 1 {
+				baseFilename = releaseName + ext
+			} else {
+				baseFilename = fmt.Sprintf("%s_%d%s", releaseName, rarContent.ISOExpansionIndex, ext)
+			}
+			slog.InfoContext(ctx, "Renaming ISO-expanded file using NZB release name",
+				"original", rarContent.Filename,
+				"renamed", baseFilename)
+		} else if shouldNormalizeName && (utils.IsAllowedFile(rarContent.InternalPath, rarContent.Size, allowedFileExtensions) ||
 			utils.IsAllowedFile(rarContent.Filename, rarContent.Size, allowedFileExtensions)) {
-			// Extract release name and combine with original extension
+			// Normalize filename to match NZB if it's the only media file (non-ISO archives)
 			baseFilename = normalizeArchiveReleaseFilename(nzbName, baseFilename)
 			slog.InfoContext(ctx, "Normalizing obfuscated filename in RAR archive",
 				"original", rarContent.Filename,
@@ -214,11 +294,28 @@ func ProcessArchive(
 				)
 			}
 
+			// Get the segments to validate — for nested content, collect from all sources
+			validationSegments := getContentSegments(rarContent)
+
 			// RAR segments contain packed/compressed data, so use PackedSize for validation.
-			// For AES-encrypted files (rclone encryption on top of RAR), add AES padding.
-			validationSize := rarContent.PackedSize
-			if len(rarContent.AesKey) > 0 {
-				validationSize = aes.EncryptedSize(rarContent.PackedSize)
+			// For AES-encrypted files, add AES padding.
+			// For nested content with NestedSources, sum InnerLength across sources.
+			var validationSize int64
+			if len(rarContent.NestedSources) > 0 {
+				// Nested sources: validate outer segments independently.
+				// The packed size is the sum of each source's segment coverage.
+				for _, ns := range rarContent.NestedSources {
+					sourceSize := int64(0)
+					for _, seg := range ns.Segments {
+						sourceSize += seg.EndOffset - seg.StartOffset + 1
+					}
+					validationSize += sourceSize
+				}
+			} else {
+				validationSize = rarContent.PackedSize
+				if len(rarContent.AesKey) > 0 {
+					validationSize = aes.EncryptedSize(rarContent.PackedSize)
+				}
 			}
 
 			// Validate segments with real-time progress updates
@@ -226,7 +323,7 @@ func ProcessArchive(
 				ctx,
 				baseFilename,
 				validationSize,
-				rarContent.Segments,
+				validationSegments,
 				metapb.Encryption_NONE,
 				poolManager,
 				maxValidationGoroutines,
@@ -241,7 +338,7 @@ func ProcessArchive(
 		}
 
 		// Calculate and track segments validated for this file (for next file's offset)
-		segmentCount := len(rarContent.Segments)
+		segmentCount := getContentSegmentCount(rarContent)
 		var fileSegmentsValidated int
 		if segmentSamplePercentage == 100 {
 			fileSegmentsValidated = segmentCount
@@ -302,6 +399,81 @@ func ProcessArchive(
 	slog.InfoContext(ctx, "Successfully processed RAR archive files", "files_processed", filesProcessed)
 
 	return nil
+}
+
+// expandISOContents replaces any .iso Content entries with the media files found
+// inside them. Non-ISO entries are passed through unchanged. Per-file errors are
+// non-fatal: on failure the original ISO Content is kept.
+func expandISOContents(
+	ctx context.Context,
+	expand bool,
+	contents []Content,
+	poolManager pool.Manager,
+	maxPrefetch int,
+	readTimeout time.Duration,
+	allowedExtensions []string,
+) ([]Content, error) {
+	if !expand {
+		return contents, nil
+	}
+	var result []Content
+	for _, c := range contents {
+		if c.IsDirectory || strings.ToLower(filepath.Ext(c.Filename)) != ".iso" {
+			result = append(result, c)
+			continue
+		}
+
+		src := iso.ISOSource{
+			Filename: c.Filename,
+			Segments: c.Segments,
+			AesKey:   c.AesKey,
+			AesIV:    c.AesIV,
+			Size:     c.Size,
+		}
+
+		isoFiles, err := iso.AnalyzeISOContent(ctx, src, poolManager, maxPrefetch, readTimeout, allowedExtensions)
+		if err != nil {
+			slog.WarnContext(ctx, "Failed to analyze ISO content, keeping ISO as-is",
+				"file", c.Filename, "error", err)
+			result = append(result, c)
+			continue
+		}
+
+		if len(isoFiles) == 0 {
+			result = append(result, c)
+			continue
+		}
+
+		// Sort ISO files by size descending so the largest (main feature) gets index 1.
+		sort.Slice(isoFiles, func(i, j int) bool {
+			return isoFiles[i].Size > isoFiles[j].Size
+		})
+
+		// Keep only the largest file (index 0 after sort); discard smaller streams.
+		f := isoFiles[0]
+		nc := Content{
+			InternalPath:      f.InternalPath,
+			Filename:          f.Filename,
+			Size:              f.Size,
+			PackedSize:        f.Size, // raw ISO data — packed == unpacked
+			NzbdavID:          c.NzbdavID,
+			ISOExpansionIndex: 1,
+		}
+		if f.NestedSource != nil {
+			nc.NestedSources = []NestedSource{{
+				Segments:        f.NestedSource.Segments,
+				AesKey:          f.NestedSource.AesKey,
+				AesIV:           f.NestedSource.AesIV,
+				InnerOffset:     f.NestedSource.InnerOffset,
+				InnerLength:     f.NestedSource.InnerLength,
+				InnerVolumeSize: f.NestedSource.InnerVolumeSize,
+			}}
+		} else {
+			nc.Segments = f.Segments
+		}
+		result = append(result, nc)
+	}
+	return result, nil
 }
 
 // normalizeArchiveReleaseFilename aligns the filename to the NZB basename while keeping the original extension.

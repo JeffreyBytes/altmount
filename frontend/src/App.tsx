@@ -1,7 +1,7 @@
 import { QueryClientProvider } from "@tanstack/react-query";
 import { ReactQueryDevtools } from "@tanstack/react-query-devtools";
 import { BrowserRouter, Route, Routes } from "react-router-dom";
-import { ProtectedRoute, UserManagement } from "./components/auth";
+import { ProtectedRoute } from "./components/auth/ProtectedRoute";
 import { Layout } from "./components/layout/Layout";
 import { ToastContainer } from "./components/ui/ToastContainer";
 import { AuthProvider } from "./contexts/AuthContext";
@@ -12,7 +12,6 @@ import { ConfigurationPage } from "./pages/ConfigurationPage";
 import { Dashboard } from "./pages/Dashboard";
 import { FilesPage } from "./pages/FilesPage";
 import { HealthPage } from "./pages/HealthPage";
-import { ImportPage } from "./pages/ImportPage";
 import { QueuePage } from "./pages/QueuePage";
 
 function App() {
@@ -22,7 +21,7 @@ function App() {
 				<ModalProvider>
 					<AuthProvider>
 						<BrowserRouter>
-							<div className="min-h-screen bg-base-100" data-theme="light">
+							<div className="min-h-screen bg-base-100">
 								<Routes>
 									{/* Protected routes */}
 									<Route
@@ -35,19 +34,10 @@ function App() {
 									>
 										<Route index element={<Dashboard />} />
 										<Route path="queue" element={<QueuePage />} />
-										<Route path="import" element={<ImportPage />} />
 										<Route path="health" element={<HealthPage />} />
 										<Route path="files" element={<FilesPage />} />
 
 										{/* Admin-only routes */}
-										<Route
-											path="admin"
-											element={
-												<ProtectedRoute requireAdmin>
-													<UserManagement />
-												</ProtectedRoute>
-											}
-										/>
 										<Route
 											path="config"
 											element={

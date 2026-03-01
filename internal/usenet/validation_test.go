@@ -25,7 +25,7 @@ func TestSelectSegmentsForValidation(t *testing.T) {
 
 	// Create 100 dummy segments
 	segments := make([]*metapb.SegmentData, 100)
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		segments[i] = &metapb.SegmentData{Id: fmt.Sprintf("seg%d", i)}
 	}
 
@@ -63,5 +63,16 @@ func TestSelectSegmentsForValidation(t *testing.T) {
 		// 1% of 100 = 1 segment, but minimum is 5
 		selected := selectSegmentsForValidation(segments, 1)
 		assert.Equal(t, 5, len(selected))
+	})
+
+	t.Run("cap 55", func(t *testing.T) {
+		// Create 20,000 segments (10% = 2000)
+		largeSegments := make([]*metapb.SegmentData, 20000)
+		for i := range 20000 {
+			largeSegments[i] = &metapb.SegmentData{Id: fmt.Sprintf("seg%d", i)}
+		}
+
+		selected := selectSegmentsForValidation(largeSegments, 10)
+		assert.Equal(t, 55, len(selected), "Should be capped at 55")
 	})
 }

@@ -2,6 +2,7 @@ import type {
 	ActiveStream,
 	APIResponse,
 	AuthResponse,
+	ChangeOwnPasswordRequest,
 	FileHealth,
 	FileMetadata,
 	FuseStatus,
@@ -11,10 +12,12 @@ import type {
 	HealthPriority,
 	HealthStats,
 	HealthWorkerStatus,
+	ImportHistoryItem,
 	ImportStatusResponse,
 	LibrarySyncStatus,
 	ManualScanRequest,
 	PoolMetrics,
+	QueueHistoricalStatsResponse,
 	QueueItem,
 	QueueStats,
 	SABnzbdAddResponse,
@@ -22,7 +25,6 @@ import type {
 	SystemBrowseResponse,
 	UploadNZBLnkResponse,
 	User,
-	UserAdminUpdateRequest,
 } from "../types/api";
 import type {
 	ConfigResponse,
@@ -37,6 +39,7 @@ import type {
 	ProviderTestResponse,
 	ProviderUpdateRequest,
 } from "../types/config";
+import type { UpdateChannel, UpdateStatusResponse } from "../types/update";
 
 export class APIError extends Error {
 	public status: number;
@@ -73,19 +76,31 @@ export class APIClient {
 			const response = await fetch(url, config);
 
 			if (!response.ok) {
+				if (response.status === 401) {
+					window.dispatchEvent(new CustomEvent("api:unauthorized"));
+				}
 				const errorData = await response.json();
-				throw new APIError(
-					response.status,
-					errorData.message || `HTTP ${response.status}: ${response.statusText}`,
-					errorData.details || "",
-				);
+				const errorMessage =
+					(typeof errorData.error === "object" ? errorData.error?.message : errorData.error) ||
+					errorData.message ||
+					`HTTP ${response.status}: ${response.statusText}`;
+				const errorDetails =
+					(typeof errorData.error === "object" ? errorData.error?.details : "") ||
+					errorData.details ||
+					"";
+
+				throw new APIError(response.status, errorMessage, errorDetails);
 			}
 
 			const data: APIResponse<T> = await response.json();
 
 			if (!data.success) {
 				// Handle error in the success=false format
-				throw new APIError(response.status, data.error || "API request failed", "");
+				const errorMessage =
+					(typeof data.error === "object" ? data.error?.message : data.error) ||
+					"API request failed";
+				const errorDetails = (typeof data.error === "object" ? data.error?.details : "") || "";
+				throw new APIError(response.status, errorMessage, errorDetails);
 			}
 
 			return data.data as T;
@@ -116,15 +131,26 @@ export class APIClient {
 			const response = await fetch(url, config);
 
 			if (!response.ok) {
+				if (response.status === 401) {
+					window.dispatchEvent(new CustomEvent("api:unauthorized"));
+				}
 				// Try to parse error response
 				try {
 					const errorData = await response.json();
-					throw new APIError(
-						response.status,
-						errorData.message || `HTTP ${response.status}: ${response.statusText}`,
-						errorData.details || "",
-					);
-				} catch {
+					const errorMessage =
+						(typeof errorData.error === "object" ? errorData.error?.message : errorData.error) ||
+						errorData.message ||
+						`HTTP ${response.status}: ${response.statusText}`;
+					const errorDetails =
+						(typeof errorData.error === "object" ? errorData.error?.details : "") ||
+						errorData.details ||
+						"";
+
+					throw new APIError(response.status, errorMessage, errorDetails);
+				} catch (e) {
+					if (e instanceof APIError) {
+						throw e;
+					}
 					// If parsing fails, use generic error
 					throw new APIError(
 						response.status,
@@ -138,7 +164,11 @@ export class APIClient {
 
 			if (!data.success) {
 				// Handle error in the success=false format
-				throw new APIError(response.status, data.error || "API request failed", "");
+				const errorMessage =
+					(typeof data.error === "object" ? data.error?.message : data.error) ||
+					"API request failed";
+				const errorDetails = (typeof data.error === "object" ? data.error?.details : "") || "";
+				throw new APIError(response.status, errorMessage, errorDetails);
 			}
 
 			return data;
@@ -213,6 +243,13 @@ export class APIClient {
 		});
 	}
 
+	async updateQueueItemPriority(id: number, priority: 1 | 2 | 3) {
+		return this.request<QueueItem>(`/queue/${id}/priority`, {
+			method: "PATCH",
+			body: JSON.stringify({ priority }),
+		});
+	}
+
 	async cancelBulkQueueItems(ids: number[]) {
 		return this.request<{
 			cancelled_count: number;
@@ -228,6 +265,16 @@ export class APIClient {
 
 	async getQueueStats() {
 		return this.request<QueueStats>("/queue/stats");
+	}
+
+	async getQueueHistory(days?: number) {
+		const searchParams = new URLSearchParams();
+		if (days) searchParams.set("days", days.toString());
+
+		const query = searchParams.toString();
+		return this.request<QueueHistoricalStatsResponse>(
+			`/queue/stats/history${query ? `?${query}` : ""}`,
+		);
 	}
 
 	async clearCompletedQueue(olderThan?: string) {
@@ -444,6 +491,18 @@ export class APIClient {
 		});
 	}
 
+	async unmaskHealthItem(id: number) {
+		return this.request<{
+			message: string;
+			id: number;
+			file_path: string;
+			updated_at: string;
+			health_data: FileHealth;
+		}>(`/health/${id}/unmask`, {
+			method: "POST",
+		});
+	}
+
 	async cancelHealthCheck(id: number) {
 		return this.request<{
 			message: string;
@@ -539,17 +598,8 @@ export class APIClient {
 		});
 	}
 
-	async getUsers(params?: { limit?: number; offset?: number }) {
-		const searchParams = new URLSearchParams();
-		if (params?.limit) searchParams.set("limit", params.limit.toString());
-		if (params?.offset) searchParams.set("offset", params.offset.toString());
-
-		const query = searchParams.toString();
-		return this.request<User[]>(`/users${query ? `?${query}` : ""}`);
-	}
-
-	async updateUserAdmin(userId: string, data: UserAdminUpdateRequest) {
-		return this.request<AuthResponse>(`/users/${userId}/admin`, {
+	async changeOwnPassword(data: ChangeOwnPasswordRequest) {
+		return this.request<AuthResponse>("/user/password", {
 			method: "PUT",
 			body: JSON.stringify(data),
 		});
@@ -654,6 +704,16 @@ export class APIClient {
 		return this.request<SystemBrowseResponse>(`/system/browse${query ? `?${query}` : ""}`);
 	}
 
+	async resetSystemStats(duration?: string) {
+		const searchParams = new URLSearchParams();
+		if (duration) searchParams.set("duration", duration);
+
+		const query = searchParams.toString();
+		return this.request<{ message: string }>(`/system/stats/reset${query ? `?${query}` : ""}`, {
+			method: "POST",
+		});
+	}
+
 	// Provider endpoints
 	async testProvider(data: ProviderTestRequest) {
 		return this.request<ProviderTestResponse>("/providers/test", {
@@ -708,6 +768,14 @@ export class APIClient {
 
 	async getScanStatus() {
 		return this.request<ScanStatusResponse>("/import/scan/status");
+	}
+
+	async getImportHistory(limit?: number) {
+		const searchParams = new URLSearchParams();
+		if (limit) searchParams.set("limit", limit.toString());
+
+		const query = searchParams.toString();
+		return this.request<ImportHistoryItem[]>(`/import/history${query ? `?${query}` : ""}`);
 	}
 
 	async cancelScan() {
@@ -826,6 +894,25 @@ export class APIClient {
 		return this.request<{ message: string }>("/fuse/stop", {
 			method: "POST",
 			body: JSON.stringify({}),
+		});
+	}
+
+	async forceStopFuseMount() {
+		return this.request<{ message: string }>("/fuse/force-stop", {
+			method: "POST",
+			body: JSON.stringify({}),
+		});
+	}
+
+	// Update endpoints
+	async checkUpdateStatus(channel: UpdateChannel): Promise<UpdateStatusResponse> {
+		return this.request<UpdateStatusResponse>(`/system/update/status?channel=${channel}`);
+	}
+
+	async applyUpdate(channel: UpdateChannel): Promise<{ message: string }> {
+		return this.request<{ message: string }>("/system/update/apply", {
+			method: "POST",
+			body: JSON.stringify({ channel }),
 		});
 	}
 }

@@ -1,5 +1,8 @@
 // Configuration types that match the backend API structure
 
+// Mount type for unified mount configuration
+export type MountType = "none" | "rclone" | "fuse" | "rclone_external";
+
 // Base configuration response from API
 export interface ConfigResponse {
 	webdav: WebDAVConfig;
@@ -11,13 +14,16 @@ export interface ConfigResponse {
 	health: HealthConfig;
 	rclone: RCloneConfig;
 	fuse: FuseConfig;
+	segment_cache: SegmentCacheConfig;
 	import: ImportConfig;
 	log: LogConfig;
 	sabnzbd: SABnzbdConfig;
 	arrs: ArrsConfig;
 	providers: ProviderConfig[];
 	mount_path: string;
+	mount_type: MountType;
 	api_key?: string;
+	profiler_enabled: boolean;
 }
 
 // WebDAV server configuration
@@ -26,6 +32,7 @@ export interface WebDAVConfig {
 	user: string;
 	password: string;
 	host?: string;
+	debug?: boolean;
 }
 
 // API server configuration
@@ -64,6 +71,14 @@ export interface StreamingConfig {
 	max_prefetch: number;
 }
 
+// Segment cache configuration
+export interface SegmentCacheConfig {
+	enabled: boolean | null;
+	cache_path: string;
+	max_size_gb: number;
+	expiry_hours: number;
+}
+
 // Health configuration
 export interface HealthConfig {
 	enabled?: boolean;
@@ -74,9 +89,19 @@ export interface HealthConfig {
 	max_concurrent_jobs?: number; // Max concurrent health check jobs
 	segment_sample_percentage?: number; // Percentage of segments to check (1-100)
 	library_sync_interval_minutes?: number; // Library sync interval in minutes (optional)
+	library_sync_concurrency?: number;
 	check_all_segments?: boolean; // Whether to check all segments or use sampling
 	resolve_repair_on_import?: boolean; // Automatically resolve pending repairs in the same directory when a new file is imported
 	verify_data?: boolean; // Verify 1 byte of data for each segment
+	acceptable_missing_segments_percentage?: number;
+	repair: RepairConfig;
+}
+
+export interface RepairConfig {
+	enabled: boolean;
+	interval_minutes: number;
+	max_cooldown_hours: number;
+	exponential_backoff: boolean;
 }
 
 // Library sync types
@@ -162,6 +187,7 @@ export interface RCloneConfig {
 	async_read: boolean;
 	vfs_fast_fingerprint: boolean;
 	use_mmap: boolean;
+	links: boolean;
 }
 
 // Fuse configuration
@@ -174,13 +200,6 @@ export interface FuseConfig {
 	entry_timeout_seconds: number;
 	max_cache_size_mb: number;
 	max_read_ahead_mb: number;
-	// VFS disk cache settings
-	disk_cache_enabled?: boolean;
-	disk_cache_path?: string;
-	disk_cache_max_size_gb?: number;
-	disk_cache_expiry_hours?: number;
-	chunk_size_mb?: number;
-	read_ahead_chunks?: number;
 }
 
 // Import strategy type
@@ -200,6 +219,7 @@ export interface ImportConfig {
 	skip_health_check?: boolean;
 	watch_dir?: string | null;
 	watch_interval_seconds?: number | null;
+	allow_nested_rar_extraction?: boolean;
 }
 
 // Log configuration
@@ -226,6 +246,7 @@ export interface ProviderConfig {
 	password_set: boolean;
 	enabled: boolean;
 	is_backup_provider: boolean;
+	last_rtt_ms?: number;
 	last_speed_test_mbps?: number;
 	last_speed_test_time?: string;
 }
@@ -257,6 +278,7 @@ export interface ConfigUpdateRequest {
 	database?: DatabaseUpdateRequest;
 	metadata?: MetadataUpdateRequest;
 	streaming?: StreamingUpdateRequest;
+	segment_cache?: Partial<SegmentCacheConfig>;
 	health?: HealthUpdateRequest;
 	rclone?: RCloneUpdateRequest;
 	fuse?: Partial<FuseConfig>;
@@ -266,6 +288,8 @@ export interface ConfigUpdateRequest {
 	arrs?: ArrsConfig;
 	providers?: ProviderUpdateRequest[];
 	mount_path?: string;
+	mount_type?: MountType;
+	profiler_enabled?: boolean;
 }
 
 // WebDAV update request
@@ -311,9 +335,11 @@ export interface HealthUpdateRequest {
 	max_connections_for_health_checks?: number;
 	max_concurrent_jobs?: number; // Max concurrent health check jobs
 	library_sync_interval_minutes?: number; // Library sync interval in minutes (optional)
+	library_sync_concurrency?: number;
 	check_all_segments?: boolean; // Whether to check all segments or use sampling
 	resolve_repair_on_import?: boolean;
 	verify_data?: boolean;
+	acceptable_missing_segments_percentage?: number;
 }
 
 // RClone update request
@@ -365,6 +391,7 @@ export interface RCloneUpdateRequest {
 	async_read?: boolean;
 	vfs_fast_fingerprint?: boolean;
 	use_mmap?: boolean;
+	links?: boolean;
 }
 
 // Import update request
@@ -377,6 +404,7 @@ export interface ImportUpdateRequest {
 	skip_health_check?: boolean;
 	watch_dir?: string | null;
 	watch_interval_seconds?: number | null;
+	allow_nested_rar_extraction?: boolean;
 }
 
 // Log update request
@@ -437,9 +465,11 @@ export type ConfigSection =
 	| "auth"
 	| "metadata"
 	| "streaming"
+	| "segment_cache"
 	| "health"
 	| "import"
 	| "providers"
+	| "mount"
 	| "rclone"
 	| "fuse"
 	| "sabnzbd"
@@ -461,6 +491,8 @@ export interface APIFormData {
 export interface ImportFormData {
 	max_processor_workers: number;
 	queue_processing_interval_seconds: number; // Interval in seconds for queue processing
+	max_download_prefetch: number;
+	read_timeout_seconds: number;
 	import_strategy: ImportStrategy;
 	import_dir: string;
 	watch_dir?: string;
@@ -524,6 +556,7 @@ export interface RCloneFormData {
 	async_read: boolean;
 	vfs_fast_fingerprint: boolean;
 	use_mmap: boolean;
+	links: boolean;
 }
 
 export interface RCloneRCFormData {
@@ -575,6 +608,7 @@ export interface RCloneMountFormData {
 	async_read: boolean;
 	vfs_fast_fingerprint: boolean;
 	use_mmap: boolean;
+	links: boolean;
 }
 
 export interface MountStatus {
@@ -663,7 +697,9 @@ export interface ArrsConfig {
 	sonarr_instances: ArrsInstanceConfig[];
 	queue_cleanup_enabled?: boolean;
 	queue_cleanup_interval_seconds?: number;
+	queue_cleanup_grace_period_minutes?: number;
 	queue_cleanup_allowlist?: IgnoredMessage[];
+	cleanup_automatic_import_failure?: boolean;
 }
 
 // Sync status and progress types
@@ -700,6 +736,10 @@ export interface ArrsFormData {
 	webhook_base_url?: string;
 	radarr_instances: ArrsInstanceConfig[];
 	sonarr_instances: ArrsInstanceConfig[];
+	queue_cleanup_enabled?: boolean;
+	queue_cleanup_interval_seconds?: number;
+	queue_cleanup_grace_period_minutes?: number;
+	cleanup_automatic_import_failure?: boolean;
 }
 
 // Helper type for configuration sections
@@ -714,6 +754,7 @@ export interface ConfigSectionInfo {
 // Configuration sections metadata
 // Provider management types
 export interface ProviderTestRequest {
+	provider_id?: string;
 	host: string;
 	port: number;
 	username: string;
@@ -760,15 +801,9 @@ export const CONFIG_SECTIONS: Record<ConfigSection | "system", ConfigSectionInfo
 		icon: "Shield",
 		canEdit: true,
 	},
-	rclone: {
-		title: "Rclone Mount",
-		description: "RClone mount and VFS settings",
-		icon: "HardDrive",
-		canEdit: true,
-	},
-	fuse: {
-		title: "Altmount Native Mount",
-		description: "Configure altmount native FUSE mount settings",
+	mount: {
+		title: "Mount",
+		description: "Configure filesystem mount (RClone or native FUSE)",
 		icon: "HardDrive",
 		canEdit: true,
 	},
@@ -783,6 +818,13 @@ export const CONFIG_SECTIONS: Record<ConfigSection | "system", ConfigSectionInfo
 		description: "File streaming, chunking and download worker configuration",
 		icon: "Download",
 		canEdit: true,
+	},
+	segment_cache: {
+		title: "Segment Cache",
+		description: "Segment-aligned disk cache shared by FUSE and WebDAV for faster media playback",
+		icon: "HardDrive",
+		canEdit: true,
+		hidden: true,
 	},
 	health: {
 		title: "Health Monitoring",
@@ -801,6 +843,20 @@ export const CONFIG_SECTIONS: Record<ConfigSection | "system", ConfigSectionInfo
 		description: "Usenet provider configuration for downloads",
 		icon: "Radio",
 		canEdit: true,
+	},
+	rclone: {
+		title: "RClone",
+		description: "RClone configuration",
+		icon: "HardDrive",
+		canEdit: true,
+		hidden: true,
+	},
+	fuse: {
+		title: "FUSE",
+		description: "Native FUSE configuration",
+		icon: "HardDrive",
+		canEdit: true,
+		hidden: true,
 	},
 	sabnzbd: {
 		title: "SABnzbd API",

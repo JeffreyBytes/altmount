@@ -36,6 +36,15 @@ export const useQueueStats = () => {
 	});
 };
 
+export const useQueueHistory = (days?: number) => {
+	return useQuery({
+		queryKey: ["queue", "history", days],
+		queryFn: () => apiClient.getQueueHistory(days),
+		// Refetch historical stats less frequently (every 5 minutes)
+		refetchInterval: 5 * 60 * 1000,
+	});
+};
+
 export const useDeleteQueueItem = () => {
 	const queryClient = useQueryClient();
 
@@ -89,6 +98,18 @@ export const useCancelQueueItem = () => {
 		onSuccess: () => {
 			queryClient.invalidateQueries({ queryKey: ["queue"] });
 			queryClient.invalidateQueries({ queryKey: ["queue-stats"] });
+		},
+	});
+};
+
+export const useUpdateQueueItemPriority = () => {
+	const queryClient = useQueryClient();
+
+	return useMutation({
+		mutationFn: ({ id, priority }: { id: number; priority: 1 | 2 | 3 }) =>
+			apiClient.updateQueueItemPriority(id, priority),
+		onSuccess: () => {
+			queryClient.invalidateQueries({ queryKey: ["queue"] });
 		},
 	});
 };
@@ -353,6 +374,17 @@ export const useSetHealthPriority = () => {
 	});
 };
 
+export const useUnmaskHealthItem = () => {
+	const queryClient = useQueryClient();
+
+	return useMutation({
+		mutationFn: (id: number) => apiClient.unmaskHealthItem(id),
+		onSuccess: () => {
+			queryClient.invalidateQueries({ queryKey: ["health"] });
+		},
+	});
+};
+
 export const useCancelHealthCheck = () => {
 	const queryClient = useQueryClient();
 
@@ -398,6 +430,14 @@ export const useCancelScan = () => {
 			// Invalidate scan status to update immediately
 			queryClient.invalidateQueries({ queryKey: ["scan", "status"] });
 		},
+	});
+};
+
+export const useImportHistory = (limit?: number, refetchInterval?: number) => {
+	return useQuery({
+		queryKey: ["import", "history", limit],
+		queryFn: () => apiClient.getImportHistory(limit),
+		refetchInterval: refetchInterval,
 	});
 };
 
@@ -512,6 +552,21 @@ export const useSystemBrowse = (path?: string) => {
 	return useQuery({
 		queryKey: ["system", "browse", path],
 		queryFn: () => apiClient.getSystemBrowse(path),
+	});
+};
+
+export const useResetSystemStats = () => {
+	const queryClient = useQueryClient();
+
+	return useMutation({
+		mutationFn: (duration?: string) => apiClient.resetSystemStats(duration),
+		onSuccess: () => {
+			// Invalidate all relevant metrics and history to show reset values
+			queryClient.invalidateQueries({ queryKey: ["system", "pool", "metrics"] });
+			queryClient.invalidateQueries({ queryKey: ["queue", "stats"] });
+			queryClient.invalidateQueries({ queryKey: ["queue", "history"] });
+			queryClient.invalidateQueries({ queryKey: ["import", "history"] });
+		},
 	});
 };
 

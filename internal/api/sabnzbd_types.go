@@ -16,12 +16,12 @@ import (
 
 // SABnzbdResponse represents the standard SABnzbd API response wrapper
 type SABnzbdResponse struct {
-	Status  bool        `json:"status"`
-	Queue   interface{} `json:"queue,omitempty"`
-	History interface{} `json:"history,omitempty"`
-	Config  interface{} `json:"config,omitempty"`
-	Version interface{} `json:"version,omitempty"`
-	Error   *string     `json:"error,omitempty"`
+	Status  bool    `json:"status"`
+	Queue   any     `json:"queue,omitempty"`
+	History any     `json:"history,omitempty"`
+	Config  any     `json:"config,omitempty"`
+	Version any     `json:"version,omitempty"`
+	Error   *string `json:"error,omitempty"`
 }
 
 // SABnzbdQueueObject represents the nested queue object in the response
@@ -397,7 +397,7 @@ func ToSABnzbdQueueSlot(item *database.ImportQueueItem, index int, progressBroad
 }
 
 // ToSABnzbdHistorySlot converts an AltMount ImportQueueItem to SABnzbd history format
-func ToSABnzbdHistorySlot(item *database.ImportQueueItem, index int, basePath string) SABnzbdHistorySlot {
+func ToSABnzbdHistorySlot(item *database.ImportQueueItem, index int, finalPath string) SABnzbdHistorySlot {
 	if item == nil {
 		return SABnzbdHistorySlot{}
 	}
@@ -413,29 +413,12 @@ func ToSABnzbdHistorySlot(item *database.ImportQueueItem, index int, basePath st
 		status = "Unknown"
 	}
 
-	// Calculate paths
-	// SABnzbd reports 'path' as the absolute path to the JOB folder.
-	// Sonarr/Radarr will look INSIDE this folder for media files.
-	var finalPath string
+	// Calculate jobName
 	var jobName string
-
 	if item.StoragePath != nil && *item.StoragePath != "" {
-		// Construct the full absolute path on the mount
-		// We use filepath.ToSlash to ensure consistent forward slashes for the API
-		storagePath := filepath.ToSlash(*item.StoragePath)
-		// Ensure storagePath is treated as relative to basePath even if it starts with /
-		fullStoragePath := filepath.ToSlash(filepath.Join(basePath, strings.TrimPrefix(storagePath, "/")))
-
-		// Determine the job folder
-		jobFolder := fullStoragePath
-		if utils.HasPopularExtension(fullStoragePath) {
-			jobFolder = filepath.Dir(fullStoragePath)
-		}
-
-		// SABnzbd reports 'path' as the absolute path to the JOB folder.
-		// Sonarr/Radarr will look INSIDE this folder for media files.
-		finalPath = jobFolder
-		jobName = filepath.Base(jobFolder)
+		// Calculate jobName from the finalPath
+		// finalPath is the absolute directory path where the media resides
+		jobName = filepath.Base(finalPath)
 
 		// Safety check: If the job name matches a generic category name, it means it was a flattened import.
 		// In this case, we need to report the category folder as the 'path' and the NZB name as the 'name'.
@@ -450,7 +433,6 @@ func ToSABnzbdHistorySlot(item *database.ImportQueueItem, index int, basePath st
 			jobName = strings.TrimSuffix(nzbName, filepath.Ext(nzbName))
 		}
 	} else {
-		finalPath = basePath
 		// Fallback to NZB name if no storage path yet
 		nzbName := filepath.Base(item.NzbPath)
 		jobName = strings.TrimSuffix(nzbName, filepath.Ext(nzbName))

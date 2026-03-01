@@ -2,6 +2,7 @@ package api
 
 import (
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -14,12 +15,13 @@ import (
 // ConfigAPIResponse wraps config.Config with sensitive data handling
 type ConfigAPIResponse struct {
 	*config.Config
-	WebDAV    WebDAVAPIResponse     `json:"webdav"`
-	Import    ImportAPIResponse     `json:"import"`
-	RClone    RCloneAPIResponse     `json:"rclone"`
-	SABnzbd   SABnzbdAPIResponse    `json:"sabnzbd"`
-	Providers []ProviderAPIResponse `json:"providers"`
-	APIKey    string                `json:"api_key,omitempty"` // User's API key for authentication
+	WebDAV          WebDAVAPIResponse     `json:"webdav"`
+	Import          ImportAPIResponse     `json:"import"`
+	RClone          RCloneAPIResponse     `json:"rclone"`
+	SABnzbd         SABnzbdAPIResponse    `json:"sabnzbd"`
+	Providers       []ProviderAPIResponse `json:"providers"`
+	APIKey          string                `json:"api_key,omitempty"` // User's API key for authentication
+	ProfilerEnabled bool                  `json:"profiler_enabled"`
 }
 
 // WebDAVAPIResponse sanitizes WebDAV config for API responses
@@ -57,6 +59,7 @@ type RCloneAPIResponse struct {
 	// Mount-Specific Settings
 	AllowOther    bool   `json:"allow_other"`
 	AllowNonEmpty bool   `json:"allow_non_empty"`
+	Links         bool   `json:"links"`
 	ReadOnly      bool   `json:"read_only"`
 	Timeout       string `json:"timeout"`
 	Syslog        bool   `json:"syslog"`
@@ -105,6 +108,7 @@ type ProviderAPIResponse struct {
 	Enabled           bool       `json:"enabled"`
 	IsBackupProvider  bool       `json:"is_backup_provider"`
 	InflightRequests  int        `json:"inflight_requests"`
+	LastRTTMs         int64      `json:"last_rtt_ms"`
 	LastSpeedTestMbps float64    `json:"last_speed_test_mbps"`
 	LastSpeedTestTime *time.Time `json:"last_speed_test_time,omitempty"`
 }
@@ -116,12 +120,14 @@ type ImportAPIResponse struct {
 	AllowedFileExtensions          []string              `json:"allowed_file_extensions"`
 	MaxImportConnections           int                   `json:"max_import_connections"`
 	MaxDownloadPrefetch            int                   `json:"max_download_prefetch"`
+	ReadTimeoutSeconds             int                   `json:"read_timeout_seconds"`
 	SegmentSamplePercentage        int                   `json:"segment_sample_percentage"` // Percentage of segments to check (1-100)
 	ImportStrategy                 config.ImportStrategy `json:"import_strategy"`
 	ImportDir                      *string               `json:"import_dir,omitempty"`
 	SkipHealthCheck                bool                  `json:"skip_health_check"`
 	WatchDir                       *string               `json:"watch_dir,omitempty"`
 	WatchIntervalSeconds           *int                  `json:"watch_interval_seconds,omitempty"`
+	AllowNestedRarExtraction       *bool                 `json:"allow_nested_rar_extraction,omitempty"`
 }
 
 // SABnzbdAPIResponse sanitizes SABnzbd config for API responses
@@ -159,6 +165,7 @@ func ToConfigAPIResponse(cfg *config.Config, apiKey string) *ConfigAPIResponse {
 			Enabled:           p.Enabled != nil && *p.Enabled,
 			IsBackupProvider:  p.IsBackupProvider != nil && *p.IsBackupProvider,
 			InflightRequests:  p.InflightRequests,
+			LastRTTMs:         p.LastRTTMs,
 			LastSpeedTestMbps: p.LastSpeedTestMbps,
 			LastSpeedTestTime: p.LastSpeedTestTime,
 		}
@@ -181,6 +188,7 @@ func ToConfigAPIResponse(cfg *config.Config, apiKey string) *ConfigAPIResponse {
 		// Mount-Specific Settings
 		AllowOther:    cfg.RClone.AllowOther,
 		AllowNonEmpty: cfg.RClone.AllowNonEmpty,
+		Links:         cfg.RClone.Links,
 		ReadOnly:      cfg.RClone.ReadOnly,
 		Timeout:       cfg.RClone.Timeout,
 		Syslog:        cfg.RClone.Syslog,
@@ -239,13 +247,14 @@ func ToConfigAPIResponse(cfg *config.Config, apiKey string) *ConfigAPIResponse {
 	}
 
 	return &ConfigAPIResponse{
-		Config:    cfg,
-		WebDAV:    webdavResp,
-		Import:    ToImportAPIResponse(cfg.Import),
-		RClone:    rcloneResp,
-		SABnzbd:   sabnzbdResp,
-		Providers: providers,
-		APIKey:    apiKey,
+		Config:          cfg,
+		WebDAV:          webdavResp,
+		Import:          ToImportAPIResponse(cfg.Import),
+		RClone:          rcloneResp,
+		SABnzbd:         sabnzbdResp,
+		Providers:       providers,
+		APIKey:          apiKey,
+		ProfilerEnabled: cfg.ProfilerEnabled,
 	}
 }
 
@@ -256,12 +265,14 @@ func ToImportAPIResponse(importConfig config.ImportConfig) ImportAPIResponse {
 		AllowedFileExtensions:          importConfig.AllowedFileExtensions,
 		MaxImportConnections:           importConfig.MaxImportConnections,
 		MaxDownloadPrefetch:            importConfig.MaxDownloadPrefetch,
+		ReadTimeoutSeconds:             importConfig.ReadTimeoutSeconds,
 		SegmentSamplePercentage:        importConfig.SegmentSamplePercentage,
 		ImportStrategy:                 importConfig.ImportStrategy,
 		ImportDir:                      importConfig.ImportDir,
 		SkipHealthCheck:                importConfig.SkipHealthCheck != nil && *importConfig.SkipHealthCheck,
 		WatchDir:                       importConfig.WatchDir,
 		WatchIntervalSeconds:           importConfig.WatchIntervalSeconds,
+		AllowNestedRarExtraction:       importConfig.AllowNestedRarExtraction,
 	}
 }
 
@@ -269,10 +280,10 @@ func ToImportAPIResponse(importConfig config.ImportConfig) ImportAPIResponse {
 
 // APIResponse represents a standard API response wrapper
 type APIResponse struct {
-	Success bool        `json:"success"`
-	Data    interface{} `json:"data,omitempty"`
-	Error   *APIError   `json:"error,omitempty"`
-	Meta    *APIMeta    `json:"meta,omitempty"`
+	Success bool      `json:"success"`
+	Data    any       `json:"data,omitempty"`
+	Error   *APIError `json:"error,omitempty"`
+	Meta    *APIMeta  `json:"meta,omitempty"`
 }
 
 // APIError represents an error response
@@ -344,6 +355,42 @@ type QueueStatsResponse struct {
 	LastUpdated         time.Time `json:"last_updated"`
 }
 
+// QueueHistoryRange represents statistics for a specific time range
+type QueueHistoryRange struct {
+	Completed  int     `json:"completed"`
+	Failed     int     `json:"failed"`
+	Percentage float64 `json:"percentage"`
+}
+
+// ImportHistoryResponse represents a persistent import record in API responses
+type ImportHistoryResponse struct {
+	ID          int64     `json:"id"`
+	NzbID       *int64    `json:"nzb_id"`
+	NzbName     string    `json:"nzb_name"`
+	FileName    string    `json:"file_name"`
+	FileSize    int64     `json:"file_size"`
+	VirtualPath string    `json:"virtual_path"`
+	LibraryPath *string   `json:"library_path,omitempty"`
+	Category    *string   `json:"category"`
+	CompletedAt time.Time `json:"completed_at"`
+}
+
+// DailyStat represents statistics for a single day
+type DailyStat struct {
+	Day       string `json:"day"`
+	Completed int    `json:"completed"`
+	Failed    int    `json:"failed"`
+}
+
+// QueueHistoricalStatsResponse represents historical queue statistics
+type QueueHistoricalStatsResponse struct {
+	Last24Hours QueueHistoryRange `json:"last_24_hours"`
+	Last7Days   QueueHistoryRange `json:"last_7_days"`
+	Last30Days  QueueHistoryRange `json:"last_30_days"`
+	Last365Days QueueHistoryRange `json:"last_365_days"`
+	Daily       []DailyStat       `json:"daily"`
+}
+
 // Health API Types
 
 // HealthItemResponse represents a health record in API responses
@@ -352,7 +399,7 @@ type HealthItemResponse struct {
 	FilePath         string                  `json:"file_path"`
 	LibraryPath      *string                 `json:"library_path,omitempty"`
 	Status           database.HealthStatus   `json:"status"`
-	LastChecked      time.Time               `json:"last_checked"`
+	LastChecked      *time.Time              `json:"last_checked"`
 	LastError        *string                 `json:"last_error"`
 	RetryCount       int                     `json:"retry_count"`
 	MaxRetries       int                     `json:"max_retries"`
@@ -364,6 +411,9 @@ type HealthItemResponse struct {
 	UpdatedAt        time.Time               `json:"updated_at"`
 	ScheduledCheckAt *time.Time              `json:"scheduled_check_at,omitempty"`
 	Priority         database.HealthPriority `json:"priority"`
+	// Failure masking fields
+	StreamingFailureCount int  `json:"streaming_failure_count"`
+	IsMasked              bool `json:"is_masked"`
 }
 
 // HealthListRequest represents request parameters for listing health records
@@ -435,9 +485,30 @@ type SystemStatsResponse struct {
 // SystemInfoResponse represents system information
 type SystemInfoResponse struct {
 	Version   string    `json:"version,omitempty"`
+	GitCommit string    `json:"git_commit,omitempty"`
 	StartTime time.Time `json:"start_time"`
 	Uptime    string    `json:"uptime"`
 	GoVersion string    `json:"go_version,omitempty"`
+}
+
+// Update API Types
+
+// UpdateChannel represents the Docker image channel for updates.
+type UpdateChannel string
+
+const (
+	UpdateChannelLatest UpdateChannel = "latest"
+	UpdateChannelDev    UpdateChannel = "dev"
+)
+
+// UpdateStatusResponse represents the current update status.
+type UpdateStatusResponse struct {
+	CurrentVersion  string        `json:"current_version"`
+	GitCommit       string        `json:"git_commit,omitempty"`
+	Channel         UpdateChannel `json:"channel"`
+	LatestVersion   string        `json:"latest_version,omitempty"`
+	UpdateAvailable bool          `json:"update_available"`
+	ReleaseURL      string        `json:"release_url,omitempty"`
 }
 
 // SystemHealthResponse represents system health check result
@@ -498,9 +569,10 @@ func ToQueueItemResponse(item *database.ImportQueueItem) *QueueItemResponse {
 	// Remove ID prefix (e.g. "123_filename")
 	parts := strings.SplitN(targetPath, "_", 2)
 	if len(parts) == 2 {
-		// Check if first part is numeric (the ID)
-		// We don't need strict validation, just heuristic
-		targetPath = parts[1]
+		// Only strip prefix if first part is actually numeric (the queue ID)
+		if _, err := strconv.Atoi(parts[0]); err == nil {
+			targetPath = parts[1]
+		}
 	}
 
 	// Transform error message for better user understanding
@@ -541,6 +613,93 @@ func ToQueueStatsResponse(stats *database.QueueStats) *QueueStatsResponse {
 	}
 }
 
+// ToQueueHistoricalStatsResponse converts database.ImportDailyStat slice to QueueHistoricalStatsResponse
+func ToQueueHistoricalStatsResponse(stats []*database.ImportDailyStat, hourlyStats []*database.ImportHourlyStat) *QueueHistoricalStatsResponse {
+	response := &QueueHistoricalStatsResponse{
+		Daily: make([]DailyStat, 0, len(stats)),
+	}
+
+	now := time.Now().UTC()
+	day24h := now.Add(-24 * time.Hour)
+	day7d := now.Add(-7 * 24 * time.Hour)
+	day30d := now.Add(-30 * 24 * time.Hour)
+	day365d := now.Add(-365 * 24 * time.Hour)
+
+	// If hourly stats provided, use them for strict rolling 24h
+	if len(hourlyStats) > 0 {
+		for _, hs := range hourlyStats {
+			if hs.Hour.After(day24h) || hs.Hour.Equal(day24h) {
+				response.Last24Hours.Completed += hs.CompletedCount
+				response.Last24Hours.Failed += hs.FailedCount
+			}
+		}
+	}
+
+	for _, s := range stats {
+		// Daily list
+		response.Daily = append(response.Daily, DailyStat{
+			Day:       s.Day.Format("2006-01-02"),
+			Completed: s.CompletedCount,
+			Failed:    s.FailedCount,
+		})
+
+		// Aggregates
+		if s.Day.After(day365d) || s.Day.Format("2006-01-02") == day365d.Format("2006-01-02") {
+			response.Last365Days.Completed += s.CompletedCount
+			response.Last365Days.Failed += s.FailedCount
+		}
+		if s.Day.After(day30d) || s.Day.Format("2006-01-02") == day30d.Format("2006-01-02") {
+			response.Last30Days.Completed += s.CompletedCount
+			response.Last30Days.Failed += s.FailedCount
+		}
+		if s.Day.After(day7d) || s.Day.Format("2006-01-02") == day7d.Format("2006-01-02") {
+			response.Last7Days.Completed += s.CompletedCount
+			response.Last7Days.Failed += s.FailedCount
+		}
+
+		// Fallback for 24h if no hourly stats provided
+		if len(hourlyStats) == 0 {
+			if s.Day.After(day24h) || s.Day.Format("2006-01-02") == day24h.Format("2006-01-02") {
+				response.Last24Hours.Completed += s.CompletedCount
+				response.Last24Hours.Failed += s.FailedCount
+			}
+		}
+	}
+
+	// Calculate percentages
+	calcPercentage := func(r *QueueHistoryRange) {
+		total := r.Completed + r.Failed
+		if total > 0 {
+			r.Percentage = (float64(r.Completed) / float64(total)) * 100
+		}
+	}
+
+	calcPercentage(&response.Last24Hours)
+	calcPercentage(&response.Last7Days)
+	calcPercentage(&response.Last30Days)
+	calcPercentage(&response.Last365Days)
+
+	return response
+}
+
+// ToImportHistoryResponse converts database.ImportHistory to ImportHistoryResponse
+func ToImportHistoryResponse(h *database.ImportHistory) *ImportHistoryResponse {
+	if h == nil {
+		return nil
+	}
+	return &ImportHistoryResponse{
+		ID:          h.ID,
+		NzbID:       h.NzbID,
+		NzbName:     h.NzbName,
+		FileName:    h.FileName,
+		FileSize:    h.FileSize,
+		VirtualPath: h.VirtualPath,
+		LibraryPath: h.LibraryPath,
+		Category:    h.Category,
+		CompletedAt: h.CompletedAt,
+	}
+}
+
 // ToHealthItemResponse converts database.FileHealth to HealthItemResponse
 func ToHealthItemResponse(item *database.FileHealth) *HealthItemResponse {
 	if item == nil {
@@ -563,6 +722,8 @@ func ToHealthItemResponse(item *database.FileHealth) *HealthItemResponse {
 		UpdatedAt:        item.UpdatedAt,
 		ScheduledCheckAt: item.ScheduledCheckAt,
 		Priority:         item.Priority,
+		StreamingFailureCount: item.StreamingFailureCount,
+		IsMasked:              item.IsMasked,
 	}
 }
 
@@ -594,16 +755,17 @@ func ToHealthStatsResponse(stats map[database.HealthStatus]int) *HealthStatsResp
 
 // FileMetadataResponse represents file metadata information in API responses
 type FileMetadataResponse struct {
-	FileSize          int64                 `json:"file_size"`
-	SourceNzbPath     string                `json:"source_nzb_path"`
-	Status            string                `json:"status"`
-	SegmentCount      int                   `json:"segment_count"`
-	AvailableSegments *int                  `json:"available_segments"`
-	Encryption        string                `json:"encryption"`
-	CreatedAt         string                `json:"created_at"`
-	ModifiedAt        string                `json:"modified_at"`
-	PasswordProtected bool                  `json:"password_protected"`
-	Segments          []SegmentInfoResponse `json:"segments"`
+	FileSize          int64                  `json:"file_size"`
+	SourceNzbPath     string                 `json:"source_nzb_path"`
+	Status            string                 `json:"status"`
+	SegmentCount      int                    `json:"segment_count"`
+	AvailableSegments *int                   `json:"available_segments"`
+	Encryption        string                 `json:"encryption"`
+	CreatedAt         string                 `json:"created_at"`
+	ModifiedAt        string                 `json:"modified_at"`
+	PasswordProtected bool                   `json:"password_protected"`
+	Segments          []SegmentInfoResponse  `json:"segments"`
+	NestedSources     []NestedSourceResponse `json:"nested_sources,omitempty"`
 }
 
 // SegmentInfoResponse represents segment information in API responses
@@ -613,6 +775,24 @@ type SegmentInfoResponse struct {
 	EndOffset   int64  `json:"end_offset"`
 	MessageID   string `json:"message_id"`
 	Available   bool   `json:"available"`
+}
+
+// NestedSegmentResponse represents one segment within a nested source volume
+type NestedSegmentResponse struct {
+	SegmentSize int64  `json:"segment_size"`
+	StartOffset int64  `json:"start_offset"`
+	EndOffset   int64  `json:"end_offset"`
+	MessageID   string `json:"message_id"`
+}
+
+// NestedSourceResponse represents one inner-RAR volume in a nested archive
+type NestedSourceResponse struct {
+	VolumeIndex     int                     `json:"volume_index"`
+	InnerLength     int64                   `json:"inner_length"`
+	InnerVolumeSize int64                   `json:"inner_volume_size"`
+	Encrypted       bool                    `json:"encrypted"`
+	SegmentCount    int                     `json:"segment_count"`
+	Segments        []NestedSegmentResponse `json:"segments"`
 }
 
 // Provider Management API Types
@@ -693,19 +873,20 @@ type ManualImportResponse struct {
 
 // ProviderStatusResponse represents NNTP provider connection status in API responses
 type ProviderStatusResponse struct {
-	ID                    string     `json:"id"`
-	Host                  string     `json:"host"`
-	Username              string     `json:"username"`
-	UsedConnections       int        `json:"used_connections"`
-	MaxConnections        int        `json:"max_connections"`
-	State                 string     `json:"state"`
-	ErrorCount            int64      `json:"error_count"`
-	LastConnectionAttempt time.Time  `json:"last_connection_attempt"`
-	LastSuccessfulConnect time.Time  `json:"last_successful_connect"`
-	FailureReason         string     `json:"failure_reason"`
-	LastSpeedTestMbps     float64    `json:"last_speed_test_mbps"`
-	LastSpeedTestTime     *time.Time `json:"last_speed_test_time,omitempty"`
+	ID                      string     `json:"id"`
+	Host                    string     `json:"host"`
+	Username                string     `json:"username"`
+	UsedConnections         int        `json:"used_connections"`
+	MaxConnections          int        `json:"max_connections"`
+	State                   string     `json:"state"`
+	ErrorCount              int64      `json:"error_count"`
+	LastConnectionAttempt   time.Time  `json:"last_connection_attempt"`
+	LastSuccessfulConnect   time.Time  `json:"last_successful_connect"`
+	FailureReason           string     `json:"failure_reason"`
+	LastSpeedTestMbps       float64    `json:"last_speed_test_mbps"`
+	LastSpeedTestTime       *time.Time `json:"last_speed_test_time,omitempty"`
 	CurrentSpeedBytesPerSec float64    `json:"current_speed_bytes_per_sec"`
+	PingMs                  int64      `json:"ping_ms"`
 	MissingCount            int64      `json:"missing_count"`
 	MissingRatePerMinute    float64    `json:"missing_rate_per_minute"`
 	MissingWarning          bool       `json:"missing_warning"`
@@ -714,6 +895,7 @@ type ProviderStatusResponse struct {
 // PoolMetricsResponse represents NNTP pool metrics in API responses
 type PoolMetricsResponse struct {
 	BytesDownloaded             int64                    `json:"bytes_downloaded"`
+	BytesDownloaded24h          int64                    `json:"bytes_downloaded_24h"`
 	BytesUploaded               int64                    `json:"bytes_uploaded"`
 	ArticlesDownloaded          int64                    `json:"articles_downloaded"`
 	ArticlesPosted              int64                    `json:"articles_posted"`

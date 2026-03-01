@@ -53,7 +53,9 @@ func TestSyncLibrary_WorkerPool(t *testing.T) {
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 			release_date DATETIME,
-			scheduled_check_at DATETIME
+			scheduled_check_at DATETIME,
+			streaming_failure_count INTEGER DEFAULT 0,
+			is_masked BOOLEAN DEFAULT FALSE
 		);
 	`)
 	require.NoError(t, err)
@@ -83,7 +85,7 @@ func TestSyncLibrary_WorkerPool(t *testing.T) {
 
 	// Create some metadata files
 	numFiles := 50
-	for i := 0; i < numFiles; i++ {
+	for i := range numFiles {
 		fileName := filepath.Join("movies", "movie_"+fmt.Sprintf("%d", i)+".mkv")
 
 		// Create a dummy metadata object

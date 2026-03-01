@@ -19,7 +19,7 @@ func TestFindInstanceForFilePath(t *testing.T) {
 					Name:    "radarr-test",
 					URL:     "http://localhost:7878",
 					APIKey:  "apikey",
-					Enabled: boolPtr(true),
+					Enabled: new(true),
 				},
 			},
 		},
@@ -29,8 +29,4 @@ func TestFindInstanceForFilePath(t *testing.T) {
 	s := NewService(getter, nil, nil)
 
 	assert.NotNil(t, s)
-}
-
-func boolPtr(b bool) *bool {
-	return &b
 }

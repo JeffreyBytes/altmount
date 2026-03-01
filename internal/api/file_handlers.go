@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -75,6 +76,33 @@ func (s *Server) convertToFileMetadataResponse(metadata *metapb.FileMetadata) *F
 		}
 	}
 
+	// Convert nested sources
+	var nestedSources []NestedSourceResponse
+	nestedSegmentCount := 0
+	for i, ns := range metadata.NestedSources {
+		segs := make([]NestedSegmentResponse, len(ns.Segments))
+		for j, seg := range ns.Segments {
+			segs[j] = NestedSegmentResponse{
+				SegmentSize: seg.SegmentSize,
+				StartOffset: seg.StartOffset,
+				EndOffset:   seg.EndOffset,
+				MessageID:   seg.Id,
+			}
+		}
+		nestedSegmentCount += len(ns.Segments)
+		nestedSources = append(nestedSources, NestedSourceResponse{
+			VolumeIndex:     i,
+			InnerLength:     ns.InnerLength,
+			InnerVolumeSize: ns.InnerVolumeSize,
+			Encrypted:       len(ns.AesKey) > 0,
+			SegmentCount:    len(ns.Segments),
+			Segments:        segs,
+		})
+	}
+
+	// Total segment count includes nested source segments
+	segmentCount := len(metadata.SegmentData) + nestedSegmentCount
+
 	// Convert timestamps
 	createdAt := time.Unix(metadata.CreatedAt, 0).Format(time.RFC3339)
 	modifiedAt := time.Unix(metadata.ModifiedAt, 0).Format(time.RFC3339)
@@ -83,13 +111,14 @@ func (s *Server) convertToFileMetadataResponse(metadata *metapb.FileMetadata) *F
 		FileSize:          metadata.FileSize,
 		SourceNzbPath:     metadata.SourceNzbPath,
 		Status:            statusStr,
-		SegmentCount:      len(metadata.SegmentData),
+		SegmentCount:      segmentCount,
 		AvailableSegments: nil, // TODO: Implement actual available segment count
 		Encryption:        encryptionStr,
 		CreatedAt:         createdAt,
 		ModifiedAt:        modifiedAt,
 		PasswordProtected: metadata.Password != "",
 		Segments:          segments,
+		NestedSources:     nestedSources,
 	}
 }
 
@@ -327,13 +356,7 @@ func shouldExcludeFile(filename string, excludeArchives bool) bool {
 
 	// Check for common archive extensions
 	ext := strings.ToLower(filepath.Ext(filename))
-	for _, archiveExt := range archiveExts {
-		if ext == archiveExt {
-			return true
-		}
-	}
-
-	return false
+	return slices.Contains(archiveExts, ext)
 }
 
 // handleBatchExportNZB handles POST /files/export-batch requests

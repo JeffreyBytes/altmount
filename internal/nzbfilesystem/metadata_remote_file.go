@@ -20,6 +20,7 @@ import (
 	"github.com/javi11/altmount/internal/encryption/rclone"
 	"github.com/javi11/altmount/internal/metadata"
 	metapb "github.com/javi11/altmount/internal/metadata/proto"
+	"github.com/javi11/altmount/internal/pathutil"
 	"github.com/javi11/altmount/internal/pool"
 	"github.com/javi11/altmount/internal/usenet"
 	"github.com/javi11/altmount/internal/utils"
@@ -35,6 +36,7 @@ type MetadataRemoteFile struct {
 	rcloneCipher     *rclone.RcloneCrypt // For rclone encryption/decryption
 	aesCipher        *aes.AesCipher      // For AES encryption/decryption
 	streamTracker    StreamTracker       // Stream tracker for monitoring active streams
+	segmentStore     usenet.SegmentStore // Optional segment cache (nil = disabled)
 }
 
 // Configuration is now accessed dynamically through config.ConfigGetter
@@ -47,6 +49,7 @@ func NewMetadataRemoteFile(
 	poolManager pool.Manager,
 	configGetter config.ConfigGetter,
 	streamTracker StreamTracker,
+	segmentStore usenet.SegmentStore,
 ) *MetadataRemoteFile {
 	// Initialize rclone cipher with global credentials for encrypted files
 	cfg := configGetter()
@@ -68,6 +71,7 @@ func NewMetadataRemoteFile(
 		rcloneCipher:     rcloneCipher,
 		aesCipher:        aesCipher,
 		streamTracker:    streamTracker,
+		segmentStore:     segmentStore,
 	}
 }
 
@@ -100,14 +104,22 @@ func (mrf *MetadataRemoteFile) OpenFile(ctx context.Context, name string) (bool,
 		showCorrupted = sc
 	}
 
+	// Force showCorrupted if we are inside the corrupted_metadata folder
+	// normalizedName is clean and has no trailing slashes
+	if strings.HasPrefix(normalizedName, "corrupted_metadata/") || normalizedName == "corrupted_metadata" {
+		showCorrupted = true
+	}
+
 	// Check if this is a directory first
 	if mrf.metadataService.DirectoryExists(normalizedName) {
 		// Create a directory handle
 		virtualDir := &MetadataVirtualDirectory{
-			name:            name,
-			normalizedPath:  normalizedName,
-			metadataService: mrf.metadataService,
-			showCorrupted:   showCorrupted,
+			name:             name,
+			normalizedPath:   normalizedName,
+			metadataService:  mrf.metadataService,
+			healthRepository: mrf.healthRepository,
+			configGetter:     mrf.configGetter,
+			showCorrupted:    showCorrupted,
 		}
 		return true, virtualDir, nil
 	}
@@ -131,10 +143,12 @@ func (mrf *MetadataRemoteFile) OpenFile(ctx context.Context, name string) (bool,
 			if mrf.isValidEmptyDirectory(normalizedName) {
 				// Create a directory handle for empty directory
 				virtualDir := &MetadataVirtualDirectory{
-					name:            name,
-					normalizedPath:  normalizedName,
-					metadataService: mrf.metadataService,
-					showCorrupted:   showCorrupted,
+					name:             name,
+					normalizedPath:   normalizedName,
+					metadataService:  mrf.metadataService,
+					healthRepository: mrf.healthRepository,
+					configGetter:     mrf.configGetter,
+					showCorrupted:    showCorrupted,
 				}
 				return true, virtualDir, nil
 			}
@@ -156,7 +170,7 @@ func (mrf *MetadataRemoteFile) OpenFile(ctx context.Context, name string) (bool,
 	if fileMeta.Status == metapb.FileStatus_FILE_STATUS_CORRUPTED {
 		return false, nil, &CorruptedFileError{
 			TotalExpected: fileMeta.FileSize,
-			UnderlyingErr: ErrNoNzbData,
+			UnderlyingErr: ErrMissmatchedSegments,
 		}
 	}
 
@@ -169,7 +183,10 @@ func (mrf *MetadataRemoteFile) OpenFile(ctx context.Context, name string) (bool,
 
 	// Start tracking stream if tracker available
 	streamID := ""
-	if mrf.streamTracker != nil {
+	if suppress, _ := ctx.Value(utils.SuppressStreamTrackingKey).(bool); suppress {
+		// Stream tracking handled at caller level (e.g. FUSE Handle)
+		streamID = ""
+	} else if mrf.streamTracker != nil {
 		// Check if we already have a stream ID in context
 		if id, ok := ctx.Value(utils.StreamIDKey).(string); ok && id != "" {
 			streamID = id
@@ -202,15 +219,13 @@ func (mrf *MetadataRemoteFile) OpenFile(ctx context.Context, name string) (bool,
 		}
 	}
 
-	// Build segment offset index for O(1) lookup
-	segmentIndex := buildSegmentIndex(fileMeta.SegmentData)
-
 	// Create a metadata-based virtual file handle
 	virtualFile := &MetadataVirtualFile{
 		name:             name,
 		fileMeta:         fileMeta,
 		metadataService:  mrf.metadataService,
 		healthRepository: mrf.healthRepository,
+		configGetter:     mrf.configGetter,
 		poolManager:      mrf.poolManager,
 		ctx:              ctx,
 		maxPrefetch:      maxPrefetch,
@@ -220,7 +235,7 @@ func (mrf *MetadataRemoteFile) OpenFile(ctx context.Context, name string) (bool,
 		globalSalt:       mrf.getGlobalSalt(),
 		streamTracker:    mrf.streamTracker,
 		streamID:         streamID,
-		segmentIndex:     segmentIndex,
+		segmentStore:     mrf.segmentStore,
 	}
 
 	return true, virtualFile, nil
@@ -257,12 +272,41 @@ func (mrf *MetadataRemoteFile) RemoveFile(ctx context.Context, fileName string) 
 		return false, nil
 	}
 
+	// Try to find the physical path from health record for cleanup
+	var physicalPath string
+	if mrf.healthRepository != nil {
+		if health, err := mrf.healthRepository.GetFileHealth(ctx, normalizedName); err == nil && health != nil {
+			if health.LibraryPath != nil && *health.LibraryPath != "" {
+				physicalPath = *health.LibraryPath
+			}
+		}
+	}
+
 	// Check if we should delete the source NZB file
 	cfg := mrf.configGetter()
 	deleteSourceNzb := cfg.Metadata.DeleteSourceNzbOnRemoval != nil && *cfg.Metadata.DeleteSourceNzbOnRemoval
 
 	// Use MetadataService's file delete operation with optional NZB deletion
-	return true, mrf.metadataService.DeleteFileMetadataWithSourceNzb(ctx, normalizedName, deleteSourceNzb)
+	err := mrf.metadataService.DeleteFileMetadataWithSourceNzb(ctx, normalizedName, deleteSourceNzb)
+	if err != nil {
+		return true, err
+	}
+
+	// Clean up empty physical directories if we found a physical path
+	if physicalPath != "" {
+		var rootPath string
+		if cfg.Health.LibraryDir != nil && *cfg.Health.LibraryDir != "" {
+			rootPath = *cfg.Health.LibraryDir
+		} else {
+			rootPath = cfg.MountPath
+		}
+
+		if rootPath != "" {
+			pathutil.RemoveEmptyDirs(rootPath, filepath.Dir(physicalPath))
+		}
+	}
+
+	return true, nil
 }
 
 // RenameFile renames a virtual file or directory in the metadata
@@ -291,6 +335,24 @@ func (mrf *MetadataRemoteFile) RenameFile(ctx context.Context, oldName, newName 
 		if err := os.Rename(oldDirPath, newDirPath); err != nil {
 			return false, fmt.Errorf("failed to rename directory: %w", err)
 		}
+
+		// Update health records for all files under the renamed directory
+		if mrf.healthRepository != nil {
+			if err := mrf.healthRepository.RenameHealthRecord(ctx, normalizedOld, normalizedNew); err != nil {
+				slog.WarnContext(ctx, "Failed to update health records for renamed directory", "old", normalizedOld, "new", normalizedNew, "error", err)
+			}
+		}
+
+		// Update ID symlinks for all files with NzbdavId under the renamed directory
+		_ = mrf.metadataService.WalkDirectoryFiles(normalizedNew, func(fileVirtualPath string, meta *metapb.FileMetadata) error {
+			if meta.NzbdavId != "" {
+				if err := mrf.metadataService.UpdateIDSymlink(meta.NzbdavId, fileVirtualPath); err != nil {
+					slog.WarnContext(ctx, "Failed to update ID symlink after directory rename", "id", meta.NzbdavId, "path", fileVirtualPath, "error", err)
+				}
+			}
+			return nil
+		})
+
 		return true, nil
 	}
 
@@ -301,30 +363,31 @@ func (mrf *MetadataRemoteFile) RenameFile(ctx context.Context, oldName, newName 
 		return false, nil
 	}
 
-	// Read existing metadata
+	// Read metadata first to get NzbdavId before rename
 	fileMeta, err := mrf.metadataService.ReadFileMetadata(normalizedOld)
 	if err != nil {
 		return false, fmt.Errorf("failed to read old metadata: %w", err)
 	}
 
-	// Write to new location
-	if err := mrf.metadataService.WriteFileMetadata(normalizedNew, fileMeta); err != nil {
-		return false, fmt.Errorf("failed to write new metadata: %w", err)
-	}
-
-	// Delete old location
-	cfg := mrf.configGetter()
-	deleteSourceNzb := cfg.Metadata.DeleteSourceNzbOnRemoval != nil && *cfg.Metadata.DeleteSourceNzbOnRemoval
-	if err := mrf.metadataService.DeleteFileMetadataWithSourceNzb(ctx, normalizedOld, deleteSourceNzb); err != nil {
-		return false, fmt.Errorf("failed to delete old metadata: %w", err)
+	// Use atomic rename instead of read-write-delete
+	if err := mrf.metadataService.RenameFileMetadata(normalizedOld, normalizedNew); err != nil {
+		return false, fmt.Errorf("failed to rename metadata: %w", err)
 	}
 
 	slog.InfoContext(ctx, "MOVE operation successful", "source", normalizedOld, "destination", normalizedNew)
 
-	// Clean up any health records for the new location and optionally for the directory
+	// Update ID symlink if file has a NzbdavId
+	if fileMeta != nil && fileMeta.NzbdavId != "" {
+		if err := mrf.metadataService.UpdateIDSymlink(fileMeta.NzbdavId, normalizedNew); err != nil {
+			slog.WarnContext(ctx, "Failed to update ID symlink during MOVE", "id", fileMeta.NzbdavId, "error", err)
+		}
+	}
+
+	// Update health records
 	if mrf.healthRepository != nil {
-		// Remove health record for the specific resulting file (the new one)
-		_ = mrf.healthRepository.DeleteHealthRecord(ctx, normalizedNew)
+		if err := mrf.healthRepository.RenameHealthRecord(ctx, normalizedOld, normalizedNew); err != nil {
+			slog.WarnContext(ctx, "Failed to update health record path during MOVE", "old", normalizedOld, "new", normalizedNew, "error", err)
+		}
 
 		// Check if we should resolve other repairs in the same directory
 		cfg := mrf.configGetter()
@@ -439,6 +502,23 @@ func (mrf *MetadataRemoteFile) Stat(ctx context.Context, name string) (bool, fs.
 		return false, nil, fs.ErrNotExist
 	}
 
+	// Extract showCorrupted flag from context
+	showCorrupted := false
+	if sc, ok := ctx.Value(utils.ShowCorrupted).(bool); ok {
+		showCorrupted = sc
+	}
+
+	// Filter out masked files if masking is enabled and not showing corrupted
+	if !showCorrupted {
+		cfg := mrf.configGetter()
+		if cfg.Streaming.FailureMasking.Enabled == nil || *cfg.Streaming.FailureMasking.Enabled {
+			health, err := mrf.healthRepository.GetFileHealth(ctx, normalizedName)
+			if err == nil && health != nil && health.IsMasked {
+				return false, nil, fs.ErrNotExist
+			}
+		}
+	}
+
 	// Convert to fs.FileInfo
 	info := &MetadataFileInfo{
 		name:    filepath.Base(normalizedName),
@@ -465,7 +545,7 @@ func (mfi *MetadataFileInfo) Size() int64        { return mfi.size }
 func (mfi *MetadataFileInfo) Mode() os.FileMode  { return mfi.mode }
 func (mfi *MetadataFileInfo) ModTime() time.Time { return mfi.modTime }
 func (mfi *MetadataFileInfo) IsDir() bool        { return mfi.isDir }
-func (mfi *MetadataFileInfo) Sys() interface{}   { return nil }
+func (mfi *MetadataFileInfo) Sys() any           { return nil }
 
 // MetadataSegmentLoader adapts metadata segments to the usenet.SegmentLoader interface
 type MetadataSegmentLoader struct {
@@ -497,10 +577,12 @@ func (msl *MetadataSegmentLoader) GetSegment(index int) (segment usenet.Segment,
 
 // MetadataVirtualDirectory implements afero.File for metadata-backed virtual directories
 type MetadataVirtualDirectory struct {
-	name            string
-	normalizedPath  string
-	metadataService *metadata.MetadataService
-	showCorrupted   bool
+	name             string
+	normalizedPath   string
+	metadataService  *metadata.MetadataService
+	healthRepository *database.HealthRepository
+	configGetter     config.ConfigGetter
+	showCorrupted    bool
 }
 
 // Read implements afero.File.Read (not supported for directories)
@@ -557,6 +639,12 @@ func (mvd *MetadataVirtualDirectory) Readdir(count int) ([]fs.FileInfo, error) {
 		return nil, err
 	}
 
+	// Check if failure masking is enabled
+	cfg := mvd.configGetter()
+	maskingEnabled := cfg.Streaming.FailureMasking.Enabled == nil || *cfg.Streaming.FailureMasking.Enabled
+
+	ctx := context.Background()
+
 	for _, fileName := range fileNames {
 		virtualFilePath := filepath.Join(mvd.normalizedPath, fileName)
 		fileMeta, err := mvd.metadataService.ReadFileMetadata(virtualFilePath)
@@ -567,6 +655,14 @@ func (mvd *MetadataVirtualDirectory) Readdir(count int) ([]fs.FileInfo, error) {
 		// Skip corrupted files unless showCorrupted flag is set
 		if !mvd.showCorrupted && fileMeta.Status == metapb.FileStatus_FILE_STATUS_CORRUPTED {
 			continue
+		}
+
+		// Skip masked files if masking is enabled
+		if maskingEnabled && !mvd.showCorrupted {
+			health, err := mvd.healthRepository.GetFileHealth(ctx, virtualFilePath)
+			if err == nil && health != nil && health.IsMasked {
+				continue
+			}
 		}
 
 		info := &MetadataFileInfo{
@@ -643,6 +739,7 @@ type MetadataVirtualFile struct {
 	fileMeta         *metapb.FileMetadata
 	metadataService  *metadata.MetadataService
 	healthRepository *database.HealthRepository
+	configGetter     config.ConfigGetter
 	poolManager      pool.Manager // Pool manager for dynamic pool access
 	ctx              context.Context
 	maxPrefetch      int // Maximum segments prefetched ahead of current read position
@@ -652,6 +749,8 @@ type MetadataVirtualFile struct {
 	globalSalt       string
 	streamTracker    StreamTracker
 	streamID         string
+	segmentStore     usenet.SegmentStore // optional segment cache
+	segmentIndexOnce sync.Once           // guards lazy init of segmentIndex
 
 	// Reader state and position tracking
 	reader            io.ReadCloser
@@ -664,7 +763,8 @@ type MetadataVirtualFile struct {
 	// Segment offset index for O(1) offset→segment lookup
 	segmentIndex *segmentOffsetIndex
 
-	mu sync.Mutex
+	mu      sync.Mutex
+	closeWg sync.WaitGroup // tracks background reader closes during seek
 }
 
 // segmentOffsetIndex provides O(1) lookup for offset→segment mapping using binary search
@@ -791,6 +891,7 @@ func (mvf *MetadataVirtualFile) Read(p []byte) (n int, err error) {
 
 		if totalRead > 0 && mvf.streamTracker != nil && mvf.streamID != "" {
 			mvf.streamTracker.UpdateProgress(mvf.streamID, int64(totalRead))
+			mvf.streamTracker.UpdateCurrentOffset(mvf.streamID, mvf.position)
 
 			// Update buffered offset if available
 			if ur, ok := mvf.reader.(interface{ GetBufferedOffset() int64 }); ok {
@@ -852,8 +953,12 @@ func (mvf *MetadataVirtualFile) ReadAt(p []byte, off int64) (n int, err error) {
 	}
 	defer reader.Close()
 
-	// Read the requested data
-	n, err = io.ReadFull(reader, p[:end-off+1])
+	// Read the requested data using a context-aware wrapper.
+	// This ensures reads are cancelled if the FUSE context expires,
+	// even if the underlying reader blocks.
+	ctx := mvf.ctx
+	buf := p[:end-off+1]
+	n, err = readFullContext(ctx, reader, buf)
 	if err == io.ErrUnexpectedEOF {
 		// Partial read is acceptable for ReadAt at end of file
 		err = nil
@@ -869,8 +974,13 @@ func (mvf *MetadataVirtualFile) createReaderAtOffset(start, end int64) (io.ReadC
 		return nil, ErrNoUsenetPool
 	}
 
+	// Nested sources take priority — each source has its own segments and AES credentials
+	if len(mvf.fileMeta.NestedSources) > 0 {
+		return mvf.createNestedReader(start, end)
+	}
+
 	if len(mvf.fileMeta.SegmentData) == 0 {
-		return nil, ErrNoNzbData
+		return nil, ErrMissmatchedSegments
 	}
 
 	// Create reader based on encryption type
@@ -973,6 +1083,9 @@ func (mvf *MetadataVirtualFile) Seek(offset int64, whence int) (int64, error) {
 	// on next read. This prevents stale range information from being reused after seek.
 	if abs != mvf.position {
 		mvf.originalRangeEnd = 0
+		if mvf.streamTracker != nil && mvf.streamID != "" {
+			mvf.streamTracker.UpdateCurrentOffset(mvf.streamID, abs)
+		}
 	}
 
 	mvf.position = abs
@@ -988,13 +1101,16 @@ func (mvf *MetadataVirtualFile) Close() error {
 	}
 
 	mvf.mu.Lock()
-	defer mvf.mu.Unlock()
 	if mvf.reader != nil {
-		err := mvf.reader.Close()
+		mvf.reader.Close()
 		mvf.reader = nil
 		mvf.readerInitialized = false
-		return err
 	}
+	mvf.mu.Unlock()
+
+	// Wait for any background reader closes from previous seeks
+	mvf.closeWg.Wait()
+
 	return nil
 }
 
@@ -1075,11 +1191,15 @@ func (mvf *MetadataVirtualFile) hasMoreDataToRead() bool {
 	return false
 }
 
-// closeCurrentReader closes the current reader and resets reader state
+// closeCurrentReader detaches the current reader and closes it in the background.
+// This avoids blocking Seek on UsenetReader.Close() which may wait for in-flight downloads.
 func (mvf *MetadataVirtualFile) closeCurrentReader() {
 	if mvf.reader != nil {
-		mvf.reader.Close()
+		reader := mvf.reader
 		mvf.reader = nil
+		mvf.closeWg.Go(func() {
+			reader.Close()
+		})
 	}
 	mvf.readerInitialized = false
 }
@@ -1106,7 +1226,14 @@ func (mvf *MetadataVirtualFile) ensureReader() error {
 	mvf.currentRangeEnd = end
 
 	// Create reader for the calculated range using metadata segments
-	if mvf.fileMeta.Encryption != metapb.Encryption_NONE {
+	if len(mvf.fileMeta.NestedSources) > 0 {
+		// Nested RAR: use multi-source reader
+		reader, err := mvf.createNestedReader(start, end)
+		if err != nil {
+			return fmt.Errorf("failed to create nested reader: %w", err)
+		}
+		mvf.reader = reader
+	} else if mvf.fileMeta.Encryption != metapb.Encryption_NONE {
 		// Wrap the usenet reader with encryption
 		decryptedReader, err := mvf.wrapWithEncryption(start, end)
 		if err != nil {
@@ -1161,28 +1288,28 @@ func (mvf *MetadataVirtualFile) getRequestRange() (start, end int64) {
 // createUsenetReader creates a new usenet reader for the specified range using metadata segments
 func (mvf *MetadataVirtualFile) createUsenetReader(ctx context.Context, start, end int64) (io.ReadCloser, error) {
 	if len(mvf.fileMeta.SegmentData) == 0 {
-		return nil, ErrNoNzbData
+		return nil, ErrMissmatchedSegments
 	}
+
+	// Build segment offset index lazily on first read (thread-safe via sync.Once)
+	mvf.segmentIndexOnce.Do(func() {
+		mvf.segmentIndex = buildSegmentIndex(mvf.fileMeta.SegmentData)
+	})
 
 	loader := newMetadataSegmentLoader(mvf.fileMeta.SegmentData)
 
-	// Use segment index for O(log n) lookup of starting segment instead of O(n) linear scan
-	startSegIdx := 0
-	startFilePos := int64(0)
-	if mvf.segmentIndex != nil && start > 0 {
-		startSegIdx = mvf.segmentIndex.findSegmentForOffset(start)
-		if startSegIdx >= 0 {
-			startFilePos = mvf.segmentIndex.getOffsetForSegment(startSegIdx)
-		}
-		// If startSegIdx < 0 (offset beyond all segments), keep defaults (0, 0)
-		// to let GetSegmentsInRangeFromIndex iterate from beginning -
-		// it will correctly handle finding no segments in range
-	}
+	// segmentIndex is always non-nil here (built by segmentIndexOnce.Do above).
+	// Use O(log n) binary search to find segment boundaries, then create a lazy
+	// range with O(1) initialization. Corrupt metadata (index returning -1) results
+	// in an empty range caught by HasSegments() below.
+	startSegIdx := mvf.segmentIndex.findSegmentForOffset(start)
+	startFilePos := mvf.segmentIndex.getOffsetForSegment(startSegIdx)
+	endSegIdx := mvf.segmentIndex.findSegmentForOffset(end)
+	endFilePos := mvf.segmentIndex.getOffsetForSegment(endSegIdx)
 
-	rg := usenet.GetSegmentsInRangeFromIndex(ctx, start, end, loader, startSegIdx, startFilePos)
+	rg := usenet.NewLazySegmentRange(ctx, start, end, loader, startSegIdx, startFilePos, endSegIdx, endFilePos)
 
 	if !rg.HasSegments() {
-		// Calculate available bytes for debugging
 		var availableBytes int64
 		for _, seg := range mvf.fileMeta.SegmentData {
 			availableBytes += seg.SegmentSize
@@ -1196,16 +1323,188 @@ func (mvf *MetadataVirtualFile) createUsenetReader(ctx context.Context, start, e
 		)
 
 		mvf.updateFileHealthOnError(&usenet.DataCorruptionError{
-			UnderlyingErr: ErrNoNzbData,
+			UnderlyingErr: ErrMissmatchedSegments,
 		}, true)
 
 		return nil, &CorruptedFileError{
 			TotalExpected: mvf.fileMeta.FileSize,
-			UnderlyingErr: ErrNoNzbData,
+			UnderlyingErr: ErrMissmatchedSegments,
 		}
 	}
 
-	return usenet.NewUsenetReader(ctx, mvf.poolManager.GetPool, rg, mvf.maxPrefetch)
+	return usenet.NewUsenetReader(ctx, mvf.poolManager.GetPool, rg, mvf.maxPrefetch, mvf.streamTracker, mvf.streamID, mvf.segmentStore)
+}
+
+// createNestedReader creates a reader for files backed by nested RAR sources.
+// It maps the requested byte range [start, end] across multiple NestedSegmentSources,
+// building a lazy reader that opens each inner-volume reader only when needed.
+// This avoids opening all inner volumes simultaneously, which would cause all their
+// segments to be prefetched concurrently and spike memory usage.
+func (mvf *MetadataVirtualFile) createNestedReader(start, end int64) (io.ReadCloser, error) {
+	sources := mvf.fileMeta.NestedSources
+	if len(sources) == 0 {
+		return nil, fmt.Errorf("no nested sources available")
+	}
+
+	// Calculate which sources contain the requested byte range.
+	// Sources are concatenated: source 0 covers [0, InnerLength0),
+	// source 1 covers [InnerLength0, InnerLength0+InnerLength1), etc.
+	var specs []nestedSourceSpec
+	var sourceOffset int64
+
+	for _, src := range sources {
+		srcEnd := sourceOffset + src.InnerLength - 1
+
+		// Skip sources before our range
+		if srcEnd < start {
+			sourceOffset += src.InnerLength
+			continue
+		}
+
+		// Stop if we've passed our range
+		if sourceOffset > end {
+			break
+		}
+
+		// Calculate local offsets within this source
+		localStart := int64(0)
+		if start > sourceOffset {
+			localStart = start - sourceOffset
+		}
+		localEnd := src.InnerLength - 1
+		if end < srcEnd {
+			localEnd = end - sourceOffset
+		}
+
+		readLen := localEnd - localStart + 1
+		if readLen <= 0 {
+			sourceOffset += src.InnerLength
+			continue
+		}
+
+		specs = append(specs, nestedSourceSpec{src: src, localStart: localStart, readLen: readLen})
+		sourceOffset += src.InnerLength
+	}
+
+	if len(specs) == 0 {
+		return nil, fmt.Errorf("no nested sources cover range [%d, %d]", start, end)
+	}
+
+	return &lazyNestedMultiReader{mvf: mvf, specs: specs}, nil
+}
+
+// createNestedSourceReader creates a reader for a single NestedSegmentSource,
+// starting at innerStart within the decrypted inner volume and reading readLen bytes.
+func (mvf *MetadataVirtualFile) createNestedSourceReader(
+	src *metapb.NestedSegmentSource,
+	innerStart int64,
+	readLen int64,
+) (io.ReadCloser, error) {
+	absoluteStart := src.InnerOffset + innerStart
+
+	if len(src.AesKey) > 0 {
+		// Encrypted source: decrypt with AES-CBC then read at inner offset
+		if mvf.aesCipher == nil {
+			return nil, ErrNoCipherConfig
+		}
+
+		rh := &utils.RangeHeader{
+			Start: absoluteStart,
+			End:   absoluteStart + readLen - 1,
+		}
+
+		return mvf.aesCipher.Open(
+			mvf.ctx,
+			rh,
+			src.InnerVolumeSize,
+			src.AesKey,
+			src.AesIv,
+			func(ctx context.Context, s, e int64) (io.ReadCloser, error) {
+				return mvf.createUsenetReaderFromSegments(ctx, src.Segments, s, e)
+			},
+		)
+	}
+
+	// Unencrypted source: read directly from segments at inner offset
+	return mvf.createUsenetReaderFromSegments(mvf.ctx, src.Segments, absoluteStart, absoluteStart+readLen-1)
+}
+
+// createUsenetReaderFromSegments creates a usenet reader from a specific set of segments
+// (used for nested source reading where segments differ from the main file metadata).
+func (mvf *MetadataVirtualFile) createUsenetReaderFromSegments(ctx context.Context, segments []*metapb.SegmentData, start, end int64) (io.ReadCloser, error) {
+	if len(segments) == 0 {
+		return nil, ErrMissmatchedSegments
+	}
+
+	loader := newMetadataSegmentLoader(segments)
+	idx := buildSegmentIndex(segments)
+
+	startSegIdx := idx.findSegmentForOffset(start)
+	startFilePos := idx.getOffsetForSegment(startSegIdx)
+	endSegIdx := idx.findSegmentForOffset(end)
+	endFilePos := idx.getOffsetForSegment(endSegIdx)
+
+	rg := usenet.NewLazySegmentRange(ctx, start, end, loader, startSegIdx, startFilePos, endSegIdx, endFilePos)
+
+	if !rg.HasSegments() {
+		return nil, fmt.Errorf("no segments cover range [%d, %d]", start, end)
+	}
+
+	return usenet.NewUsenetReader(ctx, mvf.poolManager.GetPool, rg, mvf.maxPrefetch, mvf.streamTracker, mvf.streamID, mvf.segmentStore)
+}
+
+// nestedSourceSpec holds the parameters needed to lazily open one inner-volume reader.
+type nestedSourceSpec struct {
+	src        *metapb.NestedSegmentSource
+	localStart int64
+	readLen    int64
+}
+
+// lazyNestedMultiReader opens inner-volume readers one at a time, only when needed.
+// This prevents all inner volumes from being opened simultaneously, which would cause
+// all their segments to be prefetched concurrently and spike memory usage.
+type lazyNestedMultiReader struct {
+	mvf     *MetadataVirtualFile
+	specs   []nestedSourceSpec
+	idx     int
+	current io.ReadCloser
+}
+
+func (r *lazyNestedMultiReader) Read(p []byte) (int, error) {
+	for {
+		if r.current == nil {
+			if r.idx >= len(r.specs) {
+				return 0, io.EOF
+			}
+			spec := r.specs[r.idx]
+			rc, err := r.mvf.createNestedSourceReader(spec.src, spec.localStart, spec.readLen)
+			if err != nil {
+				return 0, err
+			}
+			r.current = rc
+			r.idx++
+		}
+
+		n, err := r.current.Read(p)
+		if err == io.EOF {
+			r.current.Close()
+			r.current = nil
+			if n > 0 {
+				return n, nil
+			}
+			continue
+		}
+		return n, err
+	}
+}
+
+func (r *lazyNestedMultiReader) Close() error {
+	if r.current != nil {
+		err := r.current.Close()
+		r.current = nil
+		return err
+	}
+	return nil
 }
 
 // wrapWithEncryption wraps a usenet reader with encryption using metadata
@@ -1308,6 +1607,17 @@ func (mvf *MetadataVirtualFile) updateFileHealthOnError(dataCorruptionErr *usene
 	errorDetails := fmt.Sprintf(`{"missing_articles": %d, "total_articles": %d, "error_type": "ArticleNotFound"}`,
 		1, len(mvf.fileMeta.SegmentData))
 
+	// Increment streaming failure count and handle masking
+	cfg := mvf.configGetter()
+	if cfg.Streaming.FailureMasking.Enabled == nil || *cfg.Streaming.FailureMasking.Enabled {
+		isMasked, err := mvf.healthRepository.IncrementStreamingFailureCount(ctx, mvf.name, cfg.Streaming.FailureMasking.Threshold)
+		if err != nil {
+			slog.WarnContext(ctx, "Failed to increment streaming failure count", "file", mvf.name, "error", err)
+		} else if isMasked {
+			slog.InfoContext(ctx, "File masked due to repeated streaming failures", "file", mvf.name, "threshold", cfg.Streaming.FailureMasking.Threshold)
+		}
+	}
+
 	if err := mvf.healthRepository.UpdateFileHealth(
 		ctx,
 		mvf.name,
@@ -1318,6 +1628,29 @@ func (mvf *MetadataVirtualFile) updateFileHealthOnError(dataCorruptionErr *usene
 		noRetry,
 	); err != nil {
 		slog.WarnContext(ctx, "Failed to update file health", "file", mvf.name, "error", err)
+	}
+}
+
+// readFullContext reads exactly len(buf) bytes from r, but returns early
+// if ctx is cancelled. This prevents io.ReadFull from blocking indefinitely
+// when the underlying reader is stuck (e.g., waiting for network data).
+func readFullContext(ctx context.Context, r io.Reader, buf []byte) (int, error) {
+	type result struct {
+		n   int
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		n, err := io.ReadFull(r, buf)
+		ch <- result{n, err}
+	}()
+	select {
+	case res := <-ch:
+		return res.n, res.err
+	case <-ctx.Done():
+		// Context cancelled — the goroutine will finish eventually when
+		// the reader is closed by the caller's defer reader.Close().
+		return 0, ctx.Err()
 	}
 }
 

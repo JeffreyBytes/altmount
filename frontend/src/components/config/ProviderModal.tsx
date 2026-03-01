@@ -1,4 +1,4 @@
-import { AlertTriangle, Check, Loader, Wifi } from "lucide-react";
+import { AlertTriangle, Check, Loader, Save, Wifi } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useToast } from "../../contexts/ToastContext";
 import { useProviders } from "../../hooks/useProviders";
@@ -17,7 +17,7 @@ const defaultFormData: ProviderFormData = {
 	username: "",
 	password: "",
 	max_connections: 10,
-	inflight_requests: 3,
+	inflight_requests: 10,
 	tls: false,
 	insecure_tls: false,
 	proxy_url: "",
@@ -47,7 +47,7 @@ export function ProviderModal({ mode, provider, onSuccess, onCancel }: ProviderM
 				username: provider.username,
 				password: "", // Always start with empty password for security
 				max_connections: provider.max_connections,
-				inflight_requests: provider.inflight_requests || 3,
+				inflight_requests: provider.inflight_requests || 10,
 				tls: provider.tls,
 				insecure_tls: provider.insecure_tls,
 				proxy_url: provider.proxy_url || "",
@@ -90,6 +90,7 @@ export function ProviderModal({ mode, provider, onSuccess, onCancel }: ProviderM
 
 		try {
 			const result = await testProvider.mutateAsync({
+				provider_id: provider?.id,
 				host: formData.host,
 				port: formData.port,
 				username: formData.username,
@@ -118,11 +119,11 @@ export function ProviderModal({ mode, provider, onSuccess, onCancel }: ProviderM
 	};
 
 	const handleSave = async () => {
-		if (!canSave) {
+		if (mode === "create" && !canSave) {
 			showToast({
 				type: "warning",
 				title: "Connection Test Required",
-				message: "Please test the connection successfully before saving",
+				message: "Please test the connection successfully before saving a new provider",
 			});
 			return;
 		}
@@ -171,24 +172,24 @@ export function ProviderModal({ mode, provider, onSuccess, onCancel }: ProviderM
 		}
 	};
 
-	const isFormValid = formData.host && formData.username && formData.password;
+	const isFormValid = formData.host && formData.username && (mode === "edit" || formData.password);
 	const isSaving = createProvider.isPending || updateProvider.isPending;
 
 	return (
-		<div className="modal modal-open">
-			<div className="modal-box max-w-2xl">
-				<h3 className="mb-4 font-bold text-lg">
+		<div className="modal modal-open backdrop-blur-sm">
+			<div className="modal-box max-w-2xl rounded-2xl border border-base-300 shadow-2xl">
+				<h3 className="mb-6 font-black text-xl uppercase tracking-tighter">
 					{mode === "create" ? "Add New Provider" : "Edit Provider"}
 				</h3>
 
-				<form className="space-y-4" onSubmit={(e) => e.preventDefault()}>
+				<form className="space-y-6" onSubmit={(e) => e.preventDefault()}>
 					{/* Host */}
-					<fieldset className="rounded-lg border border-base-300 p-4">
-						<legend className="px-2 font-medium">Host *</legend>
+					<fieldset className="fieldset">
+						<legend className="fieldset-legend font-bold">NNTP Host *</legend>
 						<input
 							id="host"
 							type="text"
-							className="input input-bordered w-full"
+							className="input input-bordered w-full font-mono text-sm"
 							value={formData.host}
 							onChange={(e) => handleInputChange("host", e.target.value)}
 							placeholder="news.example.com"
@@ -197,13 +198,13 @@ export function ProviderModal({ mode, provider, onSuccess, onCancel }: ProviderM
 					</fieldset>
 
 					{/* Connection Details */}
-					<div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-						<fieldset className="rounded-lg border border-base-300 p-4">
-							<legend className="px-2 font-medium">Port</legend>
+					<div className="grid grid-cols-1 gap-6 md:grid-cols-2">
+						<fieldset className="fieldset">
+							<legend className="fieldset-legend font-bold">Port</legend>
 							<input
 								id="port"
 								type="number"
-								className="input input-bordered w-full"
+								className="input input-bordered w-full font-mono text-sm"
 								value={formData.port}
 								onChange={(e) =>
 									handleInputChange("port", Number.parseInt(e.target.value, 10) || 119)
@@ -213,174 +214,195 @@ export function ProviderModal({ mode, provider, onSuccess, onCancel }: ProviderM
 							/>
 						</fieldset>
 
-						<fieldset className="rounded-lg border border-base-300 p-4">
-							<legend className="px-2 font-medium">Max Connections</legend>
+						<fieldset className="fieldset">
+							<legend className="fieldset-legend font-bold">Max Connections</legend>
 							<input
 								id="max_connections"
 								type="number"
-								className="input input-bordered w-full"
+								className="input input-bordered w-full font-mono text-sm"
 								value={formData.max_connections}
 								onChange={(e) =>
 									handleInputChange("max_connections", Number.parseInt(e.target.value, 10) || 1)
 								}
 								min={1}
-								max={50}
+								max={100}
 							/>
 						</fieldset>
 
-						<fieldset className="rounded-lg border border-base-300 p-4">
-							<legend className="px-2 font-medium">Inflight Requests</legend>
+						<fieldset className="fieldset">
+							<legend className="fieldset-legend font-bold">Pipeline (Inflight)</legend>
 							<input
 								id="inflight_requests"
 								type="number"
-								className="input input-bordered w-full"
+								className="input input-bordered w-full font-mono text-sm"
 								value={formData.inflight_requests}
 								onChange={(e) =>
 									handleInputChange("inflight_requests", Number.parseInt(e.target.value, 10) || 1)
 								}
 								min={1}
-								max={50}
+								max={100}
 							/>
-							<p className="mt-2 text-base-content/60 text-xs">
-								Concurrent requests per connection (pipelining). Higher values may cause slowness if
-								the provider does not support it well.
+							<p className="label mt-1 text-base-content/70 text-xs">
+								Requests per connection. Default is 10.
 							</p>
 						</fieldset>
 					</div>
 
 					{/* Authentication */}
-					<div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-						<fieldset className="rounded-lg border border-base-300 p-4">
-							<legend className="px-2 font-medium">Username *</legend>
+					<div className="grid grid-cols-1 gap-6 md:grid-cols-2">
+						<fieldset className="fieldset">
+							<legend className="fieldset-legend font-bold">Username *</legend>
 							<input
 								id="username"
 								type="text"
-								className="input input-bordered w-full"
+								className="input input-bordered w-full font-mono text-sm"
 								value={formData.username}
 								onChange={(e) => handleInputChange("username", e.target.value)}
 								required
 							/>
 						</fieldset>
 
-						<fieldset className="rounded-lg border border-base-300 p-4">
-							<legend className="px-2 font-medium">Password *</legend>
+						<fieldset className="fieldset">
+							<legend className="fieldset-legend font-bold">
+								Password {mode === "create" ? "*" : ""}
+							</legend>
 							<input
 								id="password"
 								type="password"
-								className="input input-bordered w-full"
+								className="input input-bordered w-full font-mono text-sm"
 								value={formData.password}
 								onChange={(e) => handleInputChange("password", e.target.value)}
-								placeholder={mode === "edit" ? "Leave empty to keep current" : ""}
+								placeholder={mode === "edit" ? "••••••••••••••••" : ""}
 								required={mode === "create"}
 							/>
+							{mode === "edit" && (
+								<p className="label text-base-content/70 text-xs">Leave empty to keep current.</p>
+							)}
 						</fieldset>
 					</div>
 
 					{/* Security Settings */}
-					<fieldset className="space-y-3 rounded-lg border border-base-300 p-4">
-						<legend className="px-2 font-medium">Security & Options</legend>
+					<div className="space-y-4 rounded-2xl border-2 border-base-300/80 bg-base-200/60 p-5">
+						<h4 className="font-bold text-base-content/60 text-xs uppercase tracking-widest">
+							Options & Security
+						</h4>
 
-						<label htmlFor="tls" className="label cursor-pointer justify-start space-x-2">
-							<input
-								id="tls"
-								type="checkbox"
-								className="checkbox"
-								checked={formData.tls}
-								onChange={(e) => handleInputChange("tls", e.target.checked)}
-							/>
-							<span className="label-text">Use TLS/SSL encryption</span>
-						</label>
+						<div className="flex flex-col gap-4">
+							<label htmlFor="tls" className="label cursor-pointer items-start justify-start gap-3">
+								<input
+									id="tls"
+									type="checkbox"
+									className="checkbox checkbox-primary checkbox-sm mt-0.5"
+									checked={formData.tls}
+									onChange={(e) => handleInputChange("tls", e.target.checked)}
+								/>
+								<div className="min-w-0 flex-1">
+									<span className="label-text font-bold text-xs">Use SSL/TLS</span>
+									<span className="block text-base-content/70 text-xs">
+										Highly recommended for privacy.
+									</span>
+								</div>
+							</label>
 
-						{formData.tls && (
+							{formData.tls && (
+								<label
+									htmlFor="insecure_tls"
+									className="label ml-7 cursor-pointer items-start justify-start gap-3"
+								>
+									<input
+										id="insecure_tls"
+										type="checkbox"
+										className="checkbox checkbox-warning checkbox-sm mt-0.5"
+										checked={formData.insecure_tls}
+										onChange={(e) => handleInputChange("insecure_tls", e.target.checked)}
+									/>
+									<div className="min-w-0 flex-1">
+										<span className="label-text font-bold text-xs">
+											Insecure (Skip Verification)
+										</span>
+										<span className="block text-base-content/70 text-xs">
+											Only use for self-signed certs.
+										</span>
+									</div>
+								</label>
+							)}
+
 							<label
-								htmlFor="insecure_tls"
-								className="label ml-6 cursor-pointer justify-start space-x-2"
+								htmlFor="is_backup_provider"
+								className="label cursor-pointer items-start justify-start gap-3"
 							>
 								<input
-									id="insecure_tls"
+									id="is_backup_provider"
 									type="checkbox"
-									className="checkbox"
-									checked={formData.insecure_tls}
-									onChange={(e) => handleInputChange("insecure_tls", e.target.checked)}
+									className="checkbox checkbox-primary checkbox-sm mt-0.5"
+									checked={formData.is_backup_provider}
+									onChange={(e) => handleInputChange("is_backup_provider", e.target.checked)}
 								/>
-								<span className="label-text">Skip TLS certificate verification (insecure)</span>
-							</label>
-						)}
-
-						<label
-							htmlFor="is_backup_provider"
-							className="label cursor-pointer justify-start space-x-2"
-						>
-							<input
-								id="is_backup_provider"
-								type="checkbox"
-								className="checkbox"
-								checked={formData.is_backup_provider}
-								onChange={(e) => handleInputChange("is_backup_provider", e.target.checked)}
-							/>
-							<div>
-								<span className="label-text">Use only as backup provider</span>
-								<div className="text-base-content/60 text-xs">
-									Backup providers are only used when articles cannot be found on primary providers
+								<div className="min-w-0 flex-1">
+									<span className="label-text font-bold text-xs">Backup Only</span>
+									<span className="block text-base-content/70 text-xs">
+										Only use when primary providers fail.
+									</span>
 								</div>
-							</div>
-						</label>
-					</fieldset>
+							</label>
+						</div>
+					</div>
 
 					{/* Proxy Settings */}
-					<fieldset className="rounded-lg border border-base-300 p-4">
-						<legend className="px-2 font-medium">Proxy (Optional)</legend>
+					<fieldset className="fieldset">
+						<legend className="fieldset-legend font-bold">SOCKS5 Proxy (Optional)</legend>
 						<input
 							id="proxy_url"
 							type="text"
-							className="input input-bordered w-full"
+							className="input input-bordered w-full font-mono text-sm"
 							value={formData.proxy_url}
 							onChange={(e) => handleInputChange("proxy_url", e.target.value)}
-							placeholder="socks5://proxy.example.com:1080"
+							placeholder="socks5://user:pass@host:port"
 						/>
-						<p className="mt-2 text-base-content/60 text-xs">
-							Optional SOCKS5 proxy URL. Format: socks5://[user:pass@]host:port
-						</p>
 					</fieldset>
 
 					{/* Connection Test */}
-					<div className="space-y-4">
+					<div className="space-y-4 border-base-300/50 border-t pt-4">
 						<div className="flex items-center justify-between">
-							<h4 className="font-semibold text-base">Connection Test</h4>
+							<h4 className="font-bold text-base-content/60 text-xs uppercase tracking-widest">
+								Connectivity Check
+							</h4>
 							<button
 								type="button"
-								className="btn btn-sm btn-outline"
+								className="btn btn-sm btn-outline px-4"
 								onClick={handleTestConnection}
 								disabled={!isFormValid || isTestingConnection}
 							>
 								{isTestingConnection ? (
-									<Loader className="h-4 w-4 animate-spin" />
+									<Loader className="h-3 w-3 animate-spin" />
 								) : (
-									<Wifi className="h-4 w-4" />
+									<Wifi className="h-3 w-3" />
 								)}
-								Test Connection
+								Test Link
 							</button>
 						</div>
 
 						{connectionTestResult && (
 							<div
-								className={`alert ${
-									connectionTestResult.success ? "alert-success" : "alert-error"
+								className={`alert rounded-xl py-2 text-xs ${
+									connectionTestResult.success
+										? "alert-success border-success/20 bg-success/10 text-success"
+										: "alert-error border-error/20 bg-error/10 text-error"
 								}`}
 							>
 								{connectionTestResult.success ? (
-									<Check className="h-5 w-5" />
+									<Check className="h-4 w-4" />
 								) : (
-									<AlertTriangle className="h-5 w-5" />
+									<AlertTriangle className="h-4 w-4" />
 								)}
 								<div>
-									<div className="font-medium">
+									<div className="font-black text-xs uppercase tracking-widest">
 										{connectionTestResult.success
-											? `Connection successful!${connectionTestResult.rttMs ? ` (${connectionTestResult.rttMs}ms)` : ""}`
-											: "Connection failed"}
+											? `Success${connectionTestResult.rttMs !== undefined ? ` • ${connectionTestResult.rttMs}ms` : ""}`
+											: "Failed"}
 									</div>
 									{connectionTestResult.message && (
-										<div className="text-sm">{connectionTestResult.message}</div>
+										<div className="mt-0.5 font-medium">{connectionTestResult.message}</div>
 									)}
 								</div>
 							</div>
@@ -388,18 +410,18 @@ export function ProviderModal({ mode, provider, onSuccess, onCancel }: ProviderM
 					</div>
 				</form>
 
-				<div className="modal-action">
+				<div className="modal-action gap-3">
 					<button type="button" className="btn btn-ghost" onClick={onCancel}>
 						Cancel
 					</button>
 					<button
 						type="button"
-						className="btn btn-primary"
+						className="btn btn-primary px-8 shadow-lg shadow-primary/20"
 						onClick={handleSave}
-						disabled={!canSave || isSaving}
+						disabled={isSaving || (mode === "create" && !canSave)}
 					>
-						{isSaving ? <Loader className="h-4 w-4 animate-spin" /> : <Check className="h-4 w-4" />}
-						{mode === "create" ? "Create Provider" : "Update Provider"}
+						{isSaving ? <Loader className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+						{mode === "create" ? "Create Provider" : "Save Changes"}
 					</button>
 				</div>
 			</div>
