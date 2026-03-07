@@ -1,7 +1,7 @@
 # AltMount
 
 <p align="center">
-  <img src="./docs/static/img/logo.png" alt="AltMount Logo" width="150" height="150" />
+  <img src="./docs/static/img/logo.jpg" alt="AltMount Logo" width="150" height="150" />
 </p>
 
 A WebDAV server backed by NZB/Usenet that provides seamless access to Usenet content through standard WebDAV protocols.
@@ -29,11 +29,15 @@ services:
       - PUID=1000
       - PGID=1000
       - PORT=8080
+      - JWT_SECRET=change-me-to-a-strong-random-secret # Required when login is enabled (auth.login_required: true)
       - COOKIE_DOMAIN=localhost # Must match the domain/IP where web interface is accessed
     volumes:
       - ./config:/config
       - /mnt:/mnt:rshared
       - /metadata:/metadata # This is optional you can still use /mnt
+      - /var/run/docker.sock:/var/run/docker.sock # Required for the auto-update feature
+    group_add:
+      - "999" # GID of the docker group on the host (run `getent group docker | cut -d: -f3` to find yours)
     ports:
       - "8080:8080"
     restart: unless-stopped

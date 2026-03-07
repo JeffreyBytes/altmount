@@ -124,15 +124,21 @@ type ImportService interface {
 	// Close releases all resources
 	Close() error
 	// SetRcloneClient sets the rclone client for VFS notifications
-	SetRcloneClient(client interface{})
+	SetRcloneClient(client any)
 	// SetArrsService sets the ARRs service for notifications
-	SetArrsService(service interface{})
+	SetArrsService(service any)
 	// RegisterConfigChangeHandler registers a handler for configuration changes
-	RegisterConfigChangeHandler(configManager interface{})
+	RegisterConfigChangeHandler(configManager any)
 }
 
 // FileSizeCalculator calculates file sizes for different file types
 type FileSizeCalculator interface {
 	// CalculateFileSizeOnly calculates the size of a file without full processing
 	CalculateFileSizeOnly(filePath string) (int64, error)
+}
+
+// HistoryRecorder records successful import events in persistent storage
+type HistoryRecorder interface {
+	// AddImportHistory records a successful file import
+	AddImportHistory(ctx context.Context, history *database.ImportHistory) error
 }

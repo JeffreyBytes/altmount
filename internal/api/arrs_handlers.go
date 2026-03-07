@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -32,16 +33,16 @@ type ArrsWebhookRequest struct {
 	// For upgrades/renames, the file path might be in other fields or need to be inferred
 	Movie struct {
 		FolderPath string `json:"folderPath"`
-	} `json:"movie,omitempty"`
+	} `json:"movie"`
 	MovieFile struct {
 		Path string `json:"path"`
-	} `json:"movieFile,omitempty"`
+	} `json:"movieFile"`
 	Series struct {
 		Path string `json:"path"`
-	} `json:"series,omitempty"`
+	} `json:"series"`
 	EpisodeFile struct {
 		Path string `json:"path"`
-	} `json:"episodeFile,omitempty"`
+	} `json:"episodeFile"`
 	DeletedFiles ArrsDeletedFiles `json:"deletedFiles,omitempty"`
 }
 
@@ -65,6 +66,18 @@ func (df *ArrsDeletedFiles) UnmarshalJSON(data []byte) error {
 }
 
 // handleArrsWebhook handles webhooks from Radarr/Sonarr
+//
+//	@Summary		ARR webhook receiver
+//	@Description	Receives file-import webhook events from Sonarr/Radarr and triggers health checks. Authenticated via API key query parameter.
+//	@Tags			ARRs
+//	@Accept			json
+//	@Produce		json
+//	@Param			apikey	query		string				true	"AltMount API key"
+//	@Param			body	body		ArrsWebhookRequest	true	"Webhook payload"
+//	@Success		200		{object}	APIResponse
+//	@Failure		401		{object}	APIResponse
+//	@Security		ApiKeyAuth
+//	@Router			/arrs/webhook [post]
 func (s *Server) handleArrsWebhook(c *fiber.Ctx) error {
 	// Check for API key authentication
 	// Try query param first, then header
@@ -90,10 +103,7 @@ func (s *Server) handleArrsWebhook(c *fiber.Ctx) error {
 
 	if s.arrsService == nil {
 		slog.ErrorContext(c.Context(), "Arrs service is not available for webhook")
-		return c.Status(503).JSON(fiber.Map{
-			"success": false,
-			"message": "Arrs not available",
-		})
+		return RespondServiceUnavailable(c, "Arrs not available", "")
 	}
 
 	var req ArrsWebhookRequest
@@ -182,12 +192,28 @@ func (s *Server) handleArrsWebhook(c *fiber.Ctx) error {
 	// Helper for path normalization
 	normalize := func(path string) string {
 		normalizedPath := path
-		if mountPath != "" && strings.HasPrefix(normalizedPath, mountPath) {
-			normalizedPath = strings.TrimPrefix(normalizedPath, mountPath)
-		} else if importDir != "" && strings.HasPrefix(normalizedPath, importDir) {
-			normalizedPath = strings.TrimPrefix(normalizedPath, importDir)
-		} else if libraryDir != "" && strings.HasPrefix(normalizedPath, libraryDir) {
-			normalizedPath = strings.TrimPrefix(normalizedPath, libraryDir)
+
+		// Find the longest matching prefix to avoid over-truncation
+		prefixes := []string{}
+		if mountPath != "" {
+			prefixes = append(prefixes, mountPath)
+		}
+		if importDir != "" {
+			prefixes = append(prefixes, importDir)
+		}
+		if libraryDir != "" {
+			prefixes = append(prefixes, libraryDir)
+		}
+
+		longestPrefix := ""
+		for _, p := range prefixes {
+			if strings.HasPrefix(normalizedPath, p) && len(p) > len(longestPrefix) {
+				longestPrefix = p
+			}
+		}
+
+		if longestPrefix != "" {
+			normalizedPath = strings.TrimPrefix(normalizedPath, longestPrefix)
 		}
 		normalizedPath = strings.TrimPrefix(normalizedPath, "/")
 
@@ -306,6 +332,18 @@ func (s *Server) handleArrsWebhook(c *fiber.Ctx) error {
 			var releaseDate *time.Time
 			var sourceNzb *string
 
+			// Handle Rename and Download specifically: try to find and re-link old record
+			if req.EventType == "Rename" || req.EventType == "Download" {
+				fileName := filepath.Base(normalizedPath)
+				// Try to find a record with the same filename but currently under /complete/
+				// or with a NULL library_path
+				if err := s.healthRepo.RelinkFileByFilename(c.Context(), fileName, normalizedPath, path); err == nil {
+					slog.InfoContext(c.Context(), "Successfully re-linked health record during webhook",
+						"event", req.EventType, "filename", fileName, "new_library_path", path)
+					continue // Successfully re-linked, no need to add new
+				}
+			}
+
 			// Try to read metadata to get release date
 			if s.metadataService != nil {
 				meta, err := s.metadataService.ReadFileMetadata(normalizedPath)
@@ -317,6 +355,14 @@ func (s *Server) handleArrsWebhook(c *fiber.Ctx) error {
 					if meta.SourceNzbPath != "" {
 						sourceNzb = &meta.SourceNzbPath
 					}
+				} else {
+					// SAFETY: If metadata does not exist for this path, it means the file was renamed
+					// and we don't have a record for the new name yet. We should NOT add a health
+					// record for a path without metadata, as it will just be marked corrupted.
+					// The Library Sync will eventually discover the new mapping.
+					slog.DebugContext(c.Context(), "Skipping webhook health addition: no metadata found for path",
+						"path", normalizedPath)
+					continue
 				}
 			}
 
@@ -399,13 +445,19 @@ type TestConnectionRequest struct {
 }
 
 // handleListArrsInstances returns all arrs instances
+//
+//	@Summary		List ARR instances
+//	@Description	Returns all configured Sonarr/Radarr instances.
+//	@Tags			ARRs
+//	@Produce		json
+//	@Success		200	{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/arrs/instances [get]
 func (s *Server) handleListArrsInstances(c *fiber.Ctx) error {
 	if s.arrsService == nil {
 		slog.ErrorContext(c.Context(), "Arrs service is not available")
-		return c.Status(503).JSON(fiber.Map{
-			"success": false,
-			"message": "Arrs not available",
-		})
+		return RespondServiceUnavailable(c, "Arrs not available", "")
 	}
 
 	slog.DebugContext(c.Context(), "Listing arrs instances")
@@ -430,13 +482,22 @@ func (s *Server) handleListArrsInstances(c *fiber.Ctx) error {
 }
 
 // handleGetArrsInstance returns a single arrs instance by type and name
+//
+//	@Summary		Get ARR instance
+//	@Description	Returns a specific Sonarr/Radarr instance by type and name.
+//	@Tags			ARRs
+//	@Produce		json
+//	@Param			type	path		string	true	"Instance type (sonarr or radarr)"
+//	@Param			name	path		string	true	"Instance name"
+//	@Success		200		{object}	APIResponse
+//	@Failure		404		{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/arrs/instances/{type}/{name} [get]
 func (s *Server) handleGetArrsInstance(c *fiber.Ctx) error {
 	if s.arrsService == nil {
 		slog.ErrorContext(c.Context(), "Arrs service is not available")
-		return c.Status(503).JSON(fiber.Map{
-			"success": false,
-			"message": "Arrs not available",
-		})
+		return RespondServiceUnavailable(c, "Arrs not available", "")
 	}
 
 	instanceType := c.Params("type")
@@ -474,12 +535,21 @@ func (s *Server) handleGetArrsInstance(c *fiber.Ctx) error {
 }
 
 // handleTestArrsConnection tests connection to an arrs instance
+//
+//	@Summary		Test ARR connection
+//	@Description	Tests connectivity to a Sonarr/Radarr instance with given credentials.
+//	@Tags			ARRs
+//	@Accept			json
+//	@Produce		json
+//	@Param			body	body		ArrsInstanceRequest	true	"Instance connection details"
+//	@Success		200		{object}	APIResponse
+//	@Failure		400		{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/arrs/instances/test [post]
 func (s *Server) handleTestArrsConnection(c *fiber.Ctx) error {
 	if s.arrsService == nil {
-		return c.Status(503).JSON(fiber.Map{
-			"success": false,
-			"message": "Arrs not available",
-		})
+		return RespondServiceUnavailable(c, "Arrs not available", "")
 	}
 
 	var req TestConnectionRequest
@@ -512,12 +582,18 @@ func (s *Server) handleTestArrsConnection(c *fiber.Ctx) error {
 }
 
 // handleGetArrsStats returns arrs statistics
+//
+//	@Summary		Get ARR statistics
+//	@Description	Returns sync statistics for all configured ARR instances.
+//	@Tags			ARRs
+//	@Produce		json
+//	@Success		200	{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/arrs/stats [get]
 func (s *Server) handleGetArrsStats(c *fiber.Ctx) error {
 	if s.arrsService == nil {
-		return c.Status(503).JSON(fiber.Map{
-			"success": false,
-			"message": "Arrs not available",
-		})
+		return RespondServiceUnavailable(c, "Arrs not available", "")
 	}
 
 	// Get all instances from configuration
@@ -557,12 +633,18 @@ func (s *Server) handleGetArrsStats(c *fiber.Ctx) error {
 }
 
 // handleGetArrsHealth returns health checks from all ARR instances
+//
+//	@Summary		Get ARR health
+//	@Description	Returns health check results from all configured Sonarr/Radarr instances.
+//	@Tags			ARRs
+//	@Produce		json
+//	@Success		200	{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/arrs/health [get]
 func (s *Server) handleGetArrsHealth(c *fiber.Ctx) error {
 	if s.arrsService == nil {
-		return c.Status(503).JSON(fiber.Map{
-			"success": false,
-			"message": "Arrs not available",
-		})
+		return RespondServiceUnavailable(c, "Arrs not available", "")
 	}
 
 	health, err := s.arrsService.GetHealth(c.Context())
@@ -581,12 +663,19 @@ func (s *Server) handleGetArrsHealth(c *fiber.Ctx) error {
 }
 
 // handleRegisterArrsWebhooks triggers automatic registration of webhooks in ARR instances
+//
+//	@Summary		Register ARR webhooks
+//	@Description	Automatically registers AltMount as a webhook connection in all configured Sonarr/Radarr instances.
+//	@Tags			ARRs
+//	@Produce		json
+//	@Success		200	{object}	APIResponse
+//	@Failure		500	{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/arrs/webhook/register [post]
 func (s *Server) handleRegisterArrsWebhooks(c *fiber.Ctx) error {
 	if s.arrsService == nil {
-		return c.Status(503).JSON(fiber.Map{
-			"success": false,
-			"message": "Arrs not available",
-		})
+		return RespondServiceUnavailable(c, "Arrs not available", "")
 	}
 
 	apiKey := s.getAPIKeyForConfig(c)
@@ -621,12 +710,19 @@ func (s *Server) handleRegisterArrsWebhooks(c *fiber.Ctx) error {
 }
 
 // handleRegisterArrsDownloadClients triggers automatic registration of AltMount as a download client in ARR instances
+//
+//	@Summary		Register ARR download clients
+//	@Description	Automatically registers AltMount as a download client (SABnzbd-compatible) in all configured ARR instances.
+//	@Tags			ARRs
+//	@Produce		json
+//	@Success		200	{object}	APIResponse
+//	@Failure		500	{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/arrs/download-client/register [post]
 func (s *Server) handleRegisterArrsDownloadClients(c *fiber.Ctx) error {
 	if s.arrsService == nil {
-		return c.Status(503).JSON(fiber.Map{
-			"success": false,
-			"message": "Arrs not available",
-		})
+		return RespondServiceUnavailable(c, "Arrs not available", "")
 	}
 
 	apiKey := s.getAPIKeyForConfig(c)
@@ -686,12 +782,18 @@ func (s *Server) handleRegisterArrsDownloadClients(c *fiber.Ctx) error {
 }
 
 // handleTestArrsDownloadClients tests the connection from ARR instances to AltMount
+//
+//	@Summary		Test ARR download clients
+//	@Description	Tests whether AltMount is reachable as a download client from all configured ARR instances.
+//	@Tags			ARRs
+//	@Produce		json
+//	@Success		200	{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/arrs/download-client/test [post]
 func (s *Server) handleTestArrsDownloadClients(c *fiber.Ctx) error {
 	if s.arrsService == nil {
-		return c.Status(503).JSON(fiber.Map{
-			"success": false,
-			"message": "Arrs not available",
-		})
+		return RespondServiceUnavailable(c, "Arrs not available", "")
 	}
 
 	apiKey := s.getAPIKeyForConfig(c)

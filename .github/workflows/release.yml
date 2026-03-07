@@ -96,17 +96,17 @@ jobs:
           # macOS builds
           - goos: darwin
             goarch: amd64
-            runner: macos-13
+            runner: macos-latest
             cc: ''
           - goos: darwin
             goarch: arm64
-            runner: macos-13
+            runner: macos-latest
             cc: ''
           # Windows builds
-          # - goos: windows
-          #   goarch: amd64
-          #   runner: ubuntu-latest
-          #   cc: zig cc -target x86_64-windows-gnu
+          - goos: windows
+            goarch: amd64
+            runner: ubuntu-latest
+            cc: zig cc -target x86_64-windows-gnu
     steps:
       # dependencies
       - uses: mlugg/setup-zig@v2
@@ -114,7 +114,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: 1.25.1
+          go-version: 1.26.0
 
       # checkout
       - name: Checkout
@@ -128,6 +128,11 @@ jobs:
         with:
           name: frontend-build
           path: frontend/dist/
+
+      # Install macFUSE headers (required by cgofuse CGO dependency)
+      - name: Install macFUSE
+        if: matrix.goos == 'darwin'
+        run: brew install --cask macfuse
 
       # Extract version info
       - name: Extract version info
@@ -158,7 +163,7 @@ jobs:
           go build \
             -trimpath \
             -tags=cli \
-            -ldflags="-s -w -X 'main.Version=${{ steps.version.outputs.version }}' -X 'main.GitCommit=${{ steps.version.outputs.commit }}' -X 'main.Timestamp=${{ steps.version.outputs.timestamp }}'" \
+            -ldflags="-s -w -X 'github.com/javi11/altmount/internal/version.Version=${{ steps.version.outputs.version }}' -X 'github.com/javi11/altmount/internal/version.GitCommit=${{ steps.version.outputs.commit }}' -X 'github.com/javi11/altmount/internal/version.Timestamp=${{ steps.version.outputs.timestamp }}'" \
             -o "altmount-cli-${{ matrix.goos }}-${{ matrix.goarch }}${EXT}" \
             ./cmd/altmount/main.go
 
@@ -192,7 +197,7 @@ jobs:
           retention-days: 1
 
   create-universal-darwin:
-    runs-on: macos-13
+    runs-on: macos-latest
     needs: build-cli
     permissions:
       contents: write

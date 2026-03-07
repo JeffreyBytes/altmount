@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -13,9 +14,27 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/javi11/altmount/internal/config"
 	"github.com/javi11/altmount/internal/database"
+	"github.com/javi11/altmount/internal/pathutil"
 )
 
 // handleListHealth handles GET /api/health
+//
+//	@Summary		List health records
+//	@Description	Returns a paginated list of file health records with optional status/search filters.
+//	@Tags			Health
+//	@Produce		json
+//	@Param			status		query		string	false	"Filter by status"	Enums(pending,checking,corrupted,repair_triggered,healthy)
+//	@Param			search		query		string	false	"Search by file path"
+//	@Param			sort_by		query		string	false	"Sort field"		Enums(file_path,created_at,status,priority,last_checked,scheduled_check_at)
+//	@Param			sort_order	query		string	false	"Sort direction"	Enums(asc,desc)
+//	@Param			since		query		string	false	"ISO8601 timestamp filter"
+//	@Param			limit		query		int		false	"Page size (default 50)"
+//	@Param			offset		query		int		false	"Page offset"
+//	@Success		200			{object}	APIResponse{data=[]HealthItemResponse,meta=APIMeta}
+//	@Failure		400			{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/health [get]
 func (s *Server) handleListHealth(c *fiber.Ctx) error {
 	// Parse pagination
 	pagination := ParsePaginationFiber(c)
@@ -106,6 +125,18 @@ func (s *Server) countHealthItems(ctx context.Context, statusFilter *database.He
 }
 
 // handleGetHealth handles GET /api/health/{id}
+//
+//	@Summary		Get health record
+//	@Description	Returns a single health record by ID.
+//	@Tags			Health
+//	@Produce		json
+//	@Param			id	path		int	true	"Health record ID"
+//	@Success		200	{object}	APIResponse{data=HealthItemResponse}
+//	@Failure		400	{object}	APIResponse
+//	@Failure		404	{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/health/{id} [get]
 func (s *Server) handleGetHealth(c *fiber.Ctx) error {
 	// Extract ID from path parameter
 	idStr := c.Params("id")
@@ -134,6 +165,19 @@ func (s *Server) handleGetHealth(c *fiber.Ctx) error {
 }
 
 // handleDeleteHealth handles DELETE /api/health/{id}
+//
+//	@Summary		Delete health record
+//	@Description	Deletes a health record and optionally the associated physical file.
+//	@Tags			Health
+//	@Produce		json
+//	@Param			id				path	int		true	"Health record ID"
+//	@Param			delete_file		query	bool	false	"Also delete the physical file"
+//	@Success		204
+//	@Failure		400				{object}	APIResponse
+//	@Failure		404				{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/health/{id} [delete]
 func (s *Server) handleDeleteHealth(c *fiber.Ctx) error {
 	// Extract ID from path parameter
 	idStr := c.Params("id")
@@ -187,6 +231,18 @@ func (s *Server) handleDeleteHealth(c *fiber.Ctx) error {
 }
 
 // handleDeleteHealthBulk handles POST /api/health/bulk/delete
+//
+//	@Summary		Bulk delete health records
+//	@Description	Deletes multiple health records by ID.
+//	@Tags			Health
+//	@Accept			json
+//	@Produce		json
+//	@Param			body	body		object{ids=[]int}	true	"List of health record IDs"
+//	@Success		200		{object}	APIResponse
+//	@Failure		400		{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/health/bulk/delete [post]
 func (s *Server) handleDeleteHealthBulk(c *fiber.Ctx) error {
 	// Parse request body
 	var req struct {
@@ -240,6 +296,20 @@ func (s *Server) handleDeleteHealthBulk(c *fiber.Ctx) error {
 }
 
 // handleRepairHealth handles POST /api/health/{id}/repair
+//
+//	@Summary		Trigger health repair
+//	@Description	Triggers a repair attempt for a corrupted file.
+//	@Tags			Health
+//	@Accept			json
+//	@Produce		json
+//	@Param			id		path		int					true	"Health record ID"
+//	@Param			body	body		HealthRepairRequest	false	"Repair options"
+//	@Success		200		{object}	APIResponse{data=HealthItemResponse}
+//	@Failure		400		{object}	APIResponse
+//	@Failure		404		{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/health/{id}/repair [post]
 func (s *Server) handleRepairHealth(c *fiber.Ctx) error {
 	// Extract ID from path parameter
 	idStr := c.Params("id")
@@ -287,14 +357,14 @@ func (s *Server) handleRepairHealth(c *fiber.Ctx) error {
 	// Determine final path for ARR rescan
 	pathForRescan := libraryPath
 	if pathForRescan == "" && cfg.Import.ImportStrategy == config.ImportStrategySYMLINK && cfg.Import.ImportDir != nil && *cfg.Import.ImportDir != "" {
-		pathForRescan = filepath.Join(*cfg.Import.ImportDir, strings.TrimPrefix(item.FilePath, "/"))
+		pathForRescan = pathutil.JoinAbsPath(*cfg.Import.ImportDir, item.FilePath)
 		slog.InfoContext(ctx, "Using symlink import path for manual repair",
 			"file_path", item.FilePath,
 			"symlink_path", pathForRescan)
 	}
 	if pathForRescan == "" {
 		// Fallback to mount path if no library path found
-		pathForRescan = filepath.Join(cfg.MountPath, strings.TrimPrefix(item.FilePath, "/"))
+		pathForRescan = pathutil.JoinAbsPath(cfg.MountPath, item.FilePath)
 		slog.InfoContext(ctx, "Using mount path fallback for manual repair",
 			"file_path", item.FilePath,
 			"mount_path", pathForRescan)
@@ -333,6 +403,18 @@ func (s *Server) handleRepairHealth(c *fiber.Ctx) error {
 }
 
 // handleRepairHealthBulk handles POST /api/health/bulk/repair
+//
+//	@Summary		Bulk trigger health repair
+//	@Description	Triggers repair attempts for multiple corrupted files.
+//	@Tags			Health
+//	@Accept			json
+//	@Produce		json
+//	@Param			body	body		object{ids=[]int}	true	"List of health record IDs"
+//	@Success		200		{object}	APIResponse
+//	@Failure		400		{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/health/bulk/repair [post]
 func (s *Server) handleRepairHealthBulk(c *fiber.Ctx) error {
 	// Parse request body
 	var req struct {
@@ -381,7 +463,7 @@ func (s *Server) handleRepairHealthBulk(c *fiber.Ctx) error {
 
 		pathForRescan := libraryPath
 		if pathForRescan == "" {
-			pathForRescan = filepath.Join(cfg.MountPath, strings.TrimPrefix(item.FilePath, "/"))
+			pathForRescan = pathutil.JoinAbsPath(cfg.MountPath, item.FilePath)
 		}
 
 		// Trigger rescan
@@ -420,6 +502,18 @@ func (s *Server) handleRepairHealthBulk(c *fiber.Ctx) error {
 }
 
 // handleListCorrupted handles GET /api/health/corrupted
+//
+//	@Summary		List corrupted files
+//	@Description	Returns a paginated list of health records with corrupted status.
+//	@Tags			Health
+//	@Produce		json
+//	@Param			limit	query		int	false	"Page size (default 50)"
+//	@Param			offset	query		int	false	"Page offset"
+//	@Success		200		{object}	APIResponse{data=[]HealthItemResponse,meta=APIMeta}
+//	@Failure		500		{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/health/corrupted [get]
 func (s *Server) handleListCorrupted(c *fiber.Ctx) error {
 	// Parse pagination
 	pagination := ParsePaginationFiber(c)
@@ -442,10 +536,7 @@ func (s *Server) handleListCorrupted(c *fiber.Ctx) error {
 	if pagination.Offset >= len(corruptedItems) {
 		corruptedItems = []*database.FileHealth{}
 	} else {
-		end := pagination.Offset + pagination.Limit
-		if end > len(corruptedItems) {
-			end = len(corruptedItems)
-		}
+		end := min(pagination.Offset+pagination.Limit, len(corruptedItems))
 		corruptedItems = corruptedItems[pagination.Offset:end]
 	}
 
@@ -466,6 +557,16 @@ func (s *Server) handleListCorrupted(c *fiber.Ctx) error {
 }
 
 // handleGetHealthStats handles GET /api/health/stats
+//
+//	@Summary		Get health statistics
+//	@Description	Returns counts of health records grouped by status.
+//	@Tags			Health
+//	@Produce		json
+//	@Success		200	{object}	APIResponse{data=HealthStatsResponse}
+//	@Failure		500	{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/health/stats [get]
 func (s *Server) handleGetHealthStats(c *fiber.Ctx) error {
 	stats, err := s.healthRepo.GetHealthStats(c.Context())
 	if err != nil {
@@ -477,6 +578,18 @@ func (s *Server) handleGetHealthStats(c *fiber.Ctx) error {
 }
 
 // handleCleanupHealth handles DELETE /api/health/cleanup
+//
+//	@Summary		Cleanup health records
+//	@Description	Removes old health records based on age, status, or both. Optionally deletes physical files.
+//	@Tags			Health
+//	@Accept			json
+//	@Produce		json
+//	@Param			body	body		HealthCleanupRequest	false	"Cleanup filter criteria"
+//	@Success		200		{object}	APIResponse
+//	@Failure		400		{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/health/cleanup [delete]
 func (s *Server) handleCleanupHealth(c *fiber.Ctx) error {
 	// Parse request body
 	var req HealthCleanupRequest
@@ -595,11 +708,7 @@ func (s *Server) cleanupHealthRecords(ctx context.Context, olderThan time.Time, 
 				pathToDelete = *item.LibraryPath
 			} else {
 				// Fallback to mount path
-				if filepath.IsAbs(item.FilePath) {
-					pathToDelete = item.FilePath
-				} else {
-					pathToDelete = filepath.Join(mountPath, item.FilePath)
-				}
+				pathToDelete = pathutil.JoinAbsPath(mountPath, item.FilePath)
 			}
 
 			// Attempt to delete the physical file using os.Remove
@@ -608,6 +717,24 @@ func (s *Server) cleanupHealthRecords(ctx context.Context, olderThan time.Time, 
 				fileErrors = append(fileErrors, fmt.Sprintf("%s: %v", item.FilePath, deleteErr))
 			} else {
 				deletedFileCount++
+
+				// Clean up empty parent directories
+				var rootPath string
+				if item.LibraryPath != nil && *item.LibraryPath != "" {
+					// Use library directory as root if available
+					if cfg.Health.LibraryDir != nil && *cfg.Health.LibraryDir != "" {
+						rootPath = *cfg.Health.LibraryDir
+					} else {
+						// Fallback to the directory containing the file if root not known
+						rootPath = filepath.Dir(filepath.Dir(pathToDelete))
+					}
+				} else {
+					rootPath = mountPath
+				}
+
+				if rootPath != "" {
+					pathutil.RemoveEmptyDirs(rootPath, filepath.Dir(pathToDelete))
+				}
 			}
 		}
 
@@ -640,6 +767,18 @@ func (s *Server) cleanupHealthRecords(ctx context.Context, olderThan time.Time, 
 }
 
 // handleAddHealthCheck handles POST /api/health/check
+//
+//	@Summary		Add file for health check
+//	@Description	Adds a file to the health monitoring queue for checking.
+//	@Tags			Health
+//	@Accept			json
+//	@Produce		json
+//	@Param			body	body		HealthCheckRequest	true	"File to check"
+//	@Success		201		{object}	APIResponse{data=HealthItemResponse}
+//	@Failure		400		{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/health/check [post]
 func (s *Server) handleAddHealthCheck(c *fiber.Ctx) error {
 	// Parse request body
 	var req HealthCheckRequest
@@ -678,6 +817,15 @@ func (s *Server) handleAddHealthCheck(c *fiber.Ctx) error {
 }
 
 // handleGetHealthWorkerStatus handles GET /api/health/worker/status
+//
+//	@Summary		Get health worker status
+//	@Description	Returns the current status and statistics of the background health check worker.
+//	@Tags			Health
+//	@Produce		json
+//	@Success		200	{object}	APIResponse{data=HealthWorkerStatusResponse}
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/health/worker/status [get]
 func (s *Server) handleGetHealthWorkerStatus(c *fiber.Ctx) error {
 	if s.healthWorker == nil {
 		return RespondNotFound(c, "Health worker", "Health worker is not configured or not running")
@@ -702,6 +850,18 @@ func (s *Server) handleGetHealthWorkerStatus(c *fiber.Ctx) error {
 }
 
 // handleDirectHealthCheck handles POST /api/health/{id}/check-now
+//
+//	@Summary		Trigger immediate health check
+//	@Description	Triggers an immediate health check for a file, bypassing the queue.
+//	@Tags			Health
+//	@Produce		json
+//	@Param			id	path		int	true	"Health record ID"
+//	@Success		200	{object}	APIResponse{data=HealthItemResponse}
+//	@Failure		400	{object}	APIResponse
+//	@Failure		404	{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/health/{id}/check-now [post]
 func (s *Server) handleDirectHealthCheck(c *fiber.Ctx) error {
 	// Extract ID from path parameter
 	idStr := c.Params("id")
@@ -796,6 +956,18 @@ type SegmentsInfo struct {
 }
 
 // handleRestartHealthChecksBulk handles POST /api/health/bulk/restart
+//
+//	@Summary		Bulk restart health checks
+//	@Description	Resets multiple health records to pending status for re-checking.
+//	@Tags			Health
+//	@Accept			json
+//	@Produce		json
+//	@Param			body	body		object{ids=[]int}	true	"List of health record IDs"
+//	@Success		200		{object}	APIResponse
+//	@Failure		400		{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/health/bulk/restart [post]
 func (s *Server) handleRestartHealthChecksBulk(c *fiber.Ctx) error {
 	// Parse request body
 	var req struct {
@@ -836,7 +1008,7 @@ func (s *Server) handleRestartHealthChecksBulk(c *fiber.Ctx) error {
 		return RespondNotFound(c, "Health records", "No health records found to restart")
 	}
 
-	response := map[string]interface{}{
+	response := map[string]any{
 		"message":         "Health checks restarted successfully",
 		"restarted_count": restartedCount,
 		"file_paths":      req.FilePaths,
@@ -847,6 +1019,18 @@ func (s *Server) handleRestartHealthChecksBulk(c *fiber.Ctx) error {
 }
 
 // handleCancelHealthCheck handles POST /api/health/{id}/cancel
+//
+//	@Summary		Cancel health check
+//	@Description	Cancels an in-progress health check for a file.
+//	@Tags			Health
+//	@Produce		json
+//	@Param			id	path		int	true	"Health record ID"
+//	@Success		200	{object}	APIResponse
+//	@Failure		400	{object}	APIResponse
+//	@Failure		404	{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/health/{id}/cancel [post]
 func (s *Server) handleCancelHealthCheck(c *fiber.Ctx) error {
 	// Extract ID from path parameter
 	idStr := c.Params("id")
@@ -892,7 +1076,7 @@ func (s *Server) handleCancelHealthCheck(c *fiber.Ctx) error {
 		return RespondInternalError(c, "Failed to retrieve updated health record", err.Error())
 	}
 
-	response := map[string]interface{}{
+	response := map[string]any{
 		"message":      "Health check cancelled",
 		"id":           id,
 		"file_path":    item.FilePath,
@@ -905,7 +1089,80 @@ func (s *Server) handleCancelHealthCheck(c *fiber.Ctx) error {
 	return RespondSuccess(c, response)
 }
 
+// handleUnmaskHealth handles POST /api/health/{id}/unmask
+//
+//	@Summary		Unmask health record
+//	@Description	Clears the streaming-failure mask on a health record so it can be checked again.
+//	@Tags			Health
+//	@Produce		json
+//	@Param			id	path		int	true	"Health record ID"
+//	@Success		200	{object}	APIResponse{data=HealthItemResponse}
+//	@Failure		400	{object}	APIResponse
+//	@Failure		404	{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/health/{id}/unmask [post]
+func (s *Server) handleUnmaskHealth(c *fiber.Ctx) error {
+	// Extract ID from path parameter
+	idStr := c.Params("id")
+	if idStr == "" {
+		return RespondBadRequest(c, "Health record identifier is required", "")
+	}
+
+	// Parse as numeric ID
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		return RespondBadRequest(c, "Invalid health record ID", "ID must be a valid integer")
+	}
+
+	// Check if item exists in health database
+	item, err := s.healthRepo.GetFileHealthByID(c.Context(), id)
+	if err != nil {
+		return RespondInternalError(c, "Failed to check health record", err.Error())
+	}
+
+	if item == nil {
+		return RespondNotFound(c, "Health record", "")
+	}
+
+	// Unmask file
+	err = s.healthRepo.UnmaskFile(c.Context(), item.FilePath)
+	if err != nil {
+		return RespondInternalError(c, "Failed to unmask file", err.Error())
+	}
+
+	// Get the updated health record
+	updatedItem, err := s.healthRepo.GetFileHealthByID(c.Context(), id)
+	if err != nil {
+		return RespondInternalError(c, "Failed to retrieve updated health record", err.Error())
+	}
+
+	response := map[string]any{
+		"message":     "File unmasked successfully",
+		"id":          id,
+		"file_path":   item.FilePath,
+		"updated_at":  time.Now().Format(time.RFC3339),
+		"health_data": ToHealthItemResponse(updatedItem),
+	}
+
+	return RespondSuccess(c, response)
+}
+
 // handleSetHealthPriority handles POST /api/health/{id}/priority
+//
+//	@Summary		Set health check priority
+//	@Description	Sets the checking priority for a health record.
+//	@Tags			Health
+//	@Accept			json
+//	@Produce		json
+//	@Param			id		path		int							true	"Health record ID"
+//	@Param			body	body		object{priority=string}		true	"Priority: normal or high"
+//	@Success		200		{object}	APIResponse{data=HealthItemResponse}
+//	@Failure		400		{object}	APIResponse
+//	@Failure		404		{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/health/{id}/priority [post]
 func (s *Server) handleSetHealthPriority(c *fiber.Ctx) error {
 	// Extract ID from path parameter
 	idStr := c.Params("id")
@@ -950,7 +1207,7 @@ func (s *Server) handleSetHealthPriority(c *fiber.Ctx) error {
 		return RespondInternalError(c, "Failed to retrieve updated health record", err.Error())
 	}
 
-	response := map[string]interface{}{
+	response := map[string]any{
 		"message":     "Health priority updated",
 		"id":          id,
 		"file_path":   item.FilePath,
@@ -963,6 +1220,16 @@ func (s *Server) handleSetHealthPriority(c *fiber.Ctx) error {
 }
 
 // handleResetAllHealthChecks handles POST /api/health/reset-all
+//
+//	@Summary		Reset all health checks
+//	@Description	Resets all health records to pending status for a full re-check cycle.
+//	@Tags			Health
+//	@Produce		json
+//	@Success		200	{object}	APIResponse
+//	@Failure		500	{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/health/reset-all [post]
 func (s *Server) handleResetAllHealthChecks(c *fiber.Ctx) error {
 	// Reset all items to pending status using repository method
 	restartedCount, err := s.healthRepo.ResetAllHealthChecks(c.Context())
@@ -970,7 +1237,7 @@ func (s *Server) handleResetAllHealthChecks(c *fiber.Ctx) error {
 		return RespondInternalError(c, "Failed to reset all health checks", err.Error())
 	}
 
-	response := map[string]interface{}{
+	response := map[string]any{
 		"message":         "All health checks reset successfully",
 		"restarted_count": restartedCount,
 		"restarted_at":    time.Now().Format(time.RFC3339),
@@ -980,9 +1247,23 @@ func (s *Server) handleResetAllHealthChecks(c *fiber.Ctx) error {
 }
 
 // handleRegenerateSymlinks handles POST /api/health/regenerate-symlinks
+//
+//	@Summary		Regenerate library symlinks
+//	@Description	Regenerates all library symlinks and STRM files for files that already have metadata.
+//	@Tags			Health
+//	@Produce		json
+//	@Success		200	{object}	APIResponse
+//	@Failure		500	{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/health/regenerate-symlinks [post]
 func (s *Server) handleRegenerateSymlinks(c *fiber.Ctx) error {
 	ctx := c.Context()
 	cfg := s.configManager.GetConfig()
+
+	if runtime.GOOS == "windows" {
+		return RespondBadRequest(c, "Symlink regeneration is not supported on Windows; use STRM import strategy instead", "")
+	}
 
 	// Validate that symlink strategy is enabled
 	if cfg.Import.ImportStrategy != config.ImportStrategySYMLINK {
@@ -1015,10 +1296,10 @@ func (s *Server) handleRegenerateSymlinks(c *fiber.Ctx) error {
 
 	for _, file := range files {
 		// Build the actual file path in the mount
-		actualPath := filepath.Join(cfg.MountPath, strings.TrimPrefix(file.FilePath, "/"))
+		actualPath := pathutil.JoinAbsPath(cfg.MountPath, file.FilePath)
 
 		// Build the symlink path in the import directory
-		symlinkPath := filepath.Join(*cfg.Import.ImportDir, strings.TrimPrefix(file.FilePath, "/"))
+		symlinkPath := pathutil.JoinAbsPath(*cfg.Import.ImportDir, file.FilePath)
 
 		// Create directory if needed
 		baseDir := filepath.Dir(symlinkPath)

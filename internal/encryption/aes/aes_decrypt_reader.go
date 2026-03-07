@@ -24,17 +24,20 @@ type aesDecryptReader struct {
 	offset        int64  // Current read position
 	size          int64  // Total size of decrypted data (for output limiting)
 	encryptedSize int64  // Total size of encrypted data (for source reading)
+	requestEnd    int64  // Caller's desired end offset in decrypted space (-1 = unbounded)
 	closed        bool
 }
 
 // newAesDecryptReader creates a new AES-CBC decrypt reader
 // decryptedSize is the actual file size (for output limiting)
 // encryptedSize is the padded size in segments (for source reading)
+// requestEnd is the caller's desired end offset in decrypted space (-1 = unbounded)
 func newAesDecryptReader(
 	ctx context.Context,
 	getReader func(ctx context.Context, start, end int64) (io.ReadCloser, error),
 	key, iv []byte,
 	decryptedSize, encryptedSize int64,
+	requestEnd int64,
 ) (*aesDecryptReader, error) {
 	if len(key) != 16 && len(key) != 24 && len(key) != 32 {
 		return nil, fmt.Errorf("invalid AES key size: %d (must be 16, 24, or 32 bytes)", len(key))
@@ -64,6 +67,7 @@ func newAesDecryptReader(
 		buffer:        make([]byte, aes.BlockSize*64), // Buffer multiple blocks for efficiency
 		size:          decryptedSize,
 		encryptedSize: encryptedSize,
+		requestEnd:    requestEnd,
 	}, nil
 }
 
@@ -74,16 +78,29 @@ func (r *aesDecryptReader) Read(p []byte) (int, error) {
 	}
 
 	// Lazy initialization of source reader
-	// Use encryptedSize to request full encrypted data (including padding)
 	if r.source == nil {
+		sourceEnd := r.encryptedSize - 1
+		if r.requestEnd >= 0 {
+			encEnd := EncryptedSize(r.requestEnd+1) - 1
+			if encEnd < sourceEnd {
+				sourceEnd = encEnd
+			}
+		}
 		var err error
-		r.source, err = r.getReader(r.ctx, 0, r.encryptedSize-1)
+		r.source, err = r.getReader(r.ctx, 0, sourceEnd)
 		if err != nil {
 			return 0, fmt.Errorf("failed to initialize source reader: %w", err)
 		}
 	}
 
 	totalRead := 0
+
+	// Respect requestEnd for output limiting: if the caller requested a sub-range,
+	// stop at requestEnd+1 rather than at the full decrypted file size.
+	effectiveSize := r.size
+	if r.requestEnd >= 0 && r.requestEnd+1 < r.size {
+		effectiveSize = r.requestEnd + 1
+	}
 
 	for totalRead < len(p) {
 		// First, drain any buffered data
@@ -98,8 +115,8 @@ func (r *aesDecryptReader) Read(p []byte) (int, error) {
 		// Need to read more data
 		// Read in multiples of AES block size
 		readSize := len(r.buffer)
-		if r.offset+int64(readSize) > r.size {
-			readSize = int(r.size - r.offset)
+		if r.offset+int64(readSize) > effectiveSize {
+			readSize = int(effectiveSize - r.offset)
 			// Round up to block size
 			if readSize%aes.BlockSize != 0 {
 				readSize += aes.BlockSize - (readSize % aes.BlockSize)
@@ -138,8 +155,8 @@ func (r *aesDecryptReader) Read(p []byte) (int, error) {
 
 			// Calculate how much decrypted data is actually part of the file
 			decryptedLen := n
-			if r.offset+int64(n) > r.size {
-				decryptedLen = int(r.size - r.offset)
+			if r.offset+int64(n) > effectiveSize {
+				decryptedLen = int(effectiveSize - r.offset)
 			}
 
 			// Copy to buffer
@@ -204,38 +221,43 @@ func (r *aesDecryptReader) Seek(offset int64, whence int) (int64, error) {
 	blockNum := abs / int64(aes.BlockSize)
 	blockOffset := abs % int64(aes.BlockSize)
 
-	// Recreate IV by reading the previous ciphertext block
-	var newIV []byte
-	if blockNum == 0 {
-		// First block uses original IV
-		newIV = make([]byte, len(r.origIV))
-		copy(newIV, r.origIV)
-	} else {
-		// Need to read the previous block's ciphertext to use as IV
-		prevBlockOffset := (blockNum - 1) * int64(aes.BlockSize)
-		prevBlockEnd := prevBlockOffset + int64(aes.BlockSize) - 1
-
-		// Get a reader for the previous block
-		prevBlockReader, err := r.getReader(r.ctx, prevBlockOffset, prevBlockEnd)
-		if err != nil {
-			return 0, fmt.Errorf("failed to get reader for IV block: %w", err)
-		}
-		defer prevBlockReader.Close()
-
-		// Read previous block as new IV
-		newIV = make([]byte, aes.BlockSize)
-		_, err = io.ReadFull(prevBlockReader, newIV)
-		if err != nil {
-			return 0, fmt.Errorf("failed to read IV block: %w", err)
+	// Calculate bounded source end
+	sourceEnd := r.encryptedSize - 1
+	if r.requestEnd >= 0 {
+		encEnd := EncryptedSize(r.requestEnd+1) - 1
+		if encEnd < sourceEnd {
+			sourceEnd = encEnd
 		}
 	}
 
-	// Get a new reader starting at the target block
-	// Use encryptedSize to request full encrypted data (including padding)
-	sourceOffset := blockNum * int64(aes.BlockSize)
-	newSource, err := r.getReader(r.ctx, sourceOffset, r.encryptedSize-1)
+	// For blockNum > 0, start one block earlier to read the previous ciphertext
+	// block as IV, avoiding a separate reader (and duplicate segment download).
+	var newIV []byte
+	var sourceOffset int64
+
+	if blockNum == 0 {
+		newIV = make([]byte, len(r.origIV))
+		copy(newIV, r.origIV)
+		sourceOffset = 0
+	} else {
+		// Start from previous block to include IV
+		sourceOffset = (blockNum - 1) * int64(aes.BlockSize)
+	}
+
+	newSource, err := r.getReader(r.ctx, sourceOffset, sourceEnd)
 	if err != nil {
 		return 0, fmt.Errorf("failed to get reader for seek position: %w", err)
+	}
+
+	if blockNum > 0 {
+		// Read previous block as IV from the combined source reader
+		newIV = make([]byte, aes.BlockSize)
+		_, err = io.ReadFull(newSource, newIV)
+		if err != nil {
+			newSource.Close()
+			return 0, fmt.Errorf("failed to read IV block: %w", err)
+		}
+		// newSource is now positioned at blockStart, ready for decryption
 	}
 
 	// Recreate decrypter with new IV

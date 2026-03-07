@@ -2,6 +2,7 @@ import { Shield } from "lucide-react";
 import { LoadingTable } from "../../../../components/ui/LoadingSpinner";
 import type { FileHealth, HealthPriority } from "../../../../types/api";
 import type { SortBy, SortOrder } from "../../types";
+import { HealthItemCard } from "./HealthItemCard";
 import { HealthTableHeader } from "./HealthTableHeader";
 import { HealthTableRow } from "./HealthTableRow";
 
@@ -17,6 +18,7 @@ interface HealthTableProps {
 	isDirectCheckPending: boolean;
 	isRepairPending: boolean;
 	isDeletePending: boolean;
+	isUnmaskPending: boolean;
 	onSelectItem: (filePath: string, checked: boolean) => void;
 	onSelectAll: (checked: boolean) => void;
 	onSort: (column: SortBy) => void;
@@ -24,6 +26,7 @@ interface HealthTableProps {
 	onManualCheck: (id: number) => void;
 	onRepair: (id: number) => void;
 	onDelete: (id: number) => void;
+	onUnmask: (id: number) => void;
 	onSetPriority: (id: number, priority: HealthPriority) => void;
 }
 
@@ -39,6 +42,7 @@ export function HealthTable({
 	isDirectCheckPending,
 	isRepairPending,
 	isDeletePending,
+	isUnmaskPending,
 	onSelectItem,
 	onSelectAll,
 	onSort,
@@ -46,6 +50,7 @@ export function HealthTable({
 	onManualCheck,
 	onRepair,
 	onDelete,
+	onUnmask,
 	onSetPriority,
 }: HealthTableProps) {
 	// Helper functions for select all checkbox state
@@ -59,37 +64,66 @@ export function HealthTable({
 				{isLoading ? (
 					<LoadingTable columns={9} />
 				) : data && data.length > 0 ? (
-					<div>
-						<table className="table-zebra table">
-							<HealthTableHeader
-								isAllSelected={Boolean(isAllSelected)}
-								isIndeterminate={Boolean(isIndeterminate)}
-								sortBy={sortBy}
-								sortOrder={sortOrder}
-								onSelectAll={onSelectAll}
-								onSort={onSort}
-							/>
-							<tbody>
-								{data.map((item: FileHealth) => (
-									<HealthTableRow
-										key={item.id}
-										item={item}
-										isSelected={selectedItems.has(item.file_path)}
-										isCancelPending={isCancelPending}
-										isDirectCheckPending={isDirectCheckPending}
-										isRepairPending={isRepairPending}
-										isDeletePending={isDeletePending}
-										onSelectChange={onSelectItem}
-										onCancelCheck={onCancelCheck}
-										onManualCheck={onManualCheck}
-										onRepair={onRepair}
-										onDelete={onDelete}
-										onSetPriority={onSetPriority}
-									/>
-								))}
-							</tbody>
-						</table>
-					</div>
+					<>
+						{/* Mobile View (< 640px) */}
+						<div className="space-y-3 p-4 sm:hidden">
+							{data.map((item: FileHealth) => (
+								<HealthItemCard
+									key={item.id}
+									item={item}
+									isSelected={selectedItems.has(item.file_path)}
+									onSelectChange={onSelectItem}
+									onSetPriority={onSetPriority}
+									onCancelCheck={onCancelCheck}
+									onManualCheck={onManualCheck}
+									onRepair={onRepair}
+									onDelete={onDelete}
+									onUnmask={onUnmask}
+									isCancelPending={isCancelPending}
+									isDirectCheckPending={isDirectCheckPending}
+									isRepairPending={isRepairPending}
+									isDeletePending={isDeletePending}
+									isUnmaskPending={isUnmaskPending}
+								/>
+							))}
+						</div>
+
+						{/* Desktop View (≥640px) - Keep Existing */}
+						<div className="hidden min-h-[450px] overflow-x-auto pb-24 sm:block">
+							{" "}
+							<table className="table-zebra table">
+								<HealthTableHeader
+									isAllSelected={Boolean(isAllSelected)}
+									isIndeterminate={Boolean(isIndeterminate)}
+									sortBy={sortBy}
+									sortOrder={sortOrder}
+									onSelectAll={onSelectAll}
+									onSort={onSort}
+								/>
+								<tbody>
+									{data.map((item: FileHealth) => (
+										<HealthTableRow
+											key={item.id}
+											item={item}
+											isSelected={selectedItems.has(item.file_path)}
+											isCancelPending={isCancelPending}
+											isDirectCheckPending={isDirectCheckPending}
+											isRepairPending={isRepairPending}
+											isDeletePending={isDeletePending}
+											isUnmaskPending={isUnmaskPending}
+											onSelectChange={onSelectItem}
+											onCancelCheck={onCancelCheck}
+											onManualCheck={onManualCheck}
+											onRepair={onRepair}
+											onDelete={onDelete}
+											onUnmask={onUnmask}
+											onSetPriority={onSetPriority}
+										/>
+									))}
+								</tbody>
+							</table>
+						</div>
+					</>
 				) : (
 					<div className="flex flex-col items-center justify-center py-12">
 						<Shield className="mb-4 h-12 w-12 text-base-content/30" />

@@ -77,7 +77,17 @@ docker-build-ci: build-frontend
 
 .PHONY: build-frontend
 build-frontend:
-	cd frontend && bun install --frozen-lockfile && bun run build
+	@VERSION=$$(git describe --tags --always --dirty 2>/dev/null || echo "dev"); \
+	COMMIT=$$(git rev-parse --short HEAD 2>/dev/null || echo "unknown"); \
+	cd frontend && bun install --frozen-lockfile && APP_VERSION=$$VERSION GIT_COMMIT=$$COMMIT bun run build
+
+.PHONY: build-docs
+build-docs:
+	cd docs && bun install && bun run build
+
+.PHONY: serve-docs
+serve-docs:
+	cd docs && bun run start
 
 .PHONY: build-cli
 build-cli: build-frontend
@@ -88,9 +98,28 @@ build-cli: build-frontend
 	CGO_ENABLED=1 $(GO) build \
 		-trimpath \
 		-tags=cli \
-		-ldflags="-s -w -X 'main.Version=$$VERSION' -X 'main.GitCommit=$$COMMIT' -X 'main.Timestamp=$$TIMESTAMP'" \
+		-ldflags="-s -w -X 'github.com/javi11/altmount/internal/version.Version=$$VERSION' -X 'github.com/javi11/altmount/internal/version.GitCommit=$$COMMIT' -X 'github.com/javi11/altmount/internal/version.Timestamp=$$TIMESTAMP'" \
 		-o altmount \
 		./cmd/altmount/main.go
+
+.PHONY: build-cli-windows
+build-cli-windows: build-frontend
+	@VERSION=$$(git describe --tags --always --dirty 2>/dev/null || echo "dev"); \
+	COMMIT=$$(git rev-parse --short HEAD 2>/dev/null || echo "unknown"); \
+	TIMESTAMP=$$(date -u '+%Y-%m-%dT%H:%M:%SZ'); \
+	echo "Building altmount CLI for Windows (version: $$VERSION, commit: $$COMMIT)..."; \
+	CGO_ENABLED=1 GOOS=windows GOARCH=amd64 CC=x86_64-w64-mingw32-gcc \
+		$(GO) build \
+		-trimpath \
+		-tags=cli \
+		-ldflags="-s -w -X 'github.com/javi11/altmount/internal/version.Version=$$VERSION' -X 'github.com/javi11/altmount/internal/version.GitCommit=$$COMMIT' -X 'github.com/javi11/altmount/internal/version.Timestamp=$$TIMESTAMP'" \
+		-o altmount.exe \
+		./cmd/altmount/main.go
+# Prerequisites for Windows build:
+#   Cross-compilation (Linux/macOS): MinGW-w64 (apt install gcc-mingw-w64-x86-64 / brew install mingw-w64)
+#   Native Windows build: replace CC with your toolchain (MSVC or clang-cl); remove CC=... above
+#   WinFsp must be installed on the target machine: https://winfsp.dev/
+#   WinFsp headers for cgofuse (if building natively): C:\Program Files (x86)\WinFsp\inc\fuse
 
 .PHONY: build
 build: build-cli

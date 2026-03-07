@@ -63,6 +63,14 @@ func (c *Config) GetVerifyData() bool {
 	return *c.Health.VerifyData
 }
 
+// GetCheckAllSegments returns whether to check all segments during health checks.
+func (c *Config) GetCheckAllSegments() bool {
+	if c.Health.CheckAllSegments == nil {
+		return false // Default: false
+	}
+	return *c.Health.CheckAllSegments
+}
+
 // Import config accessor methods.
 
 // GetMaxImportConnections returns max import connections with a default fallback.
@@ -108,4 +116,52 @@ func (c *Config) GetMetadataBackupKeep() int {
 		return 10 // Default: 10 backups
 	}
 	return c.Metadata.Backup.KeepBackups
+}
+
+// GetFuseMountPath returns the FUSE mount path, falling back to the root mount_path if not set.
+func (c *Config) GetFuseMountPath() string {
+	if c.Fuse.MountPath != "" {
+		return c.Fuse.MountPath
+	}
+	return c.MountPath
+}
+
+// GetHealthEnabled returns whether health checking is enabled (defaults to true)
+func (c *Config) GetHealthEnabled() bool {
+	if c.Health.Enabled == nil {
+		return true
+	}
+	return *c.Health.Enabled
+}
+
+// GetRepairEnabled returns whether automatic repair is enabled (defaults to true)
+func (c *Config) GetRepairEnabled() bool {
+	if c.Health.Repair.Enabled == nil {
+		return true
+	}
+	return *c.Health.Repair.Enabled
+}
+
+// GetRepairInterval returns the repair check interval
+func (c *Config) GetRepairInterval() time.Duration {
+	if c.Health.Repair.IntervalMinutes <= 0 {
+		return 60 * time.Minute // Default: 1 hour
+	}
+	return time.Duration(c.Health.Repair.IntervalMinutes) * time.Minute
+}
+
+// GetRepairMaxCoolDown returns the maximum cooldown for repairs
+func (c *Config) GetRepairMaxCoolDown() time.Duration {
+	if c.Health.Repair.MaxCoolDownHours <= 0 {
+		return 24 * time.Hour // Default: 24 hours
+	}
+	return time.Duration(c.Health.Repair.MaxCoolDownHours) * time.Hour
+}
+
+// GetRepairExponentialBackoff returns whether exponential backoff is enabled for repairs
+func (c *Config) GetRepairExponentialBackoff() bool {
+	if c.Health.Repair.ExponentialBackoff == nil {
+		return true
+	}
+	return *c.Health.Repair.ExponentialBackoff
 }

@@ -1,6 +1,7 @@
 import { themes as prismThemes } from "prism-react-renderer";
 import type { Config } from "@docusaurus/types";
 import type * as Preset from "@docusaurus/preset-classic";
+import webpack from "webpack";
 
 // This runs in Node.js - Don't use client-side code here (browser APIs, JSX...)
 
@@ -56,6 +57,29 @@ const config: Config = {
 
 	themes: ["@docusaurus/theme-mermaid"],
 
+	plugins: [
+		function webpackPolyfillPlugin() {
+			return {
+				name: "webpack-buffer-polyfill",
+				configureWebpack() {
+					return {
+						resolve: {
+							fallback: {
+								stream: false,
+								buffer: require.resolve("buffer/"),
+							},
+						},
+						plugins: [
+							new webpack.ProvidePlugin({
+								Buffer: ["buffer", "Buffer"],
+							}),
+						],
+					};
+				},
+			};
+		},
+	],
+
 	themeConfig: {
 		navbar: {
 			title: "AltMount",
@@ -69,6 +93,11 @@ const config: Config = {
 					sidebarId: "tutorialSidebar",
 					position: "left",
 					label: "Documentation",
+				},
+				{
+					to: "/api-explorer",
+					label: "API Explorer",
+					position: "left",
 				},
 				{
 					href: "https://github.com/javi11/altmount",
@@ -89,7 +118,7 @@ const config: Config = {
 						},
 						{
 							label: "Installation",
-							to: "/docs/Installation/cli",
+							to: "/docs/Installation/other-methods",
 						},
 					],
 				},
@@ -122,6 +151,16 @@ const config: Config = {
 			],
 			copyright: `Copyright © ${new Date().getFullYear()} AltMount. Built with Docusaurus.`,
 		},
+		metadata: [
+			{ name: 'description', content: 'AltMount is a high-performance WebDAV server backed by Usenet with streaming, ARR integration, rclone support, and native FUSE mounting.' },
+			{ property: 'og:type', content: 'website' },
+			{ property: 'og:site_name', content: 'AltMount Documentation' },
+			{ property: 'og:description', content: 'Mount Usenet as a local drive. Stream media directly, integrate with Sonarr/Radarr, and use rclone — all in a single binary.' },
+			{ name: 'twitter:card', content: 'summary' },
+			{ name: 'twitter:title', content: 'AltMount Documentation' },
+			{ name: 'twitter:description', content: 'Mount Usenet as a local drive. Stream media directly, integrate with Sonarr/Radarr, and use rclone — all in a single binary.' },
+			{ name: 'keywords', content: 'altmount, usenet, webdav, nzb, nntp, sabnzbd, sonarr, radarr, streaming, rclone, fuse, mount, docker' },
+		],
 		prism: {
 			theme: prismThemes.github,
 			darkTheme: prismThemes.dracula,

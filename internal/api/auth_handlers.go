@@ -44,6 +44,18 @@ type RegisterRequest struct {
 }
 
 // handleDirectLogin handles username/password authentication
+//
+//	@Summary		Login
+//	@Description	Authenticates with username and password and returns a JWT access token. Rate-limited to 10/min per IP.
+//	@Tags			Auth
+//	@Accept			json
+//	@Produce		json
+//	@Param			body	body		LoginRequest	true	"Login credentials"
+//	@Success		200		{object}	APIResponse{data=AuthResponse}
+//	@Failure		400		{object}	APIResponse
+//	@Failure		401		{object}	APIResponse
+//	@Failure		429		{object}	APIResponse
+//	@Router			/auth/login [post]
 func (s *Server) handleDirectLogin(c *fiber.Ctx) error {
 	var req LoginRequest
 	if err := c.BodyParser(&req); err != nil {
@@ -91,6 +103,17 @@ func (s *Server) handleDirectLogin(c *fiber.Ctx) error {
 }
 
 // handleRegister handles user registration (first user only)
+//
+//	@Summary		Register
+//	@Description	Creates the first admin user account. Only allowed when no users exist yet.
+//	@Tags			Auth
+//	@Accept			json
+//	@Produce		json
+//	@Param			body	body		RegisterRequest	true	"Registration details"
+//	@Success		201		{object}	APIResponse{data=AuthResponse}
+//	@Failure		400		{object}	APIResponse
+//	@Failure		409		{object}	APIResponse
+//	@Router			/auth/register [post]
 func (s *Server) handleRegister(c *fiber.Ctx) error {
 	var req RegisterRequest
 	if err := c.BodyParser(&req); err != nil {
@@ -107,8 +130,8 @@ func (s *Server) handleRegister(c *fiber.Ctx) error {
 	}
 
 	// Validate password (basic validation)
-	if len(req.Password) < 8 {
-		return RespondValidationError(c, "Password must be at least 8 characters", "")
+	if len(req.Password) < 12 {
+		return RespondValidationError(c, "Password must be at least 12 characters", "")
 	}
 
 	// Create user
@@ -131,6 +154,13 @@ func (s *Server) handleRegister(c *fiber.Ctx) error {
 }
 
 // handleCheckRegistration checks if registration is allowed
+//
+//	@Summary		Check registration status
+//	@Description	Returns whether registration is currently open (i.e. no users exist yet).
+//	@Tags			Auth
+//	@Produce		json
+//	@Success		200	{object}	APIResponse
+//	@Router			/auth/registration-status [get]
 func (s *Server) handleCheckRegistration(c *fiber.Ctx) error {
 	userCount, err := s.userRepo.GetUserCount(c.Context())
 	if err != nil {
@@ -145,6 +175,13 @@ func (s *Server) handleCheckRegistration(c *fiber.Ctx) error {
 }
 
 // handleGetAuthConfig returns authentication configuration (public endpoint)
+//
+//	@Summary		Get auth config
+//	@Description	Returns authentication configuration (login required flag, available providers). Public endpoint.
+//	@Tags			Auth
+//	@Produce		json
+//	@Success		200	{object}	APIResponse
+//	@Router			/auth/config [get]
 func (s *Server) handleGetAuthConfig(c *fiber.Ctx) error {
 	cfg := s.configManager.GetConfig()
 	loginRequired := true // Default to true if not set
@@ -159,9 +196,27 @@ func (s *Server) handleGetAuthConfig(c *fiber.Ctx) error {
 }
 
 // handleAuthUser returns current authenticated user information
+//
+//	@Summary		Get current user
+//	@Description	Returns information about the currently authenticated user.
+//	@Tags			User
+//	@Produce		json
+//	@Success		200	{object}	APIResponse{data=UserResponse}
+//	@Failure		401	{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/user [get]
 func (s *Server) handleAuthUser(c *fiber.Ctx) error {
 	user := auth.GetUserFromContext(c)
 	if user == nil {
+		if s.isAdminOrLoginDisabled(nil) {
+			return RespondSuccess(c, UserResponse{
+				ID:       "anonymous",
+				Name:     "Admin",
+				Provider: "none",
+				IsAdmin:  true,
+			})
+		}
 		return RespondUnauthorized(c, "Not authenticated", "")
 	}
 
@@ -170,6 +225,14 @@ func (s *Server) handleAuthUser(c *fiber.Ctx) error {
 }
 
 // handleAuthLogout logs out the current user
+//
+//	@Summary		Logout
+//	@Description	Invalidates the current session and JWT token.
+//	@Tags			User
+//	@Produce		json
+//	@Success		200	{object}	APIResponse
+//	@Security		BearerAuth
+//	@Router			/user/logout [post]
 func (s *Server) handleAuthLogout(c *fiber.Ctx) error {
 	// Clear JWT cookie using Fiber's native API
 	s.clearJWTCookie(c)
@@ -181,6 +244,15 @@ func (s *Server) handleAuthLogout(c *fiber.Ctx) error {
 }
 
 // handleAuthRefresh refreshes the current JWT token
+//
+//	@Summary		Refresh token
+//	@Description	Issues a new JWT access token using the current valid token.
+//	@Tags			User
+//	@Produce		json
+//	@Success		200	{object}	APIResponse{data=AuthResponse}
+//	@Failure		401	{object}	APIResponse
+//	@Security		BearerAuth
+//	@Router			/user/refresh [post]
 func (s *Server) handleAuthRefresh(c *fiber.Ctx) error {
 	tokenService := s.authService.TokenService()
 
@@ -214,77 +286,81 @@ func (s *Server) handleAuthRefresh(c *fiber.Ctx) error {
 	return RespondSuccess(c, response)
 }
 
-// handleListUsers returns a list of users (admin only)
-func (s *Server) handleListUsers(c *fiber.Ctx) error {
-	user := auth.GetUserFromContext(c)
-	if user == nil || !user.IsAdmin {
-		return RespondForbidden(c, "Admin privileges required", "")
+// isAdminOrLoginDisabled returns true if the user is an admin or login is disabled
+func (s *Server) isAdminOrLoginDisabled(user *database.User) bool {
+	if user != nil && user.IsAdmin {
+		return true
 	}
-
-	pagination := ParsePaginationFiber(c)
-	users, err := s.userRepo.ListUsers(c.Context(), pagination.Limit, pagination.Offset)
-	if err != nil {
-		return RespondInternalError(c, "Failed to list users", err.Error())
+	cfg := s.configManager.GetConfig()
+	if cfg != nil && cfg.Auth.LoginRequired != nil && !*cfg.Auth.LoginRequired {
+		return true
 	}
-
-	// Convert to response format
-	var userResponses []*UserResponse
-	for _, user := range users {
-		userResponses = append(userResponses, s.mapUserToResponse(user))
-	}
-
-	return RespondSuccess(c, userResponses)
+	return false
 }
 
-// handleUpdateUserAdmin updates a user's admin status (admin only)
-func (s *Server) handleUpdateUserAdmin(c *fiber.Ctx) error {
+// handleChangeOwnPassword allows the authenticated user to change their own password
+//
+//	@Summary		Change password
+//	@Description	Changes the password for the currently authenticated user.
+//	@Tags			User
+//	@Accept			json
+//	@Produce		json
+//	@Param			body	body		object{current_password=string,new_password=string}	true	"Password change request"
+//	@Success		200		{object}	APIResponse
+//	@Failure		400		{object}	APIResponse
+//	@Failure		401		{object}	APIResponse
+//	@Security		BearerAuth
+//	@Router			/user/password [put]
+func (s *Server) handleChangeOwnPassword(c *fiber.Ctx) error {
 	user := auth.GetUserFromContext(c)
-	if user == nil || !user.IsAdmin {
-		return RespondForbidden(c, "Admin privileges required", "")
+	if user == nil {
+		return RespondUnauthorized(c, "Not authenticated", "")
 	}
 
-	userID := c.Params("user_id")
-	if userID == "" {
-		return RespondBadRequest(c, "User ID is required", "")
-	}
-
-	// Parse request body
 	var req struct {
-		IsAdmin bool `json:"is_admin"`
+		CurrentPassword string `json:"current_password"`
+		NewPassword     string `json:"new_password"`
 	}
 	if err := c.BodyParser(&req); err != nil {
 		return RespondBadRequest(c, "Invalid request body", err.Error())
 	}
+	if req.CurrentPassword == "" || req.NewPassword == "" {
+		return RespondBadRequest(c, "Current password and new password are required", "")
+	}
+	if len(req.NewPassword) < 12 {
+		return RespondValidationError(c, "Password must be at least 12 characters", "")
+	}
 
-	// Update admin status
-	err := s.userRepo.SetAdminStatus(c.Context(), userID, req.IsAdmin)
+	// Verify current password
+	if _, err := s.authService.AuthenticateUser(c.Context(), user.UserID, req.CurrentPassword); err != nil {
+		return RespondUnauthorized(c, "Current password is incorrect", "")
+	}
+
+	hash, err := s.authService.HashPassword(req.NewPassword)
 	if err != nil {
-		return RespondInternalError(c, "Failed to update user admin status", err.Error())
+		return RespondInternalError(c, "Failed to hash password", err.Error())
 	}
-
-	response := AuthResponse{
-		Message: "User admin status updated successfully",
+	if err := s.userRepo.UpdatePassword(c.Context(), user.UserID, hash); err != nil {
+		return RespondInternalError(c, "Failed to update password", err.Error())
 	}
-	return RespondSuccess(c, response)
+	return RespondMessage(c, "Password updated successfully")
 }
 
 // handleRegenerateAPIKey regenerates API key for the authenticated user
+//
+//	@Summary		Regenerate API key
+//	@Description	Generates a new API key for the authenticated user, invalidating the old one.
+//	@Tags			User
+//	@Produce		json
+//	@Success		200	{object}	APIResponse{data=UserResponse}
+//	@Failure		401	{object}	APIResponse
+//	@Security		BearerAuth
+//	@Router			/user/api-key/regenerate [post]
 func (s *Server) handleRegenerateAPIKey(c *fiber.Ctx) error {
 	// Try to get user from context (auth enabled case)
 	user := auth.GetUserFromContext(c)
 
-	// If no user in context, try to get first user (auth disabled case)
-	if user == nil && s.userRepo != nil {
-		users, err := s.userRepo.ListUsers(c.Context(), 1, 0)
-		if err != nil {
-			return RespondInternalError(c, "Failed to retrieve user list", err.Error())
-		}
-		if len(users) > 0 {
-			user = users[0]
-		}
-	}
-
-	// If still no user, and authentication is disabled, let's create a default admin user
+	// If no user in context, and authentication is disabled, let's create a default admin user
 	if user == nil && s.userRepo != nil {
 		cfg := s.configManager.GetConfig()
 		loginRequired := true
@@ -396,32 +472,19 @@ func sameSiteToString(sameSite http.SameSite) string {
 	}
 }
 
-// mergeAuthConfig merges env config with service config
-func mergeAuthConfig(serviceCfg, envCfg *auth.Config) *auth.Config {
-	merged := *serviceCfg
 
-	if envCfg.CookieDomain != "" {
-		merged.CookieDomain = envCfg.CookieDomain
+// resolveSecureFlag returns the Secure flag for a cookie, auto-detecting from the
+// request protocol when CookieSecureAutoDetect is enabled.
+func resolveSecureFlag(c *fiber.Ctx, cfg *auth.Config) bool {
+	if cfg.CookieSecureAutoDetect {
+		return c.Protocol() == "https"
 	}
-	if envCfg.CookieSecure {
-		merged.CookieSecure = envCfg.CookieSecure
-	}
-	if envCfg.CookieSameSite != http.SameSiteDefaultMode {
-		merged.CookieSameSite = envCfg.CookieSameSite
-	}
-	if envCfg.TokenDuration != 0 {
-		merged.TokenDuration = envCfg.TokenDuration
-	}
-
-	return &merged
+	return cfg.CookieSecure
 }
 
 // setJWTCookie sets the JWT cookie using Fiber's native cookie handling (merged config)
 func (s *Server) setJWTCookie(c *fiber.Ctx, tokenString string) error {
-	serviceCfg := s.authService.GetConfig()
-	envCfg := auth.LoadConfigFromEnv()
-
-	cfg := mergeAuthConfig(serviceCfg, envCfg)
+	cfg := s.authService.GetConfig()
 
 	cookie := &fiber.Cookie{
 		Name:     "JWT", // Default JWT cookie name
@@ -429,7 +492,7 @@ func (s *Server) setJWTCookie(c *fiber.Ctx, tokenString string) error {
 		Path:     "/",
 		Domain:   cfg.CookieDomain,
 		Expires:  time.Now().Add(cfg.TokenDuration),
-		Secure:   cfg.CookieSecure,
+		Secure:   resolveSecureFlag(c, cfg),
 		HTTPOnly: true,
 		SameSite: sameSiteToString(cfg.CookieSameSite),
 	}
@@ -440,10 +503,7 @@ func (s *Server) setJWTCookie(c *fiber.Ctx, tokenString string) error {
 
 // clearJWTCookie clears the JWT cookie using Fiber's native cookie handling (merged config)
 func (s *Server) clearJWTCookie(c *fiber.Ctx) {
-	serviceCfg := s.authService.GetConfig()
-	envCfg := auth.LoadConfigFromEnv()
-
-	cfg := mergeAuthConfig(serviceCfg, envCfg)
+	cfg := s.authService.GetConfig()
 
 	cookie := &fiber.Cookie{
 		Name:     "JWT",
@@ -451,7 +511,7 @@ func (s *Server) clearJWTCookie(c *fiber.Ctx) {
 		Path:     "/",
 		Domain:   cfg.CookieDomain,
 		Expires:  time.Now().Add(-time.Hour), // Expire in the past
-		Secure:   cfg.CookieSecure,
+		Secure:   resolveSecureFlag(c, cfg),
 		HTTPOnly: true,
 		SameSite: sameSiteToString(cfg.CookieSameSite),
 	}

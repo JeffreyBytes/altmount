@@ -18,6 +18,16 @@ import (
 var lastMissingWarnTime sync.Map
 
 // handleGetSystemStats handles GET /api/system/stats
+//
+//	@Summary		Get system statistics
+//	@Description	Returns combined queue, health, and system information statistics.
+//	@Tags			System
+//	@Produce		json
+//	@Success		200	{object}	APIResponse{data=SystemStatsResponse}
+//	@Failure		500	{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/system/stats [get]
 func (s *Server) handleGetSystemStats(c *fiber.Ctx) error {
 	// Get queue statistics
 	queueStats, err := s.queueRepo.GetQueueStats(c.Context())
@@ -53,6 +63,15 @@ func (s *Server) handleGetSystemStats(c *fiber.Ctx) error {
 }
 
 // handleGetSystemHealth handles GET /api/system/health
+//
+//	@Summary		Get system health
+//	@Description	Returns health status of all system components (database, workers, etc.).
+//	@Tags			System
+//	@Produce		json
+//	@Success		200	{object}	APIResponse{data=SystemHealthResponse}
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/system/health [get]
 func (s *Server) handleGetSystemHealth(c *fiber.Ctx) error {
 	// Perform health checks
 	healthCheck := s.checkSystemHealth(c.Context())
@@ -72,6 +91,7 @@ func (s *Server) handleGetSystemHealth(c *fiber.Ctx) error {
 		})
 	case "unhealthy":
 		// Return 503 Service Unavailable for unhealthy status
+		c.Set("Retry-After", "10")
 		return c.Status(503).JSON(fiber.Map{
 			"success": false,
 			"data":    healthCheck,
@@ -86,6 +106,18 @@ func (s *Server) handleGetSystemHealth(c *fiber.Ctx) error {
 }
 
 // handleSystemCleanup handles POST /api/system/cleanup
+//
+//	@Summary		System cleanup
+//	@Description	Removes old queue items and health records based on age. Supports dry-run mode.
+//	@Tags			System
+//	@Accept			json
+//	@Produce		json
+//	@Param			body	body		SystemCleanupRequest	false	"Cleanup criteria"
+//	@Success		200		{object}	APIResponse{data=SystemCleanupResponse}
+//	@Failure		400		{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/system/cleanup [post]
 func (s *Server) handleSystemCleanup(c *fiber.Ctx) error {
 	// Parse request body
 	var req SystemCleanupRequest
@@ -185,6 +217,17 @@ func (s *Server) handleSystemCleanup(c *fiber.Ctx) error {
 }
 
 // handleSystemRestart handles POST /api/system/restart
+//
+//	@Summary		Restart system
+//	@Description	Schedules a graceful system restart. Use force=true to skip safety checks.
+//	@Tags			System
+//	@Accept			json
+//	@Produce		json
+//	@Param			body	body		SystemRestartRequest	false	"Restart options"
+//	@Success		200		{object}	APIResponse{data=SystemRestartResponse}
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/system/restart [post]
 func (s *Server) handleSystemRestart(c *fiber.Ctx) error {
 	// Parse request body if present
 	var req SystemRestartRequest
@@ -216,6 +259,97 @@ func (s *Server) handleSystemRestart(c *fiber.Ctx) error {
 	go s.performRestart(c.Context())
 
 	return result
+}
+
+// handleResetSystemStats handles POST /api/system/stats/reset
+//
+//	@Summary		Reset system statistics
+//	@Description	Resets accumulated system statistics counters (pool metrics, download counters).
+//	@Tags			System
+//	@Produce		json
+//	@Success		200	{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/system/stats/reset [post]
+func (s *Server) handleResetSystemStats(c *fiber.Ctx) error {
+	ctx := c.Context()
+	durationStr := c.Query("duration")
+	resetPeak := c.Query("reset_peak") == "true"
+	resetTotals := c.Query("reset_totals") == "true"
+	resetHistory := c.Query("reset_history") == "true"
+	resetQueue := c.Query("reset_queue") == "true"
+
+	// If no flags are provided, default to full reset
+	if !resetPeak && !resetTotals && !resetHistory && !resetQueue && durationStr == "" {
+		resetPeak = true
+		resetTotals = true
+		resetHistory = true
+	}
+
+	// If duration is provided and not "all", perform granular reset for history
+	if durationStr != "" && durationStr != "all" {
+		duration, err := ParseDuration(durationStr)
+		if err != nil {
+			return RespondBadRequest(c, "Invalid duration format", err.Error())
+		}
+
+		since := time.Now().Add(-duration)
+
+		if s.queueRepo != nil && resetHistory {
+			if err := s.queueRepo.ClearImportHistorySince(ctx, since); err != nil {
+				return c.Status(500).JSON(fiber.Map{
+					"success": false,
+					"message": "Failed to reset statistics for duration",
+					"details": err.Error(),
+				})
+			}
+		}
+
+		return c.Status(200).JSON(fiber.Map{
+			"success": true,
+			"message": fmt.Sprintf("Statistics for last %s reset successfully", durationStr),
+		})
+	}
+
+	// Full/Granular reset
+	// Reset pool metrics (NNTP errors, totals, peak)
+	if s.poolManager != nil && (resetTotals || resetPeak) {
+		if err := s.poolManager.ResetMetrics(ctx, resetPeak, resetTotals); err != nil {
+			return c.Status(500).JSON(fiber.Map{
+				"success": false,
+				"message": "Failed to reset pool metrics",
+				"details": err.Error(),
+			})
+		}
+	}
+
+	// Reset import history and daily stats
+	if s.queueRepo != nil {
+		if resetHistory {
+			if err := s.queueRepo.ClearImportHistory(ctx); err != nil {
+				return c.Status(500).JSON(fiber.Map{
+					"success": false,
+					"message": "Failed to reset import history",
+					"details": err.Error(),
+				})
+			}
+		}
+
+		// Optional: Clear completed/failed queue items too if requested
+		if resetQueue {
+			if _, err := s.queueRepo.ClearCompletedQueueItems(ctx); err != nil {
+				slog.ErrorContext(ctx, "Failed to clear completed queue items during reset", "error", err)
+			}
+			if _, err := s.queueRepo.ClearFailedQueueItems(ctx); err != nil {
+				slog.ErrorContext(ctx, "Failed to clear failed queue items during reset", "error", err)
+			}
+		}
+	}
+
+	return c.Status(200).JSON(fiber.Map{
+		"success": true,
+		"message": "System statistics reset successfully",
+	})
 }
 
 // performRestart performs the actual server restart
@@ -257,6 +391,15 @@ func (s *Server) performRestart(ctx context.Context) {
 }
 
 // handleGetPoolMetrics handles GET /api/system/pool/metrics
+//
+//	@Summary		Get NNTP pool metrics
+//	@Description	Returns download/upload metrics, speed, and per-provider connection statistics.
+//	@Tags			System
+//	@Produce		json
+//	@Success		200	{object}	APIResponse{data=PoolMetricsResponse}
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/system/pool/metrics [get]
 func (s *Server) handleGetPoolMetrics(c *fiber.Ctx) error {
 	// Check if pool manager is available
 	if s.poolManager == nil {
@@ -313,6 +456,12 @@ func (s *Server) handleGetPoolMetrics(c *fiber.Ctx) error {
 	// Get current configuration to access provider details and speed test results
 	config := s.configManager.GetConfig()
 
+	// Calculate total speed from all providers to use for proportional scaling
+	var totalProviderSpeed float64
+	for _, ps := range poolStats.Providers {
+		totalProviderSpeed += ps.AvgSpeed
+	}
+
 	// Build provider response from pool stats + config
 	providers := make([]ProviderStatusResponse, 0, len(poolStats.Providers))
 	for _, ps := range poolStats.Providers {
@@ -325,9 +474,8 @@ func (s *Server) handleGetPoolMetrics(c *fiber.Ctx) error {
 
 		if config != nil {
 			for _, p := range config.Providers {
-				// Match by provider name (v4 uses host:port as Name)
-				providerHost := fmt.Sprintf("%s:%d", p.Host, p.Port)
-				if ps.Name == providerHost || ps.Name == p.Host {
+				// Match by provider name (v4 uses host:port or host:port+username)
+				if ps.Name == p.NNTPPoolName() {
 					providerID = p.ID
 					host = p.Host
 					username = p.Username
@@ -360,6 +508,14 @@ func (s *Server) handleGetPoolMetrics(c *fiber.Ctx) error {
 		missingRate := metrics.ProviderMissingRates[ps.Name]
 		missingWarning := metrics.ProviderMissingWarning[ps.Name]
 
+		// Calculate proportional speed
+		// We use our accurate global speed and distribute it based on pool's relative provider speeds
+		currentProviderSpeed := ps.AvgSpeed
+		if totalProviderSpeed > 0 && metrics.DownloadSpeedBytesPerSec > 0 {
+			weight := ps.AvgSpeed / totalProviderSpeed
+			currentProviderSpeed = metrics.DownloadSpeedBytesPerSec * weight
+		}
+
 		providers = append(providers, ProviderStatusResponse{
 			ID:                      providerID,
 			Host:                    host,
@@ -368,7 +524,8 @@ func (s *Server) handleGetPoolMetrics(c *fiber.Ctx) error {
 			MaxConnections:          ps.MaxConnections,
 			State:                   "active",
 			ErrorCount:              errorCount,
-			CurrentSpeedBytesPerSec: ps.AvgSpeed,
+			CurrentSpeedBytesPerSec: currentProviderSpeed,
+			PingMs:                  ps.Ping.RTT.Milliseconds(),
 			LastSpeedTestMbps:       lastSpeedTestMbps,
 			LastSpeedTestTime:       lastSpeedTestTime,
 			MissingCount:            ps.Missing,
@@ -391,9 +548,21 @@ func (s *Server) handleGetPoolMetrics(c *fiber.Ctx) error {
 		}
 	}
 
+	// Get last 24h stats for download volume (strict rolling 24h)
+	var bytesDownloaded24h int64
+	if s.queueRepo != nil {
+		hourlyStats, err := s.queueRepo.GetImportHourlyStats(c.Context(), 24)
+		if err == nil {
+			for _, hs := range hourlyStats {
+				bytesDownloaded24h += hs.BytesDownloaded
+			}
+		}
+	}
+
 	// Map pool metrics to API response format
 	response := PoolMetricsResponse{
 		BytesDownloaded:             metrics.BytesDownloaded,
+		BytesDownloaded24h:          bytesDownloaded24h,
 		BytesUploaded:               metrics.BytesUploaded,
 		ArticlesDownloaded:          metrics.ArticlesDownloaded,
 		ArticlesPosted:              metrics.ArticlesPosted,
@@ -422,6 +591,17 @@ type FileEntry struct {
 }
 
 // handleSystemBrowse handles GET /api/system/browse
+//
+//	@Summary		Browse filesystem
+//	@Description	Lists filesystem entries at a given path for directory/file picker UIs.
+//	@Tags			System
+//	@Produce		json
+//	@Param			path	query		string	false	"Directory path to browse (defaults to root)"
+//	@Success		200		{object}	APIResponse
+//	@Failure		400		{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/system/browse [get]
 func (s *Server) handleSystemBrowse(c *fiber.Ctx) error {
 	path := c.Query("path")
 	if path == "" {
@@ -431,6 +611,15 @@ func (s *Server) handleSystemBrowse(c *fiber.Ctx) error {
 		if err != nil {
 			path = "/"
 		}
+	}
+
+	// Sanitize and validate the path to prevent path traversal
+	path = filepath.Clean(path)
+	if !filepath.IsAbs(path) {
+		return c.Status(400).JSON(fiber.Map{
+			"success": false,
+			"message": "Path must be absolute",
+		})
 	}
 
 	// Read directory

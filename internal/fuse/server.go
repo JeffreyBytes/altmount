@@ -5,40 +5,71 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"os/exec"
-	"runtime"
 	"strconv"
+	"sync/atomic"
 	"time"
 
-	"github.com/hanwen/go-fuse/v2/fs"
-	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/javi11/altmount/internal/config"
-	"github.com/javi11/altmount/internal/fuse/vfs"
+	"github.com/javi11/altmount/internal/fuse/backend"
 	"github.com/javi11/altmount/internal/nzbfilesystem"
+
+	// Register backends via init() (cgofuse registered in register_cgofuse.go, gated by build tags)
+	_ "github.com/javi11/altmount/internal/fuse/backend/hanwen"
 )
 
-// Server manages the FUSE mount
+// StreamTracker is the subset of stream tracking needed by the FUSE layer.
+// *api.StreamTracker satisfies this interface.
+type StreamTracker = backend.StreamTracker
+
+// Server manages the FUSE mount, delegating to a pluggable backend.
 type Server struct {
-	mountPoint string
-	nzbfs      *nzbfilesystem.NzbFilesystem
-	logger     *slog.Logger
-	server     *fuse.Server
-	config     config.FuseConfig
-	vfsm       *vfs.Manager // VFS disk cache manager (nil if disabled)
+	mountPoint    string
+	nzbfs         *nzbfilesystem.NzbFilesystem
+	logger        *slog.Logger
+	config        config.FuseConfig
+	streamTracker StreamTracker
+	backendType   backend.Type
+
+	be backend.Backend
+
+	// ValidateMount goroutine leak guard
+	validating   atomic.Int32
+	lastHealthy  atomic.Bool
+	lastHealthTS atomic.Int64
 }
 
 // NewServer creates a new FUSE server instance.
-// Takes NzbFilesystem directly (no ContextAdapter needed).
-func NewServer(mountPoint string, nzbfs *nzbfilesystem.NzbFilesystem, logger *slog.Logger, cfg config.FuseConfig) *Server {
+func NewServer(
+	mountPoint string,
+	nzbfs *nzbfilesystem.NzbFilesystem,
+	logger *slog.Logger,
+	cfg config.FuseConfig,
+	st StreamTracker,
+) *Server {
+	bt := resolveBackendType(cfg.Backend)
+
 	return &Server{
-		mountPoint: mountPoint,
-		nzbfs:      nzbfs,
-		logger:     logger,
-		config:     cfg,
+		mountPoint:    mountPoint,
+		nzbfs:         nzbfs,
+		logger:        logger,
+		config:        cfg,
+		streamTracker: st,
+		backendType:   bt,
 	}
 }
 
-// getIDFromEnv parses a numeric ID from an environment variable with a default fallback
+// resolveBackendType determines the backend type from config, env var, or platform default.
+func resolveBackendType(cfgBackend string) backend.Type {
+	if cfgBackend != "" {
+		return backend.Type(cfgBackend)
+	}
+	if env := os.Getenv("ALTMOUNT_FUSE_BACKEND"); env != "" {
+		return backend.Type(env)
+	}
+	return backend.DefaultType()
+}
+
+// getIDFromEnv parses a numeric ID from an environment variable with a default fallback.
 func getIDFromEnv(key string, defaultID int) int {
 	if val := os.Getenv(key); val != "" {
 		if id, err := strconv.Atoi(val); err == nil {
@@ -48,152 +79,108 @@ func getIDFromEnv(key string, defaultID int) int {
 	return defaultID
 }
 
-// Mount mounts the filesystem and starts serving
-// This method blocks until the filesystem is unmounted
-func (s *Server) Mount() error {
-	// Try to cleanup stale mount first
-	s.CleanupMount()
-
+// Mount mounts the filesystem and starts serving.
+// The onReady callback is called after the kernel mount is confirmed live.
+// This method blocks until the filesystem is unmounted.
+func (s *Server) Mount(onReady func()) error {
 	uid := uint32(getIDFromEnv("PUID", 1000))
 	gid := uint32(getIDFromEnv("PGID", 1000))
 
-	// Initialize VFS disk cache if enabled
-	var vfsm *vfs.Manager
-	if s.config.DiskCacheEnabled != nil && *s.config.DiskCacheEnabled {
-		cachePath := s.config.DiskCachePath
-		if cachePath == "" {
-			cachePath = "/tmp/altmount-vfs-cache"
-		}
-
-		maxSizeGB := s.config.DiskCacheMaxSizeGB
-		if maxSizeGB <= 0 {
-			maxSizeGB = 10
-		}
-
-		expiryH := s.config.DiskCacheExpiryH
-		if expiryH <= 0 {
-			expiryH = 24
-		}
-
-		chunkSizeMB := s.config.ChunkSizeMB
-		if chunkSizeMB <= 0 {
-			chunkSizeMB = 4
-		}
-
-		readAheadChunks := s.config.ReadAheadChunks
-		if readAheadChunks <= 0 {
-			readAheadChunks = 4
-		}
-
-		vfsCfg := vfs.ManagerConfig{
-			Enabled:         true,
-			CachePath:       cachePath,
-			MaxSizeBytes:    int64(maxSizeGB) * 1024 * 1024 * 1024,
-			ExpiryDuration:  time.Duration(expiryH) * time.Hour,
-			ChunkSize:       int64(chunkSizeMB) * 1024 * 1024,
-			ReadAheadChunks: readAheadChunks,
-		}
-
-		var err error
-		vfsm, err = vfs.NewManager(vfsCfg, s.logger.With("component", "vfs"))
-		if err != nil {
-			s.logger.Warn("Failed to create VFS disk cache, running without disk cache", "error", err)
-		} else {
-			vfsm.Start(context.Background())
-			s.logger.Info("VFS disk cache enabled",
-				"cache_path", cachePath,
-				"max_size_gb", maxSizeGB,
-				"expiry_hours", expiryH,
-				"chunk_size_mb", chunkSizeMB,
-				"read_ahead_chunks", readAheadChunks)
-		}
-	}
-	s.vfsm = vfsm
-
-	root := NewDir(s.nzbfs, "", s.logger, uid, gid, vfsm)
-
-	// Configure FUSE options
-	attrTimeout := time.Duration(s.config.AttrTimeoutSeconds) * time.Second
-	entryTimeout := time.Duration(s.config.EntryTimeoutSeconds) * time.Second
-
-	if attrTimeout == 0 {
-		attrTimeout = 30 * time.Second
-	}
-	if entryTimeout == 0 {
-		entryTimeout = 1 * time.Second
+	cfg := backend.Config{
+		MountPoint:    s.mountPoint,
+		NzbFs:         s.nzbfs,
+		FuseConfig:    s.config,
+		StreamTracker: s.streamTracker,
+		UID:           uid,
+		GID:           gid,
 	}
 
-	opts := &fs.Options{
-		MountOptions: fuse.MountOptions{
-			AllowOther:           s.config.AllowOther,
-			Name:                 "altmount",
-			Debug:                s.config.Debug,
-			MaxReadAhead:         s.config.MaxReadAheadMB * 1024 * 1024,
-			DisableXAttrs:        true,
-			IgnoreSecurityLabels: true,
-			MaxWrite:             1024 * 1024, // 1MB
-		},
-		EntryTimeout:    &entryTimeout,
-		AttrTimeout:     &attrTimeout,
-		NegativeTimeout: &entryTimeout,
-	}
-
-	server, err := fs.Mount(s.mountPoint, root, opts)
+	be, err := backend.Create(s.backendType, cfg)
 	if err != nil {
-		if vfsm != nil {
-			vfsm.Stop()
-		}
-		return fmt.Errorf("failed to mount FUSE filesystem: %w", err)
+		return fmt.Errorf("failed to create FUSE backend %q: %w", s.backendType, err)
 	}
 
-	s.server = server
-	s.logger.Info("FUSE filesystem mounted", "mountpoint", s.mountPoint)
+	s.be = be
+	s.logger.Info("Using FUSE backend", "type", be.Type(), "mountpoint", s.mountPoint)
 
-	// Block until unmount
-	s.server.Wait()
-
-	// Stop VFS manager on unmount
-	if s.vfsm != nil {
-		s.vfsm.Stop()
-	}
-
-	return nil
+	return be.Mount(context.Background(), onReady)
 }
 
-// Unmount gracefully unmounts the filesystem, falling back to force unmount
+// Unmount gracefully unmounts the filesystem, falling back to force unmount.
 func (s *Server) Unmount() error {
 	s.logger.Info("Unmounting FUSE filesystem", "mountpoint", s.mountPoint)
 
-	if s.server != nil {
-		err := s.server.Unmount()
-		if err == nil {
-			return nil
-		}
-		s.logger.Warn("Standard unmount failed, attempting force unmount", "error", err)
+	if s.be != nil {
+		return s.be.Unmount()
 	}
-
-	return s.ForceUnmount()
+	return nil
 }
 
-// ForceUnmount attempts to lazy/force unmount the mountpoint
+// ForceUnmount attempts to lazy/force unmount the mountpoint using platform-specific commands.
 func (s *Server) ForceUnmount() error {
-	if runtime.GOOS == "linux" {
-		// Try fusermount -uz (lazy unmount)
-		if err := exec.Command("fusermount", "-uz", s.mountPoint).Run(); err == nil {
-			s.logger.Info("Successfully lazy unmounted using fusermount")
-			return nil
-		}
-		// Fallback to umount -l
-		if err := exec.Command("umount", "-l", s.mountPoint).Run(); err == nil {
-			s.logger.Info("Successfully lazy unmounted using umount")
-			return nil
-		}
+	if s.be != nil {
+		return s.be.ForceUnmount()
 	}
-	return fmt.Errorf("failed to force unmount %s", s.mountPoint)
+	return nil
 }
 
-// CleanupMount checks for and cleans up stale mounts at the mountpoint
+// ValidateMount checks if the mount point is responsive by stat-ing the directory with a timeout.
+// Uses an atomic guard to prevent multiple concurrent os.Stat goroutines (which leak when the
+// mount is stuck). If a validation is already in-flight, returns the last cached result.
+func (s *Server) ValidateMount() (bool, error) {
+	if !s.validating.CompareAndSwap(0, 1) {
+		healthy := s.lastHealthy.Load()
+		if !healthy {
+			return false, fmt.Errorf("mount point validation in progress (last check: unhealthy)")
+		}
+		return true, nil
+	}
+
+	type statResult struct {
+		err error
+	}
+
+	ch := make(chan statResult, 1)
+	go func() {
+		defer s.validating.Store(0)
+		_, err := os.Stat(s.mountPoint)
+		ch <- statResult{err: err}
+	}()
+
+	select {
+	case result := <-ch:
+		if result.err != nil {
+			s.lastHealthy.Store(false)
+			s.lastHealthTS.Store(time.Now().UnixNano())
+			return false, fmt.Errorf("mount point stat failed: %w", result.err)
+		}
+		s.lastHealthy.Store(true)
+		s.lastHealthTS.Store(time.Now().UnixNano())
+		return true, nil
+	case <-time.After(5 * time.Second):
+		s.lastHealthy.Store(false)
+		s.lastHealthTS.Store(time.Now().UnixNano())
+		return false, fmt.Errorf("mount point not responding (stat timed out after 5s)")
+	}
+}
+
+// CleanupMount checks for and cleans up stale mounts at the mountpoint.
 func (s *Server) CleanupMount() {
 	_ = s.ForceUnmount()
 }
 
+// RefreshDirectory invalidates the kernel cache for a named directory entry.
+// Only works with backends that implement backend.Refresher (e.g. hanwen).
+func (s *Server) RefreshDirectory(name string) {
+	if r, ok := s.be.(backend.Refresher); ok {
+		r.RefreshDirectory(name)
+	}
+}
+
+// BackendType returns the active backend type.
+func (s *Server) BackendType() backend.Type {
+	if s.be != nil {
+		return s.be.Type()
+	}
+	return s.backendType
+}

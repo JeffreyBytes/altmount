@@ -1,108 +1,64 @@
+---
+title: API Endpoints
+description: REST API reference for AltMount — authentication, NZB queue management, configuration, and status endpoints.
+keywords: [altmount, api, rest, endpoints, nzb, queue, authentication, reference]
+---
+
 # API Endpoints
 
-AltMount provides REST API endpoints for programmatic integration and automation.
+AltMount provides a comprehensive REST API for programmatic integration and automation. The interactive API reference — with a built-in request explorer — is available in the sidebar under **API Reference**.
 
 ## Authentication
 
-All API endpoints require authentication using an API key. The API key can be found in your AltMount system settings.
+AltMount supports two authentication methods:
 
-API keys are provided via query parameter:
+- **Bearer token** (JWT): `Authorization: Bearer <token>` — obtained via `POST /api/auth/login`
+- **API key** (query parameter): `?apikey=YOUR_API_KEY` — found in System → Settings
 
+Most endpoints accept either method.
+
+## Endpoint Categories
+
+| Category | Base Path | Description |
+|----------|-----------|-------------|
+| **Queue** | `/api/queue` | NZB queue management, upload, stats, progress streaming |
+| **Health** | `/api/health` | Health monitoring, library sync, corruption detection, repair |
+| **Files** | `/api/files` | File metadata, active streams, NZB export |
+| **Import** | `/api/import` | Manual file imports, NZBDav imports, scan operations |
+| **Providers** | `/api/config/providers` | NNTP provider CRUD, speed tests, reordering |
+| **ARRs** | `/api/arrs` | Sonarr/Radarr instances, webhooks, download client registration |
+| **Config** | `/api/config` | Configuration get/update/patch/reload/validate |
+| **System** | `/api/system` | System stats, health, pool metrics, cleanup, restart |
+| **FUSE** | `/api/fuse` | FUSE mount start/stop/status |
+| **Stremio** | `/api/nzb` + `/stremio` | Upload NZB and receive Stremio-compatible stream URLs |
+| **Auth** | `/api/auth` | Login, registration, auth config |
+| **User** | `/api/user` | Current user info, token refresh, API key management |
+
+## Response Format
+
+All endpoints return a consistent JSON envelope:
+
+```json
+{ "success": true, "data": { ... } }
 ```
-?apikey=YOUR_API_KEY
-```
 
-## Manual Import Endpoints
-
-### Import File
-
-**Endpoint**: `POST /api/import/file`
-
-Manually add a file by filesystem path to the import queue. This is useful for custom integrations or scripts that need to trigger file processing.
-
-#### Request Format
-
-**Query Parameters**:
-
-- `apikey` (required): Your AltMount API key
-
-**Request Body** (JSON):
+Paginated list responses include a `meta` field:
 
 ```json
 {
-  "file_path": "/path/to/your/file.nzb",
-  "relative_path": "/path/to/strip"
+  "success": true,
+  "data": [ ... ],
+  "meta": { "total": 100, "limit": 50, "offset": 0, "count": 50 }
 }
 ```
 
-**Request Body Fields**:
-
-- `file_path` (required): Full path to the file to import
-- `relative_path` (optional): Path that will be stripped from the file destination
-
-#### Response Format
-
-**Success Response** (200 OK):
+Errors follow:
 
 ```json
 {
-  "data": {
-    "queue_id": 123,
-    "message": "File successfully added to import queue with ID 123"
-  },
-  "meta": null
+  "success": false,
+  "error": { "code": "NOT_FOUND", "message": "Item not found", "details": "" }
 }
 ```
 
-**Error Responses**:
-
-- **401 Unauthorized**: Missing or invalid API key
-- **400 Bad Request**: Invalid request format or missing file_path
-- **404 Not Found**: File does not exist at specified path
-- **409 Conflict**: File is already in the import queue
-- **500 Internal Server Error**: Server error during processing
-
-#### Example Usage
-
-```bash
-# Basic file import
-curl -X POST "http://localhost:8080/api/import/file?apikey=YOUR_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"file_path": "/downloads/movie.nzb"}'
-
-# Import with relative path
-curl -X POST "http://localhost:8080/api/import/file?apikey=YOUR_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"file_path": "/downloads/subfolder/tvshow.nzb", "relative_path": "/downloads"}'
-```
-
-#### File Requirements
-
-- File must exist and be accessible by AltMount
-- File must be a regular file (not a directory)
-- File must not already be in the import queue
-- Supported file types: `.nzb` files and other importable formats
-
-## Error Handling
-
-All API endpoints return consistent error responses:
-
-```json
-{
-  "error": {
-    "message": "Error description",
-    "details": "Additional error context"
-  }
-}
-```
-
-Common HTTP status codes:
-
-- `200`: Success
-- `400`: Bad Request - Invalid input or request format
-- `401`: Unauthorized - Missing or invalid API key
-- `404`: Not Found - Resource does not exist
-- `409`: Conflict - Resource already exists or is in use
-- `500`: Internal Server Error - Server error during processing
-
----
+For the full interactive reference with schemas and a try-it-out console, visit the **[API Explorer](/api-explorer)** page.

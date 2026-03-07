@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/javi11/altmount/internal/database"
+	internalerrors "github.com/javi11/altmount/internal/errors"
 	"github.com/javi11/altmount/internal/nzblnk"
 )
 
@@ -24,9 +26,9 @@ func transformQueueError(err *string) string {
 		return ""
 	}
 
-	// Check if it's the article not found error
-	if strings.Contains(*err, "article is not found") {
-		return "The file is incomplete or missing parts. Some segments of this file could not be found on any of the configured Usenet providers. This often happens with older or less popular files."
+	// Check if it's the article not found error (old raw NNTP message or new sentinel message)
+	if strings.Contains(*err, "article is not found") || *err == internalerrors.ErrArticlesNotFound.Error() {
+		return internalerrors.ErrArticlesNotFound.Error()
 	}
 
 	// Return the original error message for other errors
@@ -34,6 +36,24 @@ func transformQueueError(err *string) string {
 }
 
 // handleListQueue handles GET /api/queue
+//
+//	@Summary		List queue items
+//	@Description	Returns a paginated list of NZB download queue items with optional filters.
+//	@Tags			Queue
+//	@Produce		json
+//	@Param			status		query	string	false	"Filter by status"			Enums(pending,processing,completed,failed)
+//	@Param			search		query	string	false	"Search by filename"
+//	@Param			sort_by		query	string	false	"Sort field"				Enums(created_at,updated_at,status,nzb_path)
+//	@Param			sort_order	query	string	false	"Sort direction"			Enums(asc,desc)
+//	@Param			since		query	string	false	"ISO8601 timestamp filter"
+//	@Param			limit		query	int		false	"Page size (default 50)"
+//	@Param			offset		query	int		false	"Page offset"
+//	@Success		200			{object}	APIResponse{data=[]QueueItemResponse,meta=APIMeta}
+//	@Failure		400			{object}	APIResponse
+//	@Failure		401			{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/queue [get]
 func (s *Server) handleListQueue(c *fiber.Ctx) error {
 	// Parse pagination
 	pagination := ParsePaginationFiber(c)
@@ -124,6 +144,18 @@ func (s *Server) handleListQueue(c *fiber.Ctx) error {
 }
 
 // handleGetQueue handles GET /api/queue/{id}
+//
+//	@Summary		Get queue item
+//	@Description	Returns a single queue item by ID.
+//	@Tags			Queue
+//	@Produce		json
+//	@Param			id	path		int	true	"Queue item ID"
+//	@Success		200	{object}	APIResponse{data=QueueItemResponse}
+//	@Failure		400	{object}	APIResponse
+//	@Failure		404	{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/queue/{id} [get]
 func (s *Server) handleGetQueue(c *fiber.Ctx) error {
 	// Extract ID from path parameter
 	idStr := c.Params("id")
@@ -152,6 +184,19 @@ func (s *Server) handleGetQueue(c *fiber.Ctx) error {
 }
 
 // handleDeleteQueue handles DELETE /api/queue/{id}
+//
+//	@Summary		Delete queue item
+//	@Description	Deletes a queue item by ID. Cannot delete items currently being processed.
+//	@Tags			Queue
+//	@Produce		json
+//	@Param			id	path	int	true	"Queue item ID"
+//	@Success		204
+//	@Failure		400	{object}	APIResponse
+//	@Failure		404	{object}	APIResponse
+//	@Failure		409	{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/queue/{id} [delete]
 func (s *Server) handleDeleteQueue(c *fiber.Ctx) error {
 	// Extract ID from path parameter
 	idStr := c.Params("id")
@@ -189,6 +234,19 @@ func (s *Server) handleDeleteQueue(c *fiber.Ctx) error {
 }
 
 // handleRetryQueue handles POST /api/queue/{id}/retry
+//
+//	@Summary		Retry queue item
+//	@Description	Resets a failed, pending, or completed queue item to pending and triggers processing.
+//	@Tags			Queue
+//	@Produce		json
+//	@Param			id	path		int	true	"Queue item ID"
+//	@Success		200	{object}	APIResponse{data=QueueItemResponse}
+//	@Failure		400	{object}	APIResponse
+//	@Failure		404	{object}	APIResponse
+//	@Failure		409	{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/queue/{id}/retry [post]
 func (s *Server) handleRetryQueue(c *fiber.Ctx) error {
 	// Extract ID from path parameter
 	idStr := c.Params("id")
@@ -238,6 +296,19 @@ func (s *Server) handleRetryQueue(c *fiber.Ctx) error {
 }
 
 // handleCancelQueue handles POST /api/queue/{id}/cancel
+//
+//	@Summary		Cancel queue item
+//	@Description	Requests cancellation of a queue item that is currently being processed.
+//	@Tags			Queue
+//	@Produce		json
+//	@Param			id	path		int	true	"Queue item ID"
+//	@Success		202	{object}	APIResponse
+//	@Failure		400	{object}	APIResponse
+//	@Failure		404	{object}	APIResponse
+//	@Failure		409	{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/queue/{id}/cancel [post]
 func (s *Server) handleCancelQueue(c *fiber.Ctx) error {
 	// Extract ID from path parameter
 	idStr := c.Params("id")
@@ -285,6 +356,16 @@ func (s *Server) handleCancelQueue(c *fiber.Ctx) error {
 }
 
 // handleGetQueueStats handles GET /api/queue/stats
+//
+//	@Summary		Get queue statistics
+//	@Description	Returns current queue statistics (counts by status, average processing time).
+//	@Tags			Queue
+//	@Produce		json
+//	@Success		200	{object}	APIResponse{data=QueueStatsResponse}
+//	@Failure		500	{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/queue/stats [get]
 func (s *Server) handleGetQueueStats(c *fiber.Ctx) error {
 	stats, err := s.queueRepo.GetQueueStats(c.Context())
 	if err != nil {
@@ -295,7 +376,58 @@ func (s *Server) handleGetQueueStats(c *fiber.Ctx) error {
 	return RespondSuccess(c, response)
 }
 
+// handleGetQueueHistoricalStats handles GET /api/queue/stats/history
+//
+//	@Summary		Get historical queue statistics
+//	@Description	Returns historical import statistics over a rolling window (last 24h, 7d, 30d, 365d).
+//	@Tags			Queue
+//	@Produce		json
+//	@Param			days	query		int	false	"Number of days of history (default 1, max 365)"
+//	@Success		200		{object}	APIResponse{data=QueueHistoricalStatsResponse}
+//	@Failure		500		{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/queue/stats/history [get]
+func (s *Server) handleGetQueueHistoricalStats(c *fiber.Ctx) error {
+	// Get optional days parameter, default to 1 (24h)
+	days := 1
+	if daysStr := c.Query("days"); daysStr != "" {
+		if d, err := strconv.Atoi(daysStr); err == nil && d > 0 {
+			days = d
+		}
+	}
+
+	// Limit to max 365 days for performance
+	if days > 365 {
+		days = 365
+	}
+
+	dailyStats, err := s.queueRepo.GetImportDailyStats(c.Context(), days)
+	if err != nil {
+		return RespondInternalError(c, "Failed to retrieve queue historical statistics", err.Error())
+	}
+
+	// For 24h view, we want more granular hourly stats for strict rolling window
+	var hourlyStats []*database.ImportHourlyStat
+	if days == 1 {
+		hourlyStats, _ = s.queueRepo.GetImportHourlyStats(c.Context(), 24)
+	}
+
+	response := ToQueueHistoricalStatsResponse(dailyStats, hourlyStats)
+	return RespondSuccess(c, response)
+}
+
 // handleClearCompletedQueue handles DELETE /api/queue/completed
+//
+//	@Summary		Clear completed queue items
+//	@Description	Removes all completed items from the queue.
+//	@Tags			Queue
+//	@Produce		json
+//	@Success		200	{object}	APIResponse
+//	@Failure		500	{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/queue/completed [delete]
 func (s *Server) handleClearCompletedQueue(c *fiber.Ctx) error {
 	// Clear completed items
 	count, err := s.queueRepo.ClearCompletedQueueItems(c.Context())
@@ -307,6 +439,16 @@ func (s *Server) handleClearCompletedQueue(c *fiber.Ctx) error {
 }
 
 // handleClearFailedQueue handles DELETE /api/queue/failed
+//
+//	@Summary		Clear failed queue items
+//	@Description	Removes all failed items from the queue.
+//	@Tags			Queue
+//	@Produce		json
+//	@Success		200	{object}	APIResponse
+//	@Failure		500	{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/queue/failed [delete]
 func (s *Server) handleClearFailedQueue(c *fiber.Ctx) error {
 	// Clear failed items
 	count, err := s.queueRepo.ClearFailedQueueItems(c.Context())
@@ -318,6 +460,16 @@ func (s *Server) handleClearFailedQueue(c *fiber.Ctx) error {
 }
 
 // handleClearPendingQueue handles DELETE /api/queue/pending
+//
+//	@Summary		Clear pending queue items
+//	@Description	Removes all pending items from the queue.
+//	@Tags			Queue
+//	@Produce		json
+//	@Success		200	{object}	APIResponse
+//	@Failure		500	{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/queue/pending [delete]
 func (s *Server) handleClearPendingQueue(c *fiber.Ctx) error {
 	// Clear pending items
 	count, err := s.queueRepo.ClearPendingQueueItems(c.Context())
@@ -329,6 +481,19 @@ func (s *Server) handleClearPendingQueue(c *fiber.Ctx) error {
 }
 
 // handleDeleteQueueBulk handles DELETE /api/queue/bulk
+//
+//	@Summary		Bulk delete queue items
+//	@Description	Deletes multiple queue items by ID. Cannot delete items currently being processed.
+//	@Tags			Queue
+//	@Accept			json
+//	@Produce		json
+//	@Param			body	body		object{ids=[]int}	true	"List of queue item IDs"
+//	@Success		200		{object}	APIResponse
+//	@Failure		400		{object}	APIResponse
+//	@Failure		409		{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/queue/bulk [delete]
 func (s *Server) handleDeleteQueueBulk(c *fiber.Ctx) error {
 	// Parse request body
 	var request struct {
@@ -362,6 +527,22 @@ func (s *Server) handleDeleteQueueBulk(c *fiber.Ctx) error {
 }
 
 // handleUploadToQueue handles POST /api/queue/upload
+//
+//	@Summary		Upload NZB file to queue
+//	@Description	Uploads an NZB file and adds it to the download queue.
+//	@Tags			Queue
+//	@Accept			multipart/form-data
+//	@Produce		json
+//	@Param			file			formData	file	true	"NZB file to upload (max 100MB)"
+//	@Param			category		formData	string	false	"Optional category"
+//	@Param			relative_path	formData	string	false	"Optional relative path under CompleteDir"
+//	@Param			priority		formData	int		false	"Priority: 1=high, 2=normal, 3=low"
+//	@Success		201				{object}	APIResponse{data=QueueItemResponse}
+//	@Failure		400				{object}	APIResponse
+//	@Failure		503				{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/queue/upload [post]
 func (s *Server) handleUploadToQueue(c *fiber.Ctx) error {
 	// Get uploaded file
 	file, err := c.FormFile("file")
@@ -406,7 +587,9 @@ func (s *Server) handleUploadToQueue(c *fiber.Ctx) error {
 	}
 
 	// Save the uploaded file to temporary location
-	tempFile := filepath.Join(uploadDir, file.Filename)
+	// Use filepath.Base to strip any path components from the filename
+	safeFilename := filepath.Base(file.Filename)
+	tempFile := filepath.Join(uploadDir, safeFilename)
 	if err := c.SaveFile(file, tempFile); err != nil {
 		return RespondInternalError(c, "Failed to save file", err.Error())
 	}
@@ -453,6 +636,19 @@ func (s *Server) handleUploadToQueue(c *fiber.Ctx) error {
 }
 
 // handleUploadNZBLnk handles POST /api/queue/upload-nzblnk
+//
+//	@Summary		Add NZBLnk links to queue
+//	@Description	Resolves one or more nzblnk:// links and adds the resulting NZBs to the queue.
+//	@Tags			Queue
+//	@Accept			json
+//	@Produce		json
+//	@Param			body	body		object{links=[]string,category=string,priority=int,relative_path=string}	true	"NZBLNK request (max 20 links)"
+//	@Success		201		{object}	APIResponse
+//	@Failure		400		{object}	APIResponse
+//	@Failure		503		{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/queue/upload-nzblnk [post]
 func (s *Server) handleUploadNZBLnk(c *fiber.Ctx) error {
 	// Parse request body
 	var req struct {
@@ -625,7 +821,111 @@ func embedPasswordInNZB(nzbContent []byte, password string) []byte {
 	return []byte(content)
 }
 
+// handleSearchNZBByName handles POST /api/queue/upload-by-name
+//
+//	@Summary		Search NZB by name and add to queue
+//	@Description	Searches for an NZB by name via the configured indexer and adds the result to the queue.
+//	@Tags			Queue
+//	@Accept			json
+//	@Produce		json
+//	@Param			body	body		object{name=string,password=string,category=string,priority=int,relative_path=string}	true	"Search request"
+//	@Success		201		{object}	APIResponse
+//	@Failure		400		{object}	APIResponse
+//	@Failure		404		{object}	APIResponse
+//	@Failure		503		{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/queue/upload-by-name [post]
+func (s *Server) handleSearchNZBByName(c *fiber.Ctx) error {
+	var req struct {
+		Name         string `json:"name"`
+		Password     string `json:"password"`
+		Category     string `json:"category"`
+		Priority     int    `json:"priority"`
+		RelativePath string `json:"relative_path"`
+	}
+	if err := c.BodyParser(&req); err != nil {
+		return RespondBadRequest(c, "Invalid request body", err.Error())
+	}
+	if strings.TrimSpace(req.Name) == "" {
+		return RespondValidationError(c, "Name is required", "")
+	}
+	if s.importerService == nil {
+		return RespondServiceUnavailable(c, "Importer service not available", "The import service is not configured or running")
+	}
+
+	// Build a synthetic nzblnk URL using name as both t= and h=
+	syntheticLink := "nzblnk:?t=" + url.QueryEscape(req.Name) + "&h=" + url.QueryEscape(req.Name)
+	if req.Password != "" {
+		syntheticLink += "&p=" + url.QueryEscape(req.Password)
+	}
+
+	resolver := nzblnk.NewResolver()
+	resolved, err := resolver.Resolve(c.Context(), syntheticLink)
+	if err != nil {
+		return RespondNotFound(c, "NZB", "Could not find NZB for name '"+req.Name+"': "+err.Error())
+	}
+
+	uploadDir := filepath.Join(os.TempDir(), "altmount-uploads")
+	if err := os.MkdirAll(uploadDir, 0755); err != nil {
+		return RespondInternalError(c, "Failed to create upload directory", err.Error())
+	}
+	safeTitle := sanitizeFilename(resolved.Title)
+	tempFile := filepath.Join(uploadDir, safeTitle+".nzb")
+
+	nzbContent := resolved.NZBContent
+	if resolved.Password != "" {
+		nzbContent = embedPasswordInNZB(nzbContent, resolved.Password)
+		slog.DebugContext(c.Context(), "Embedded password in NZB", "title", resolved.Title)
+	}
+	if err := os.WriteFile(tempFile, nzbContent, 0644); err != nil {
+		return RespondInternalError(c, "Failed to save NZB file", err.Error())
+	}
+
+	var categoryPtr *string
+	if req.Category != "" {
+		categoryPtr = &req.Category
+	}
+
+	var basePath *string
+	if s.configManager != nil {
+		if completeDir := s.configManager.GetConfig().SABnzbd.CompleteDir; completeDir != "" {
+			p := completeDir
+			if req.RelativePath != "" {
+				p = filepath.Join(p, req.RelativePath)
+			}
+			basePath = &p
+		}
+	}
+
+	priority := database.QueuePriority(req.Priority)
+	item, err := s.importerService.AddToQueue(c.Context(), tempFile, basePath, categoryPtr, &priority)
+	if err != nil {
+		os.Remove(tempFile)
+		return RespondInternalError(c, "Failed to add to queue", err.Error())
+	}
+
+	return RespondCreated(c, fiber.Map{
+		"queue_id": item.ID,
+		"title":    resolved.Title,
+		"indexer":  resolved.Indexer,
+	})
+}
+
 // handleRestartQueueBulk handles POST /api/queue/bulk/restart
+//
+//	@Summary		Bulk restart queue items
+//	@Description	Resets multiple queue items to pending status for reprocessing.
+//	@Tags			Queue
+//	@Accept			json
+//	@Produce		json
+//	@Param			body	body		object{ids=[]int}	true	"List of queue item IDs"
+//	@Success		200		{object}	APIResponse
+//	@Failure		400		{object}	APIResponse
+//	@Failure		409		{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/queue/bulk/restart [post]
 func (s *Server) handleRestartQueueBulk(c *fiber.Ctx) error {
 	// Parse request body
 	var request struct {
@@ -681,6 +981,18 @@ func (s *Server) handleRestartQueueBulk(c *fiber.Ctx) error {
 }
 
 // handleCancelQueueBulk handles POST /api/queue/bulk/cancel
+//
+//	@Summary		Bulk cancel queue items
+//	@Description	Requests cancellation of multiple currently-processing queue items.
+//	@Tags			Queue
+//	@Accept			json
+//	@Produce		json
+//	@Param			body	body		object{ids=[]int}	true	"List of queue item IDs"
+//	@Success		202		{object}	APIResponse
+//	@Failure		400		{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/queue/bulk/cancel [post]
 func (s *Server) handleCancelQueueBulk(c *fiber.Ctx) error {
 	// Parse request body
 	var request struct {
@@ -748,6 +1060,19 @@ func (s *Server) handleCancelQueueBulk(c *fiber.Ctx) error {
 }
 
 // handleAddTestQueueItem handles POST /api/queue/test
+//
+//	@Summary		Add test download to queue
+//	@Description	Downloads a test NZB from sabnzbd.org and adds it to the queue for connectivity testing.
+//	@Tags			Queue
+//	@Accept			json
+//	@Produce		json
+//	@Param			body	body		object{size=string}	true	"Size: 100MB, 1GB, or 10GB"
+//	@Success		201		{object}	APIResponse{data=QueueItemResponse}
+//	@Failure		400		{object}	APIResponse
+//	@Failure		502		{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/queue/test [post]
 func (s *Server) handleAddTestQueueItem(c *fiber.Ctx) error {
 	// Parse request body
 	var req struct {
@@ -827,7 +1152,81 @@ func (s *Server) handleAddTestQueueItem(c *fiber.Ctx) error {
 	return RespondCreated(c, response)
 }
 
+// handleUpdateQueueItemPriority handles PATCH /api/queue/{id}/priority
+//
+//	@Summary		Update queue item priority
+//	@Description	Changes the priority of a pending or failed queue item.
+//	@Tags			Queue
+//	@Accept			json
+//	@Produce		json
+//	@Param			id		path		int					true	"Queue item ID"
+//	@Param			body	body		object{priority=int}	true	"Priority: 1=high, 2=normal, 3=low"
+//	@Success		200		{object}	APIResponse{data=QueueItemResponse}
+//	@Failure		400		{object}	APIResponse
+//	@Failure		404		{object}	APIResponse
+//	@Failure		409		{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/queue/{id}/priority [patch]
+func (s *Server) handleUpdateQueueItemPriority(c *fiber.Ctx) error {
+	idStr := c.Params("id")
+	if idStr == "" {
+		return RespondBadRequest(c, "Queue item ID is required", "")
+	}
+
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		return RespondBadRequest(c, "Invalid queue item ID", "ID must be a valid integer")
+	}
+
+	var req struct {
+		Priority int `json:"priority"`
+	}
+	if err := c.BodyParser(&req); err != nil {
+		return RespondBadRequest(c, "Invalid request body", err.Error())
+	}
+
+	// Validate priority: 1=high, 2=normal, 3=low
+	if req.Priority < 1 || req.Priority > 3 {
+		return RespondValidationError(c, "Invalid priority value", "Valid values: 1 (high), 2 (normal), 3 (low)")
+	}
+
+	item, err := s.queueRepo.GetQueueItem(c.Context(), id)
+	if err != nil {
+		return RespondInternalError(c, "Failed to check queue item", err.Error())
+	}
+	if item == nil {
+		return RespondNotFound(c, "Queue item", "")
+	}
+	if item.Status == database.QueueStatusProcessing {
+		return RespondConflict(c, "Cannot change priority of item currently being processed", "")
+	}
+
+	if err := s.queueRepo.UpdateQueueItemPriority(c.Context(), id, database.QueuePriority(req.Priority)); err != nil {
+		return RespondInternalError(c, "Failed to update priority", err.Error())
+	}
+
+	updated, err := s.queueRepo.GetQueueItem(c.Context(), id)
+	if err != nil {
+		return RespondInternalError(c, "Failed to retrieve updated queue item", err.Error())
+	}
+
+	return RespondSuccess(c, ToQueueItemResponse(updated))
+}
+
 // handleDownloadNZB handles GET /api/queue/{id}/download
+//
+//	@Summary		Download NZB file
+//	@Description	Downloads the original NZB file associated with a queue item.
+//	@Tags			Queue
+//	@Produce		application/x-nzb
+//	@Param			id	path	int	true	"Queue item ID"
+//	@Success		200
+//	@Failure		400	{object}	APIResponse
+//	@Failure		404	{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/queue/{id}/download [get]
 func (s *Server) handleDownloadNZB(c *fiber.Ctx) error {
 	// Extract ID from path parameter
 	idStr := c.Params("id")

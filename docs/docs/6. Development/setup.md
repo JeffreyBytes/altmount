@@ -1,3 +1,9 @@
+---
+title: Development Setup
+description: Set up a local development environment for contributing to AltMount's Go backend and React frontend.
+keywords: [altmount, development, setup, contributing, go, react, local environment]
+---
+
 # Development Setup
 
 This guide will help you set up a development environment for AltMount.
@@ -6,7 +12,7 @@ This guide will help you set up a development environment for AltMount.
 
 Before you begin, ensure you have the following installed on your system:
 
-- **Go 1.25.1+** - [Download Go](https://golang.org/dl/)
+- **Go 1.24.5+** - [Download Go](https://golang.org/dl/)
 - **Bun** - [Install Bun](https://bun.sh/docs/installation)
 - **Protobuf Compiler** - [Install Protocol Buffers](https://grpc.io/docs/protoc-installation/)
 - **Git** - [Download Git](https://git-scm.com/downloads)

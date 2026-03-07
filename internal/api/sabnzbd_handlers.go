@@ -20,6 +20,9 @@ import (
 	"github.com/javi11/altmount/internal/arrs"
 	"github.com/javi11/altmount/internal/config"
 	"github.com/javi11/altmount/internal/database"
+	"github.com/javi11/altmount/internal/httpclient"
+	"github.com/javi11/altmount/internal/importer/utils"
+	"github.com/javi11/altmount/internal/pathutil"
 )
 
 // getDefaultCategory returns the Default category from config or a fallback
@@ -368,8 +371,14 @@ func (s *Server) handleSABnzbdAddUrl(c *fiber.Ctx) error {
 		return s.writeSABnzbdErrorFiber(c, "URL parameter 'name' required")
 	}
 
-	// Download NZB file from URL
-	resp, err := http.Get(nzbUrl)
+	// Download NZB file from URL using a proper HTTP client with a User-Agent header.
+	// Some indexers (e.g. NZBHydra2) return 403 on redirect if User-Agent is missing.
+	req, err := http.NewRequestWithContext(c.Context(), http.MethodGet, nzbUrl, nil)
+	if err != nil {
+		return s.writeSABnzbdErrorFiber(c, "Failed to build NZB download request")
+	}
+	req.Header.Set("User-Agent", "altmount")
+	resp, err := httpclient.NewLong().Do(req)
 	if err != nil {
 		return s.writeSABnzbdErrorFiber(c, "Failed to download NZB from URL")
 	}
@@ -653,7 +662,9 @@ func (s *Server) handleSABnzbdHistory(c *fiber.Ctx) error {
 	for _, item := range completed {
 		// Calculate category-specific base path for this item
 		itemBasePath := s.calculateItemBasePath()
-		slot := ToSABnzbdHistorySlot(item, start+index, itemBasePath)
+		finalPath := s.calculateHistoryStoragePath(item, itemBasePath)
+
+		slot := ToSABnzbdHistorySlot(item, start+index, finalPath)
 		slog.DebugContext(c.Context(), "Reporting completed item to SABnzbd API",
 			"name", slot.Name,
 			"path", slot.Path,
@@ -665,7 +676,9 @@ func (s *Server) handleSABnzbdHistory(c *fiber.Ctx) error {
 	for _, item := range failed {
 		// Calculate category-specific base path for this item
 		itemBasePath := s.calculateItemBasePath()
-		slot := ToSABnzbdHistorySlot(item, start+index, itemBasePath)
+		finalPath := s.calculateHistoryStoragePath(item, itemBasePath)
+
+		slot := ToSABnzbdHistorySlot(item, start+index, finalPath)
 		slots = append(slots, slot)
 		totalBytes += slot.Bytes
 		index++
@@ -745,8 +758,12 @@ func (s *Server) handleSABnzbdStatus(c *fiber.Ctx) error {
 	}
 
 	// Get actual disk space for storage directory
-	tempDir := filepath.Join(os.TempDir(), "altmount-uploads")
-	diskFree, diskTotal := getDiskSpace(tempDir)
+	cfg := s.configManager.GetConfig()
+	targetPath := cfg.MountPath
+	if targetPath == "" {
+		targetPath = filepath.Join(os.TempDir(), "altmount-uploads")
+	}
+	diskFree, diskTotal := getDiskSpace(targetPath)
 
 	response := SABnzbdStatusResponse{
 		Status:          true,
@@ -793,7 +810,7 @@ func (s *Server) handleSABnzbdGetConfig(c *fiber.Ctx) error {
 		// Build misc configuration
 		itemBasePath := s.calculateItemBasePath()
 		sabnzbdConfig.Misc = SABnzbdMiscConfig{
-			CompleteDir:            itemBasePath,
+			CompleteDir:            pathutil.JoinAbsPath(itemBasePath, cfg.SABnzbd.CompleteDir),
 			PreCheck:               0,
 			HistoryRetention:       "",
 			HistoryRetentionOption: "all",
@@ -965,7 +982,7 @@ func (s *Server) validateSABnzbdCategory(category string) (string, error) {
 }
 
 // writeSABnzbdResponseFiber writes a successful SABnzbd-compatible response (Fiber version)
-func (s *Server) writeSABnzbdResponseFiber(c *fiber.Ctx, data interface{}) error {
+func (s *Server) writeSABnzbdResponseFiber(c *fiber.Ctx, data any) error {
 	return c.Status(200).JSON(data)
 }
 
@@ -1036,6 +1053,112 @@ func (s *Server) calculateItemBasePath() string {
 
 	// Return base path with category folder
 	return basePath
+}
+
+// calculateHistoryStoragePath calculates the final storage path to report to SABnzbd history for Sonarr/Radarr.
+func (s *Server) calculateHistoryStoragePath(item *database.ImportQueueItem, basePath string) string {
+	if s.configManager == nil || item.StoragePath == nil || *item.StoragePath == "" {
+		return basePath
+	}
+
+	cfg := s.configManager.GetConfig()
+	storagePath := *item.StoragePath
+
+	// Determine category folder
+	category := config.DefaultCategoryName
+	if item.Category != nil && *item.Category != "" {
+		category = *item.Category
+	}
+
+	// Get the raw relative path by stripping the mount path
+	resultingPath := storagePath
+	if after, ok := strings.CutPrefix(storagePath, cfg.MountPath); ok {
+		resultingPath = after
+	}
+
+	// For Strategy None, it relies on complete_dir, but we also want the relative job folder path.
+	if cfg.Import.ImportStrategy == config.ImportStrategyNone {
+		pathComponents := []string{cfg.MountPath}
+
+		if cfg.SABnzbd.CompleteDir != "" {
+			pathComponents = append(pathComponents, strings.TrimPrefix(cfg.SABnzbd.CompleteDir, "/"))
+		}
+
+		// The virtual file system places files directly inside the category folder
+		// under the complete directory. The file itself might be in a job folder.
+
+		// Ensure category is respected
+		cleanPath := strings.TrimPrefix(resultingPath, "/")
+		if cfg.SABnzbd.CompleteDir != "" {
+			cleanCompleteDir := strings.TrimPrefix(cfg.SABnzbd.CompleteDir, "/")
+			if after, ok := strings.CutPrefix(cleanPath, cleanCompleteDir+"/"); ok {
+				cleanPath = after
+			} else if cleanPath == cleanCompleteDir {
+				cleanPath = ""
+			}
+		}
+
+		if !strings.HasPrefix(cleanPath, category+"/") && cleanPath != category {
+			pathComponents = append(pathComponents, category)
+		}
+
+		fullPath := filepath.Join(append(pathComponents, cleanPath)...)
+		fullPath = filepath.ToSlash(filepath.Clean(fullPath))
+
+		// We only want to report the directory, not the actual file
+		// Since some files might not have popular extensions or might be folders,
+		// we check if it is explicitly a file based on PopularExtensions.
+		if utils.HasPopularExtension(fullPath) {
+			return filepath.Dir(fullPath)
+		}
+		return fullPath
+	}
+
+	// For explicit import strategies (symlink, hardlink, copy, move, strm),
+	// the post-processor strips complete_dir and places it into {ImportDir}/{Category}/{RelativeJobFolder}.
+
+	// Strip SABnzbd CompleteDir prefix from resultingPath if present
+	if cfg.SABnzbd.CompleteDir != "" {
+		completeDir := filepath.ToSlash(cfg.SABnzbd.CompleteDir)
+		if !strings.HasPrefix(completeDir, "/") {
+			completeDir = "/" + completeDir
+		}
+
+		checkPath := resultingPath
+		if !strings.HasPrefix(checkPath, "/") {
+			checkPath = "/" + checkPath
+		}
+
+		if strings.HasPrefix(checkPath, completeDir) {
+			if len(checkPath) == len(completeDir) {
+				resultingPath = "/"
+			} else if checkPath[len(completeDir)] == '/' {
+				resultingPath = checkPath[len(completeDir):]
+			}
+		}
+	}
+
+	// Ensure the resulting path respects the category
+	cleanPath := strings.TrimPrefix(resultingPath, "/")
+	if !strings.HasPrefix(cleanPath, category+"/") && cleanPath != category {
+		resultingPath = filepath.Join(category, cleanPath)
+	}
+
+	// Determine the base path for these strategies
+	stratBasePath := cfg.MountPath
+	if cfg.Import.ImportDir != nil && *cfg.Import.ImportDir != "" {
+		stratBasePath = *cfg.Import.ImportDir
+	}
+
+	fullStoragePath := filepath.Join(stratBasePath, strings.TrimPrefix(resultingPath, "/"))
+	fullStoragePath = filepath.ToSlash(filepath.Clean(fullStoragePath))
+
+	// Return the directory, not the file
+	if utils.HasPopularExtension(fullStoragePath) {
+		return filepath.Dir(fullStoragePath)
+	}
+
+	return fullStoragePath
 }
 
 // normalizeURL normalizes a URL for comparison by removing trailing slashes

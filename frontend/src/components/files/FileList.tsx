@@ -3,6 +3,7 @@ import { File, FileArchive, FileImage, FileText, FileVideo, Folder, Music } from
 import type React from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { WebDAVFile } from "../../types/webdav";
+import { getFormatLabel } from "../../utils/fileUtils";
 import { FileActions } from "./FileActions";
 
 interface FileListProps {
@@ -19,8 +20,11 @@ interface FileListProps {
 	isExportingNZB?: boolean;
 }
 
-// Virtual scrolling constants
-const ITEM_HEIGHT = 200; // Fixed height for each card
+// Virtual scrolling constants - Responsive heights for better mobile UX
+const ITEM_HEIGHT_MOBILE = 240; // Taller for mobile touch targets
+const ITEM_HEIGHT_TABLET = 200;
+const ITEM_HEIGHT_DESKTOP = 180; // More compact on desktop
+
 const ITEMS_PER_ROW = {
 	sm: 1,
 	md: 2,
@@ -28,6 +32,13 @@ const ITEMS_PER_ROW = {
 	xl: 4,
 };
 const BUFFER_SIZE = 2; // Number of extra rows to render above and below viewport
+
+// Dynamic item height based on screen width
+const getItemHeight = (width: number) => {
+	if (width < 768) return ITEM_HEIGHT_MOBILE;
+	if (width < 1024) return ITEM_HEIGHT_TABLET;
+	return ITEM_HEIGHT_DESKTOP;
+};
 
 export function FileList({
 	files,
@@ -57,10 +68,11 @@ export function FileList({
 
 	// Calculate virtual scrolling parameters
 	const virtualScrolling = useMemo(() => {
+		const itemHeight = getItemHeight(containerDimensions.width);
 		const totalRows = Math.ceil(files.length / itemsPerRow);
 		const containerHeight = containerDimensions.height || 600;
-		const visibleRows = Math.ceil(containerHeight / ITEM_HEIGHT);
-		const startRow = Math.max(0, Math.floor(scrollTop / ITEM_HEIGHT) - BUFFER_SIZE);
+		const visibleRows = Math.ceil(containerHeight / itemHeight);
+		const startRow = Math.max(0, Math.floor(scrollTop / itemHeight) - BUFFER_SIZE);
 		const endRow = Math.min(totalRows, startRow + visibleRows + BUFFER_SIZE * 2);
 
 		const startIndex = startRow * itemsPerRow;
@@ -68,14 +80,15 @@ export function FileList({
 
 		return {
 			totalRows,
-			totalHeight: totalRows * ITEM_HEIGHT,
+			totalHeight: totalRows * itemHeight,
 			startRow,
 			endRow,
 			startIndex,
 			endIndex,
-			offsetY: startRow * ITEM_HEIGHT,
+			offsetY: startRow * itemHeight,
+			itemHeight, // Include item height for FileCard
 		};
-	}, [files.length, itemsPerRow, containerDimensions.height, scrollTop]);
+	}, [files.length, itemsPerRow, containerDimensions.height, containerDimensions.width, scrollTop]);
 
 	// Get visible files
 	const visibleFiles = useMemo(() => {
@@ -127,7 +140,7 @@ export function FileList({
 				return <FileVideo className={iconClass} />;
 			case ["mp3", "wav", "flac", "aac", "ogg"].includes(extension):
 				return <Music className={iconClass} />;
-			case ["zip", "rar", "7z", "tar", "gz"].includes(extension):
+			case ["zip", "rar", "7z", "tar", "gz", "iso"].includes(extension):
 				return <FileArchive className={iconClass} />;
 			case ["txt", "md", "log", "json", "xml", "csv"].includes(extension):
 				return <FileText className={iconClass} />;
@@ -146,7 +159,9 @@ export function FileList({
 
 	const handleItemClick = (file: WebDAVFile) => {
 		if (file.type === "directory") {
-			const newPath = `${currentPath}/${file.basename}`.replace(/\/+/g, "/");
+			const newPath = currentPath
+				? `${currentPath}/${file.basename}`.replace(/\/+/g, "/")
+				: file.filename;
 			onNavigate(newPath);
 		}
 	};
@@ -190,7 +205,11 @@ export function FileList({
 	// Virtual scrolling for large lists
 	return (
 		<div className="relative">
-			<div ref={containerRef} className="h-[600px] overflow-auto" onScroll={handleScroll}>
+			<div
+				ref={containerRef}
+				className="h-[50vh] overflow-auto md:h-[60vh] lg:h-[600px]"
+				onScroll={handleScroll}
+			>
 				<div
 					ref={scrollElementRef}
 					style={{ height: virtualScrolling.totalHeight }}
@@ -224,6 +243,7 @@ export function FileList({
 								getFileIcon={getFileIcon}
 								formatFileSize={formatFileSize}
 								handleItemClick={handleItemClick}
+								itemHeight={virtualScrolling.itemHeight}
 							/>
 						))}
 					</div>
@@ -248,6 +268,7 @@ interface FileCardProps {
 	handleItemClick: (file: WebDAVFile) => void;
 	onExportNZB?: (path: string, filename: string) => void;
 	isExportingNZB?: boolean;
+	itemHeight?: number;
 }
 
 function FileCard({
@@ -264,11 +285,12 @@ function FileCard({
 	handleItemClick,
 	onExportNZB,
 	isExportingNZB,
+	itemHeight = 200,
 }: FileCardProps) {
 	return (
 		<div
 			className="card cursor-pointer bg-base-100 shadow-md transition-shadow hover:shadow-lg"
-			style={{ height: ITEM_HEIGHT - 16 }} // Account for gap
+			style={{ height: itemHeight - 16 }} // Account for gap
 		>
 			<div className="card-body p-4">
 				<div className="mb-2 flex items-start justify-between">
@@ -276,18 +298,35 @@ function FileCard({
 						className="flex min-w-0 flex-1 cursor-pointer items-center space-x-3 border-none bg-transparent"
 						onClick={() => handleItemClick(file)}
 						type="button"
+						aria-label={`${file.type === "directory" ? "Open folder" : "Open file"} ${file.basename}`}
 					>
 						{getFileIcon(file)}
-						<div className="min-w-0 flex-1">
+						<div className="min-w-0 flex-1 text-left">
 							<h3
 								className={`truncate font-medium ${
 									file.type === "directory"
 										? "text-primary hover:text-primary-focus"
 										: "text-base-content"
 								}`}
+								title={file.basename}
 							>
 								{file.basename}
 							</h3>
+							{file.type === "file" && (
+								<div className="mt-1 flex flex-col text-base-content/50 text-xs">
+									<span className="truncate" title={`Virtual Path: ${file.filename}`}>
+										{file.filename}
+									</span>
+									{file.library_path && (
+										<span
+											className="mt-0.5 truncate text-base-content/70"
+											title={`Library Path: ${file.library_path}`}
+										>
+											↳ {file.library_path}
+										</span>
+									)}
+								</div>
+							)}
 						</div>
 					</button>
 					<FileActions
@@ -321,7 +360,11 @@ function FileCard({
 					</div>
 					<div className="flex justify-between">
 						<span>Type:</span>
-						<span className="capitalize">{file.type}</span>
+						<span className="capitalize">
+							{file.type === "file"
+								? (getFormatLabel(file.basename) ?? file.mime ?? "File")
+								: file.type}
+						</span>
 					</div>
 				</div>
 			</div>
