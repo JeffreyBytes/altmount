@@ -1,4 +1,4 @@
-import { MoreHorizontal, PlayCircle, Trash2, Wrench, X } from "lucide-react";
+import { Eye, MoreHorizontal, PlayCircle, RefreshCw, Trash2, Wrench, X } from "lucide-react";
 import type { FileHealth } from "../../../../types/api";
 
 interface HealthItemActionsMenuProps {
@@ -7,10 +7,14 @@ interface HealthItemActionsMenuProps {
 	isDirectCheckPending: boolean;
 	isRepairPending: boolean;
 	isDeletePending: boolean;
+	isUnmaskPending: boolean;
+	isRegeneratePending?: boolean;
 	onCancelCheck: (id: number) => void;
 	onManualCheck: (id: number) => void;
 	onRepair: (id: number) => void;
 	onDelete: (id: number) => void;
+	onUnmask: (id: number) => void;
+	onRegenerate?: (filePath: string) => void;
 }
 
 export function HealthItemActionsMenu({
@@ -19,17 +23,34 @@ export function HealthItemActionsMenu({
 	isDirectCheckPending,
 	isRepairPending,
 	isDeletePending,
+	isUnmaskPending,
+	isRegeneratePending,
 	onCancelCheck,
 	onManualCheck,
 	onRepair,
 	onDelete,
+	onUnmask,
+	onRegenerate,
 }: HealthItemActionsMenuProps) {
 	return (
 		<div className="dropdown dropdown-end">
 			<button tabIndex={0} type="button" className="btn btn-ghost btn-sm">
 				<MoreHorizontal className="h-4 w-4" />
 			</button>
-			<ul className="dropdown-content menu w-48 rounded-box bg-base-100 shadow-lg">
+			<ul className="dropdown-content menu z-[50] w-48 rounded-box border border-base-300 bg-base-100 p-2 shadow-xl">
+				{item.is_masked && (
+					<li>
+						<button
+							type="button"
+							onClick={() => onUnmask(item.id)}
+							disabled={isUnmaskPending}
+							className="text-success"
+						>
+							<Eye className="h-4 w-4" />
+							Unmask File
+						</button>
+					</li>
+				)}
 				{item.status === "checking" ? (
 					<li>
 						<button
@@ -54,6 +75,17 @@ export function HealthItemActionsMenu({
 						</button>
 					</li>
 				)}
+				<li>
+					<button
+						type="button"
+						onClick={() => onRegenerate?.(item.file_path)}
+						disabled={isRegeneratePending}
+						className="text-primary"
+					>
+						<RefreshCw className="h-4 w-4" />
+						Regenerate File
+					</button>
+				</li>
 				<li>
 					<button
 						type="button"

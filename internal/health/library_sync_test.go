@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/javi11/altmount/internal/config"
@@ -25,6 +26,9 @@ func (m *MockRcloneClient) RefreshDir(ctx context.Context, provider string, dirs
 }
 
 func TestSyncLibrary_WorkerPool(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlinks not supported on Windows")
+	}
 	// Setup temporary directory for metadata
 	tempDir, err := os.MkdirTemp("", "altmount_test_metadata")
 	require.NoError(t, err)
@@ -53,12 +57,20 @@ func TestSyncLibrary_WorkerPool(t *testing.T) {
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 			release_date DATETIME,
-			scheduled_check_at DATETIME
+			scheduled_check_at DATETIME,
+			streaming_failure_count INTEGER DEFAULT 0,
+			is_masked BOOLEAN DEFAULT FALSE
+		);
+
+		CREATE TABLE IF NOT EXISTS system_state (
+			key TEXT PRIMARY KEY,
+			value TEXT NOT NULL,
+			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		);
 	`)
 	require.NoError(t, err)
 
-	healthRepo := database.NewHealthRepository(db)
+	healthRepo := database.NewHealthRepository(db, database.DialectSQLite)
 	metadataService := metadata.NewMetadataService(tempDir)
 
 	// Setup configuration
@@ -83,7 +95,7 @@ func TestSyncLibrary_WorkerPool(t *testing.T) {
 
 	// Create some metadata files
 	numFiles := 50
-	for i := 0; i < numFiles; i++ {
+	for i := range numFiles {
 		fileName := filepath.Join("movies", "movie_"+fmt.Sprintf("%d", i)+".mkv")
 
 		// Create a dummy metadata object
@@ -133,13 +145,13 @@ func TestFindFilesToDelete_RepairTriggered(t *testing.T) {
 		"deleted.mkv":   "path/to/meta/deleted.mkv.meta",
 	}
 
-	filesInUse := map[string]string{
-		"movie.mkv": "path/to/lib/link",
-		// repairing.mkv is MISSING from filesInUse (simulating ARR deleted it)
-		// deleted.mkv is MISSING from filesInUse
+	filesInLibrary := map[string]bool{
+		"movie.mkv": true,
+		// repairing.mkv is MISSING from filesInLibrary (simulating ARR deleted it)
+		// deleted.mkv is MISSING from filesInLibrary
 	}
 
-	toDelete := worker.findFilesToDelete(context.Background(), dbRecords, metaFileSet, filesInUse)
+	toDelete := worker.findFilesToDelete(context.Background(), dbRecords, metaFileSet, filesInLibrary)
 
 	// repairing.mkv should be protected by its status
 	// deleted.mkv should be marked for deletion

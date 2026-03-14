@@ -2,6 +2,7 @@ import type {
 	ActiveStream,
 	APIResponse,
 	AuthResponse,
+	ChangeOwnPasswordRequest,
 	FileHealth,
 	FileMetadata,
 	FuseStatus,
@@ -11,10 +12,12 @@ import type {
 	HealthPriority,
 	HealthStats,
 	HealthWorkerStatus,
+	ImportHistoryItem,
 	ImportStatusResponse,
 	LibrarySyncStatus,
 	ManualScanRequest,
 	PoolMetrics,
+	QueueHistoricalStatsResponse,
 	QueueItem,
 	QueueStats,
 	SABnzbdAddResponse,
@@ -22,7 +25,6 @@ import type {
 	SystemBrowseResponse,
 	UploadNZBLnkResponse,
 	User,
-	UserAdminUpdateRequest,
 } from "../types/api";
 import type {
 	ConfigResponse,
@@ -37,6 +39,15 @@ import type {
 	ProviderTestResponse,
 	ProviderUpdateRequest,
 } from "../types/config";
+import type { UpdateChannel, UpdateStatusResponse } from "../types/update";
+
+export interface LogEntry {
+	time: string;
+	level: string;
+	msg: string;
+	attrs?: Record<string, unknown>;
+	[key: string]: unknown;
+}
 
 export class APIError extends Error {
 	public status: number;
@@ -62,6 +73,7 @@ export class APIClient {
 
 		const config: RequestInit = {
 			credentials: "include", // Include cookies for Safari compatibility
+			cache: "no-store",
 			headers: {
 				"Content-Type": "application/json",
 				...options.headers,
@@ -73,19 +85,31 @@ export class APIClient {
 			const response = await fetch(url, config);
 
 			if (!response.ok) {
+				if (response.status === 401) {
+					window.dispatchEvent(new CustomEvent("api:unauthorized"));
+				}
 				const errorData = await response.json();
-				throw new APIError(
-					response.status,
-					errorData.message || `HTTP ${response.status}: ${response.statusText}`,
-					errorData.details || "",
-				);
+				const errorMessage =
+					(typeof errorData.error === "object" ? errorData.error?.message : errorData.error) ||
+					errorData.message ||
+					`HTTP ${response.status}: ${response.statusText}`;
+				const errorDetails =
+					(typeof errorData.error === "object" ? errorData.error?.details : "") ||
+					errorData.details ||
+					"";
+
+				throw new APIError(response.status, errorMessage, errorDetails);
 			}
 
 			const data: APIResponse<T> = await response.json();
 
 			if (!data.success) {
 				// Handle error in the success=false format
-				throw new APIError(response.status, data.error || "API request failed", "");
+				const errorMessage =
+					(typeof data.error === "object" ? data.error?.message : data.error) ||
+					"API request failed";
+				const errorDetails = (typeof data.error === "object" ? data.error?.details : "") || "";
+				throw new APIError(response.status, errorMessage, errorDetails);
 			}
 
 			return data.data as T;
@@ -105,6 +129,7 @@ export class APIClient {
 
 		const config: RequestInit = {
 			credentials: "include", // Include cookies for Safari compatibility
+			cache: "no-store",
 			headers: {
 				"Content-Type": "application/json",
 				...options.headers,
@@ -116,15 +141,26 @@ export class APIClient {
 			const response = await fetch(url, config);
 
 			if (!response.ok) {
+				if (response.status === 401) {
+					window.dispatchEvent(new CustomEvent("api:unauthorized"));
+				}
 				// Try to parse error response
 				try {
 					const errorData = await response.json();
-					throw new APIError(
-						response.status,
-						errorData.message || `HTTP ${response.status}: ${response.statusText}`,
-						errorData.details || "",
-					);
-				} catch {
+					const errorMessage =
+						(typeof errorData.error === "object" ? errorData.error?.message : errorData.error) ||
+						errorData.message ||
+						`HTTP ${response.status}: ${response.statusText}`;
+					const errorDetails =
+						(typeof errorData.error === "object" ? errorData.error?.details : "") ||
+						errorData.details ||
+						"";
+
+					throw new APIError(response.status, errorMessage, errorDetails);
+				} catch (e) {
+					if (e instanceof APIError) {
+						throw e;
+					}
 					// If parsing fails, use generic error
 					throw new APIError(
 						response.status,
@@ -138,7 +174,11 @@ export class APIClient {
 
 			if (!data.success) {
 				// Handle error in the success=false format
-				throw new APIError(response.status, data.error || "API request failed", "");
+				const errorMessage =
+					(typeof data.error === "object" ? data.error?.message : data.error) ||
+					"API request failed";
+				const errorDetails = (typeof data.error === "object" ? data.error?.details : "") || "";
+				throw new APIError(response.status, errorMessage, errorDetails);
 			}
 
 			return data;
@@ -162,7 +202,7 @@ export class APIClient {
 	}) {
 		const searchParams = new URLSearchParams();
 		if (params?.limit) searchParams.set("limit", params.limit.toString());
-		if (params?.offset) searchParams.set("offset", params.offset.toString());
+		if (params?.offset !== undefined) searchParams.set("offset", params.offset.toString());
 		if (params?.status) searchParams.set("status", params.status);
 		if (params?.since) searchParams.set("since", params.since);
 		if (params?.search) searchParams.set("search", params.search);
@@ -213,6 +253,13 @@ export class APIClient {
 		});
 	}
 
+	async updateQueueItemPriority(id: number, priority: 1 | 2 | 3) {
+		return this.request<QueueItem>(`/queue/${id}/priority`, {
+			method: "PATCH",
+			body: JSON.stringify({ priority }),
+		});
+	}
+
 	async cancelBulkQueueItems(ids: number[]) {
 		return this.request<{
 			cancelled_count: number;
@@ -228,6 +275,16 @@ export class APIClient {
 
 	async getQueueStats() {
 		return this.request<QueueStats>("/queue/stats");
+	}
+
+	async getQueueHistory(days?: number) {
+		const searchParams = new URLSearchParams();
+		if (days) searchParams.set("days", days.toString());
+
+		const query = searchParams.toString();
+		return this.request<QueueHistoricalStatsResponse>(
+			`/queue/stats/history${query ? `?${query}` : ""}`,
+		);
 	}
 
 	async clearCompletedQueue(olderThan?: string) {
@@ -272,7 +329,7 @@ export class APIClient {
 	}) {
 		const searchParams = new URLSearchParams();
 		if (params?.limit) searchParams.set("limit", params.limit.toString());
-		if (params?.offset) searchParams.set("offset", params.offset.toString());
+		if (params?.offset !== undefined) searchParams.set("offset", params.offset.toString());
 		if (params?.status) searchParams.set("status", params.status);
 		if (params?.since) searchParams.set("since", params.since);
 		if (params?.search) searchParams.set("search", params.search);
@@ -366,7 +423,7 @@ export class APIClient {
 		});
 	}
 
-	async regenerateSymlinks() {
+	async regenerateSymlinks(filePaths?: string[]) {
 		return this.request<{
 			message: string;
 			files_processed: number;
@@ -377,6 +434,7 @@ export class APIClient {
 			completed_at: string;
 		}>("/health/regenerate-symlinks", {
 			method: "POST",
+			body: JSON.stringify({ file_paths: filePaths }),
 		});
 	}
 
@@ -441,6 +499,18 @@ export class APIClient {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ priority }),
+		});
+	}
+
+	async unmaskHealthItem(id: number) {
+		return this.request<{
+			message: string;
+			id: number;
+			file_path: string;
+			updated_at: string;
+			health_data: FileHealth;
+		}>(`/health/${id}/unmask`, {
+			method: "POST",
 		});
 	}
 
@@ -539,17 +609,8 @@ export class APIClient {
 		});
 	}
 
-	async getUsers(params?: { limit?: number; offset?: number }) {
-		const searchParams = new URLSearchParams();
-		if (params?.limit) searchParams.set("limit", params.limit.toString());
-		if (params?.offset) searchParams.set("offset", params.offset.toString());
-
-		const query = searchParams.toString();
-		return this.request<User[]>(`/users${query ? `?${query}` : ""}`);
-	}
-
-	async updateUserAdmin(userId: string, data: UserAdminUpdateRequest) {
-		return this.request<AuthResponse>(`/users/${userId}/admin`, {
+	async changeOwnPassword(data: ChangeOwnPasswordRequest) {
+		return this.request<AuthResponse>("/user/password", {
 			method: "PUT",
 			body: JSON.stringify(data),
 		});
@@ -654,6 +715,26 @@ export class APIClient {
 		return this.request<SystemBrowseResponse>(`/system/browse${query ? `?${query}` : ""}`);
 	}
 
+	async resetSystemStats(params?: {
+		duration?: string;
+		reset_peak?: boolean;
+		reset_totals?: boolean;
+		reset_history?: boolean;
+		reset_queue?: boolean;
+	}) {
+		const searchParams = new URLSearchParams();
+		if (params?.duration) searchParams.set("duration", params.duration);
+		if (params?.reset_peak) searchParams.set("reset_peak", "true");
+		if (params?.reset_totals) searchParams.set("reset_totals", "true");
+		if (params?.reset_history) searchParams.set("reset_history", "true");
+		if (params?.reset_queue) searchParams.set("reset_queue", "true");
+
+		const query = searchParams.toString();
+		return this.request<{ message: string }>(`/system/stats/reset${query ? `?${query}` : ""}`, {
+			method: "POST",
+		});
+	}
+
 	// Provider endpoints
 	async testProvider(data: ProviderTestRequest) {
 		return this.request<ProviderTestResponse>("/providers/test", {
@@ -708,6 +789,14 @@ export class APIClient {
 
 	async getScanStatus() {
 		return this.request<ScanStatusResponse>("/import/scan/status");
+	}
+
+	async getImportHistory(limit?: number) {
+		const searchParams = new URLSearchParams();
+		if (limit) searchParams.set("limit", limit.toString());
+
+		const query = searchParams.toString();
+		return this.request<ImportHistoryItem[]>(`/import/history${query ? `?${query}` : ""}`);
 	}
 
 	async cancelScan() {
@@ -803,6 +892,25 @@ export class APIClient {
 		});
 	}
 
+	async searchNZBByName(
+		name: string,
+		password?: string,
+		category?: string,
+		priority?: number,
+		relativePath?: string,
+	): Promise<{ queue_id: number; title: string; indexer: string }> {
+		return this.request("/queue/upload-by-name", {
+			method: "POST",
+			body: JSON.stringify({
+				name,
+				password: password || undefined,
+				category: category || undefined,
+				priority: priority ?? undefined,
+				relative_path: relativePath || undefined,
+			}),
+		});
+	}
+
 	async addTestQueueItem(size: "100MB" | "1GB" | "10GB") {
 		return this.request<APIResponse<QueueItem>>("/queue/test", {
 			method: "POST",
@@ -827,6 +935,33 @@ export class APIClient {
 			method: "POST",
 			body: JSON.stringify({}),
 		});
+	}
+
+	async forceStopFuseMount() {
+		return this.request<{ message: string }>("/fuse/force-stop", {
+			method: "POST",
+			body: JSON.stringify({}),
+		});
+	}
+
+	// Update endpoints
+	async checkUpdateStatus(channel: UpdateChannel): Promise<UpdateStatusResponse> {
+		return this.request<UpdateStatusResponse>(`/system/update/status?channel=${channel}`);
+	}
+
+	async applyUpdate(channel: UpdateChannel): Promise<{ message: string }> {
+		return this.request<{ message: string }>("/system/update/apply", {
+			method: "POST",
+			body: JSON.stringify({ channel }),
+		});
+	}
+
+	async getLogs(params?: { level?: string; limit?: number }): Promise<LogEntry[]> {
+		const searchParams = new URLSearchParams();
+		if (params?.level) searchParams.set("level", params.level);
+		if (params?.limit) searchParams.set("limit", params.limit.toString());
+		const query = searchParams.toString();
+		return this.request<LogEntry[]>(`/logs${query ? `?${query}` : ""}`);
 	}
 }
 

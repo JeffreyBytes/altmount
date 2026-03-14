@@ -1,14 +1,32 @@
 package api
 
 import (
+	"os"
+
 	"github.com/gofiber/fiber/v2"
 )
+
+// isDevMode returns true when running in development mode (APP_ENV=development or DEBUG=true).
+// In non-dev mode, internal error details are suppressed from API responses.
+func isDevMode() bool {
+	env := os.Getenv("APP_ENV")
+	return env == "development" || env == "dev" || os.Getenv("DEBUG") == "true"
+}
+
+// safeDetails returns the details string only in development mode,
+// preventing internal implementation details from leaking in production.
+func safeDetails(details string) string {
+	if isDevMode() {
+		return details
+	}
+	return ""
+}
 
 // Response builder functions for Fiber handlers.
 // These provide a unified interface for API responses.
 
 // RespondSuccess sends a successful response with data.
-func RespondSuccess(c *fiber.Ctx, data interface{}) error {
+func RespondSuccess(c *fiber.Ctx, data any) error {
 	return c.JSON(fiber.Map{
 		"success": true,
 		"data":    data,
@@ -16,7 +34,7 @@ func RespondSuccess(c *fiber.Ctx, data interface{}) error {
 }
 
 // RespondSuccessWithMeta sends a successful response with data and pagination metadata.
-func RespondSuccessWithMeta(c *fiber.Ctx, data interface{}, meta *APIMeta) error {
+func RespondSuccessWithMeta(c *fiber.Ctx, data any, meta *APIMeta) error {
 	return c.JSON(fiber.Map{
 		"success": true,
 		"data":    data,
@@ -25,7 +43,7 @@ func RespondSuccessWithMeta(c *fiber.Ctx, data interface{}, meta *APIMeta) error
 }
 
 // RespondCreated sends a 201 Created response with data.
-func RespondCreated(c *fiber.Ctx, data interface{}) error {
+func RespondCreated(c *fiber.Ctx, data any) error {
 	return c.Status(fiber.StatusCreated).JSON(fiber.Map{
 		"success": true,
 		"data":    data,
@@ -91,12 +109,14 @@ func RespondConflict(c *fiber.Ctx, message, details string) error {
 }
 
 // RespondInternalError sends a 500 Internal Server Error.
+// In production mode, internal details are suppressed to avoid leaking implementation info.
 func RespondInternalError(c *fiber.Ctx, message, details string) error {
-	return RespondError(c, fiber.StatusInternalServerError, ErrCodeInternalServer, message, details)
+	return RespondError(c, fiber.StatusInternalServerError, ErrCodeInternalServer, message, safeDetails(details))
 }
 
 // RespondServiceUnavailable sends a 503 Service Unavailable error.
 func RespondServiceUnavailable(c *fiber.Ctx, message, details string) error {
+	c.Set("Retry-After", "10")
 	return RespondError(c, fiber.StatusServiceUnavailable, "SERVICE_UNAVAILABLE", message, details)
 }
 

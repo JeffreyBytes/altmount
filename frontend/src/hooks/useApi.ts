@@ -32,7 +32,15 @@ export const useQueueStats = () => {
 	return useQuery({
 		queryKey: ["queue", "stats"],
 		queryFn: () => apiClient.getQueueStats(),
-		refetchInterval: 5000, // Refetch every 5 seconds
+	});
+};
+
+export const useQueueHistory = (days?: number) => {
+	return useQuery({
+		queryKey: ["queue", "history", days],
+		queryFn: () => apiClient.getQueueHistory(days),
+		// Refetch historical stats less frequently (every 5 minutes)
+		refetchInterval: 5 * 60 * 1000,
 	});
 };
 
@@ -89,6 +97,18 @@ export const useCancelQueueItem = () => {
 		onSuccess: () => {
 			queryClient.invalidateQueries({ queryKey: ["queue"] });
 			queryClient.invalidateQueries({ queryKey: ["queue-stats"] });
+		},
+	});
+};
+
+export const useUpdateQueueItemPriority = () => {
+	const queryClient = useQueryClient();
+
+	return useMutation({
+		mutationFn: ({ id, priority }: { id: number; priority: 1 | 2 | 3 }) =>
+			apiClient.updateQueueItemPriority(id, priority),
+		onSuccess: () => {
+			queryClient.invalidateQueries({ queryKey: ["queue"] });
 		},
 	});
 };
@@ -152,16 +172,7 @@ export const useHealth = (params?: {
 	return useQuery({
 		queryKey: ["health", params],
 		queryFn: () => apiClient.getHealth(params),
-		refetchInterval: (query) => {
-			// Use custom refetch interval if provided
-			if (params?.refetchInterval !== undefined) {
-				return params.refetchInterval;
-			}
-			// Otherwise, poll every 5 seconds if any items are in "checking" status
-			const data = query.state.data?.data;
-			const hasCheckingItems = data?.some((item) => item.status === "checking");
-			return hasCheckingItems ? 5000 : false;
-		},
+		refetchInterval: false,
 	});
 };
 
@@ -184,7 +195,6 @@ export const useHealthStats = () => {
 	return useQuery({
 		queryKey: ["health", "stats"],
 		queryFn: () => apiClient.getHealthStats(),
-		refetchInterval: 5000, // Refetch every 5 seconds
 	});
 };
 
@@ -204,7 +214,7 @@ export const useRegenerateSymlinks = () => {
 	const queryClient = useQueryClient();
 
 	return useMutation({
-		mutationFn: () => apiClient.regenerateSymlinks(),
+		mutationFn: (filePaths?: string[]) => apiClient.regenerateSymlinks(filePaths),
 		onSuccess: () => {
 			queryClient.invalidateQueries({ queryKey: ["health"] });
 			queryClient.invalidateQueries({ queryKey: ["health", "stats"] });
@@ -353,6 +363,17 @@ export const useSetHealthPriority = () => {
 	});
 };
 
+export const useUnmaskHealthItem = () => {
+	const queryClient = useQueryClient();
+
+	return useMutation({
+		mutationFn: (id: number) => apiClient.unmaskHealthItem(id),
+		onSuccess: () => {
+			queryClient.invalidateQueries({ queryKey: ["health"] });
+		},
+	});
+};
+
 export const useCancelHealthCheck = () => {
 	const queryClient = useQueryClient();
 
@@ -398,6 +419,14 @@ export const useCancelScan = () => {
 			// Invalidate scan status to update immediately
 			queryClient.invalidateQueries({ queryKey: ["scan", "status"] });
 		},
+	});
+};
+
+export const useImportHistory = (limit?: number, refetchInterval?: number) => {
+	return useQuery({
+		queryKey: ["import", "history", limit],
+		queryFn: () => apiClient.getImportHistory(limit),
+		refetchInterval: refetchInterval,
 	});
 };
 
@@ -495,6 +524,30 @@ export const useUploadNZBLnks = () => {
 	});
 };
 
+export const useSearchNZBByName = () => {
+	const queryClient = useQueryClient();
+
+	return useMutation({
+		mutationFn: ({
+			name,
+			password,
+			category,
+			priority,
+			relativePath,
+		}: {
+			name: string;
+			password?: string;
+			category?: string;
+			priority?: number;
+			relativePath?: string;
+		}) => apiClient.searchNZBByName(name, password, category, priority, relativePath),
+		onSuccess: () => {
+			queryClient.invalidateQueries({ queryKey: ["queue"] });
+			queryClient.invalidateQueries({ queryKey: ["queue", "stats"] });
+		},
+	});
+};
+
 export const useAddTestQueueItem = () => {
 	const queryClient = useQueryClient();
 
@@ -512,6 +565,27 @@ export const useSystemBrowse = (path?: string) => {
 	return useQuery({
 		queryKey: ["system", "browse", path],
 		queryFn: () => apiClient.getSystemBrowse(path),
+	});
+};
+
+export const useResetSystemStats = () => {
+	const queryClient = useQueryClient();
+
+	return useMutation({
+		mutationFn: (params?: {
+			duration?: string;
+			reset_peak?: boolean;
+			reset_totals?: boolean;
+			reset_history?: boolean;
+			reset_queue?: boolean;
+		}) => apiClient.resetSystemStats(params),
+		onSuccess: () => {
+			// Invalidate all relevant metrics and history to show reset values
+			queryClient.invalidateQueries({ queryKey: ["system", "pool", "metrics"] });
+			queryClient.invalidateQueries({ queryKey: ["queue", "stats"] });
+			queryClient.invalidateQueries({ queryKey: ["queue", "history"] });
+			queryClient.invalidateQueries({ queryKey: ["import", "history"] });
+		},
 	});
 };
 

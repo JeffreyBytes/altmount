@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net/http"
 	"net/url"
 	"os"
@@ -20,6 +21,9 @@ import (
 	"github.com/javi11/altmount/internal/arrs"
 	"github.com/javi11/altmount/internal/config"
 	"github.com/javi11/altmount/internal/database"
+	"github.com/javi11/altmount/internal/httpclient"
+	"github.com/javi11/altmount/internal/importer/utils"
+	"github.com/javi11/altmount/internal/pathutil"
 )
 
 // getDefaultCategory returns the Default category from config or a fallback
@@ -368,8 +372,14 @@ func (s *Server) handleSABnzbdAddUrl(c *fiber.Ctx) error {
 		return s.writeSABnzbdErrorFiber(c, "URL parameter 'name' required")
 	}
 
-	// Download NZB file from URL
-	resp, err := http.Get(nzbUrl)
+	// Download NZB file from URL using a proper HTTP client with a User-Agent header.
+	// Some indexers (e.g. NZBHydra2) return 403 on redirect if User-Agent is missing.
+	req, err := http.NewRequestWithContext(c.Context(), http.MethodGet, nzbUrl, nil)
+	if err != nil {
+		return s.writeSABnzbdErrorFiber(c, "Failed to build NZB download request")
+	}
+	req.Header.Set("User-Agent", "altmount")
+	resp, err := httpclient.NewLong().Do(req)
 	if err != nil {
 		return s.writeSABnzbdErrorFiber(c, "Failed to download NZB from URL")
 	}
@@ -398,12 +408,30 @@ func (s *Server) handleSABnzbdAddUrl(c *fiber.Ctx) error {
 		return s.writeSABnzbdErrorFiber(c, "Failed to create upload directory")
 	}
 
-	// Extract filename from URL or use default
-	filename := "downloaded.nzb"
-	if u, err := url.Parse(nzbUrl); err == nil && u.Path != "" {
-		if base := filepath.Base(u.Path); base != "" && base != "." {
-			filename = base
+	// Extract filename: prefer Content-Disposition header, then URL path, then default
+	filename := ""
+
+	// 1. Try Content-Disposition header
+	if cd := resp.Header.Get("Content-Disposition"); cd != "" {
+		if _, params, err := mime.ParseMediaType(cd); err == nil {
+			if fn := params["filename"]; fn != "" {
+				filename = filepath.Base(fn)
+			}
 		}
+	}
+
+	// 2. Fall back to URL path
+	if filename == "" {
+		if u, err := url.Parse(nzbUrl); err == nil && u.Path != "" {
+			if base := filepath.Base(u.Path); base != "" && base != "." {
+				filename = base
+			}
+		}
+	}
+
+	// 3. Final fallback
+	if filename == "" {
+		filename = "downloaded.nzb"
 	}
 
 	// Ensure .nzb extension
@@ -619,20 +647,60 @@ func (s *Server) handleSABnzbdHistory(c *fiber.Ctx) error {
 		}
 	}
 
-	// Get completed items
+	// Get completed items from active queue (not yet deleted)
 	completedStatus := database.QueueStatusCompleted
-	completed, err := s.queueRepo.ListQueueItems(c.Context(), &completedStatus, "", categoryFilter, limit, start, "updated_at", "desc")
+	completedQueueItems, err := s.queueRepo.ListQueueItems(c.Context(), &completedStatus, "", categoryFilter, limit, start, "updated_at", "desc")
 	if err != nil {
-		return s.writeSABnzbdErrorFiber(c, "Failed to get completed items")
+		return s.writeSABnzbdErrorFiber(c, "Failed to get completed items from queue")
 	}
 
-	// Get total completed count
-	totalCompleted, err := s.queueRepo.CountQueueItems(c.Context(), &completedStatus, "", categoryFilter)
+	// Get recent items from persistent history (buffer for Sonarr)
+	// We look back 24 hours to be safe
+	recentHistory, err := s.queueRepo.ListRecentImportHistory(c.Context(), 1440, categoryFilter)
 	if err != nil {
-		totalCompleted = len(completed)
+		recentHistory = []*database.ImportHistory{} // Fallback
 	}
 
-	// Get failed items
+	// Combine and deduplicate by NZB Name
+	// Priority goes to items still in the queue (as they have more metadata)
+	seenNames := make(map[string]bool)
+	finalItems := make([]*database.ImportQueueItem, 0)
+
+	for _, item := range completedQueueItems {
+		name := filepath.Base(item.NzbPath)
+		if !seenNames[name] {
+			finalItems = append(finalItems, item)
+			seenNames[name] = true
+		}
+	}
+
+	for _, item := range recentHistory {
+		// Only include items that haven't been successfully moved to the library yet.
+		// Once library_path is populated, Sonarr has already finished its work.
+		if item.LibraryPath != nil && *item.LibraryPath != "" {
+			continue
+		}
+
+		if !seenNames[item.NzbName] {
+			id := item.ID
+			if item.NzbID != nil {
+				id = *item.NzbID
+			}
+			qItem := &database.ImportQueueItem{
+				ID:          id,
+				NzbPath:     item.NzbName,
+				Status:      database.QueueStatusCompleted,
+				FileSize:    &item.FileSize,
+				CompletedAt: &item.CompletedAt,
+				Category:    item.Category,
+				StoragePath: &item.VirtualPath,
+			}
+			finalItems = append(finalItems, qItem)
+			seenNames[item.NzbName] = true
+		}
+	}
+
+	// Get failed items from active queue
 	failedStatus := database.QueueStatusFailed
 	failed, err := s.queueRepo.ListQueueItems(c.Context(), &failedStatus, "", categoryFilter, limit, start, "updated_at", "desc")
 	if err != nil {
@@ -646,18 +714,16 @@ func (s *Server) handleSABnzbdHistory(c *fiber.Ctx) error {
 	}
 
 	// Combine and convert to SABnzbd format
-	slots := make([]SABnzbdHistorySlot, 0, len(completed)+len(failed))
+	slots := make([]SABnzbdHistorySlot, 0, len(finalItems)+len(failed))
 	index := 0
 	var totalBytes int64
 
-	for _, item := range completed {
-		// Calculate category-specific base path for this item
+	for _, item := range finalItems {
+		// Calculate category-specific base path
 		itemBasePath := s.calculateItemBasePath()
-		slot := ToSABnzbdHistorySlot(item, start+index, itemBasePath)
-		slog.DebugContext(c.Context(), "Reporting completed item to SABnzbd API",
-			"name", slot.Name,
-			"path", slot.Path,
-			"status", slot.Status)
+		finalPath := s.calculateHistoryStoragePath(item, itemBasePath)
+
+		slot := ToSABnzbdHistorySlot(item, start+index, finalPath)
 		slots = append(slots, slot)
 		totalBytes += slot.Bytes
 		index++
@@ -665,7 +731,9 @@ func (s *Server) handleSABnzbdHistory(c *fiber.Ctx) error {
 	for _, item := range failed {
 		// Calculate category-specific base path for this item
 		itemBasePath := s.calculateItemBasePath()
-		slot := ToSABnzbdHistorySlot(item, start+index, itemBasePath)
+		finalPath := s.calculateHistoryStoragePath(item, itemBasePath)
+
+		slot := ToSABnzbdHistorySlot(item, start+index, finalPath)
 		slots = append(slots, slot)
 		totalBytes += slot.Bytes
 		index++
@@ -680,7 +748,7 @@ func (s *Server) handleSABnzbdHistory(c *fiber.Ctx) error {
 			WeekSize:  "0 B",
 			Version:   "4.5.0",
 			DaySize:   "0 B",
-			Noofslots: totalCompleted + totalFailed,
+			Noofslots: len(finalItems) + totalFailed,
 		},
 	}
 
@@ -708,13 +776,21 @@ func (s *Server) handleSABnzbdHistoryDelete(c *fiber.Ctx) error {
 	// Delete from queue (history items are still queue items with completed/failed status)
 	err = s.queueRepo.RemoveFromQueue(c.Context(), id)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
+		// If not in active queue, it might be in persistent history
+		histErr := s.queueRepo.RemoveFromHistoryByNzbID(c.Context(), id)
+
+		if errors.Is(err, sql.ErrNoRows) && histErr == nil {
 			return s.writeSABnzbdResponseFiber(c, SABnzbdDeleteResponse{
 				Status: true,
 			})
 		}
 
-		return s.writeSABnzbdErrorFiber(c, fmt.Sprintf("Failed to delete history item: %v", err))
+		if !errors.Is(err, sql.ErrNoRows) {
+			return s.writeSABnzbdErrorFiber(c, fmt.Sprintf("Failed to delete history item: %v", err))
+		}
+	} else {
+		// Also remove from history if it existed there
+		_ = s.queueRepo.RemoveFromHistoryByNzbID(c.Context(), id)
 	}
 
 	response := SABnzbdDeleteResponse{
@@ -745,8 +821,12 @@ func (s *Server) handleSABnzbdStatus(c *fiber.Ctx) error {
 	}
 
 	// Get actual disk space for storage directory
-	tempDir := filepath.Join(os.TempDir(), "altmount-uploads")
-	diskFree, diskTotal := getDiskSpace(tempDir)
+	cfg := s.configManager.GetConfig()
+	targetPath := cfg.MountPath
+	if targetPath == "" {
+		targetPath = filepath.Join(os.TempDir(), "altmount-uploads")
+	}
+	diskFree, diskTotal := getDiskSpace(targetPath)
 
 	response := SABnzbdStatusResponse{
 		Status:          true,
@@ -793,7 +873,7 @@ func (s *Server) handleSABnzbdGetConfig(c *fiber.Ctx) error {
 		// Build misc configuration
 		itemBasePath := s.calculateItemBasePath()
 		sabnzbdConfig.Misc = SABnzbdMiscConfig{
-			CompleteDir:            itemBasePath,
+			CompleteDir:            pathutil.JoinAbsPath(itemBasePath, cfg.SABnzbd.CompleteDir),
 			PreCheck:               0,
 			HistoryRetention:       "",
 			HistoryRetentionOption: "all",
@@ -965,7 +1045,7 @@ func (s *Server) validateSABnzbdCategory(category string) (string, error) {
 }
 
 // writeSABnzbdResponseFiber writes a successful SABnzbd-compatible response (Fiber version)
-func (s *Server) writeSABnzbdResponseFiber(c *fiber.Ctx, data interface{}) error {
+func (s *Server) writeSABnzbdResponseFiber(c *fiber.Ctx, data any) error {
 	return c.Status(200).JSON(data)
 }
 
@@ -1036,6 +1116,73 @@ func (s *Server) calculateItemBasePath() string {
 
 	// Return base path with category folder
 	return basePath
+}
+
+// calculateHistoryStoragePath calculates the final storage path to report to SABnzbd history for Sonarr/Radarr.
+func (s *Server) calculateHistoryStoragePath(item *database.ImportQueueItem, basePath string) string {
+	if s.configManager == nil || item.StoragePath == nil || *item.StoragePath == "" {
+		return basePath
+	}
+
+	cfg := s.configManager.GetConfig()
+	storagePath := *item.StoragePath
+
+	// Determine category folder
+	category := config.DefaultCategoryName
+	if item.Category != nil && *item.Category != "" {
+		category = *item.Category
+	}
+
+	// 1. Get the internal relative path (relative to FUSE mount)
+	relPath := strings.TrimPrefix(storagePath, "/")
+
+	// 2. Strip any existing /complete or /category prefix from the internal path to start clean
+	if cfg.SABnzbd.CompleteDir != "" {
+		completeDir := strings.Trim(filepath.ToSlash(cfg.SABnzbd.CompleteDir), "/")
+		if after, ok := strings.CutPrefix(relPath, completeDir+"/"); ok {
+			relPath = after
+		} else if relPath == completeDir {
+			relPath = ""
+		}
+	}
+	if after, ok := strings.CutPrefix(relPath, category+"/"); ok {
+		relPath = after
+	} else if relPath == category {
+		relPath = ""
+	}
+
+	// 3. Determine the base path for reporting
+	// For NONE, use MountPath. For others, use ImportDir.
+	finalBasePath := cfg.MountPath
+	if cfg.Import.ImportStrategy != config.ImportStrategyNone {
+		if cfg.Import.ImportDir != nil && *cfg.Import.ImportDir != "" {
+			finalBasePath = *cfg.Import.ImportDir
+		}
+	}
+
+	// 4. Build the clean, isolated reporting path
+	// Construct: Base + CompleteDir + Category + RelPath
+	pathParts := []string{finalBasePath}
+	if cfg.SABnzbd.CompleteDir != "" {
+		pathParts = append(pathParts, strings.Trim(cfg.SABnzbd.CompleteDir, "/"))
+	}
+	pathParts = append(pathParts, category)
+	pathParts = append(pathParts, relPath)
+
+	fullStoragePath := filepath.Join(pathParts...)
+	fullStoragePath = filepath.ToSlash(filepath.Clean(fullStoragePath))
+
+	// Return the full file path for SYMLINK/STRM to help Arrs find it immediately.
+	// Otherwise return directory.
+	if cfg.Import.ImportStrategy == config.ImportStrategySYMLINK || cfg.Import.ImportStrategy == config.ImportStrategySTRM {
+		return fullStoragePath
+	}
+
+	if utils.HasPopularExtension(fullStoragePath) {
+		return filepath.Dir(fullStoragePath)
+	}
+
+	return fullStoragePath
 }
 
 // normalizeURL normalizes a URL for comparison by removing trailing slashes

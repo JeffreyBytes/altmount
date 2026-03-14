@@ -19,6 +19,7 @@ import (
 // ConfigManager interface defines methods for configuration management
 type ConfigManager interface {
 	GetConfig() *config.Config
+	GetConfigGetter() config.ConfigGetter
 	UpdateConfig(config *config.Config) error
 	ValidateConfig(config *config.Config) error
 	ValidateConfigUpdate(config *config.Config) error
@@ -83,6 +84,16 @@ func RegisterLogLevelHandler(ctx context.Context, configManager *config.Manager,
 }
 
 // handleGetConfig returns the current configuration
+//
+//	@Summary		Get configuration
+//	@Description	Returns the current AltMount configuration with sensitive values masked.
+//	@Tags			Config
+//	@Produce		json
+//	@Success		200	{object}	APIResponse{data=ConfigAPIResponse}
+//	@Failure		503	{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/config [get]
 func (s *Server) handleGetConfig(c *fiber.Ctx) error {
 	if s.configManager == nil {
 		return RespondServiceUnavailable(c, "Configuration management not available", "CONFIG_UNAVAILABLE")
@@ -101,6 +112,18 @@ func (s *Server) handleGetConfig(c *fiber.Ctx) error {
 }
 
 // handleUpdateConfig updates the entire configuration
+//
+//	@Summary		Update configuration
+//	@Description	Replaces the entire AltMount configuration. Triggers restart if required.
+//	@Tags			Config
+//	@Accept			json
+//	@Produce		json
+//	@Param			body	body		object{}	true	"Complete configuration object"
+//	@Success		200		{object}	APIResponse
+//	@Failure		400		{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/config [put]
 func (s *Server) handleUpdateConfig(c *fiber.Ctx) error {
 	if s.configManager == nil {
 		return RespondServiceUnavailable(c, "Configuration management not available", "CONFIG_UNAVAILABLE")
@@ -149,6 +172,19 @@ func (s *Server) handleUpdateConfig(c *fiber.Ctx) error {
 }
 
 // handlePatchConfigSection updates a specific configuration section
+//
+//	@Summary		Patch configuration section
+//	@Description	Updates a specific named section of the configuration (e.g. import, sabnzbd, rclone).
+//	@Tags			Config
+//	@Accept			json
+//	@Produce		json
+//	@Param			section	path		string		true	"Config section name"
+//	@Param			body	body		object{}	true	"Section configuration"
+//	@Success		200		{object}	APIResponse
+//	@Failure		400		{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/config/{section} [patch]
 func (s *Server) handlePatchConfigSection(c *fiber.Ctx) error {
 	if s.configManager == nil {
 		return RespondServiceUnavailable(c, "Configuration management not available", "CONFIG_UNAVAILABLE")
@@ -172,8 +208,10 @@ func (s *Server) handlePatchConfigSection(c *fiber.Ctx) error {
 	// Decode into the specific section based on the URL parameter
 	var err error
 	switch section {
-	case "webdav", "api", "auth", "database", "metadata", "streaming", "health", "rclone", "import", "log", "sabnzbd", "arrs", "fuse", "system", "mount_path":
+	case "webdav", "api", "auth", "database", "metadata", "streaming", "health", "rclone", "import", "log", "sabnzbd", "arrs", "fuse", "segment_cache", "system", "mount_path", "mount", "providers", "stremio":
 		err = c.BodyParser(newConfig)
+		// BodyParser will map fields like "profiler_enabled" from JSON to the root of newConfig
+		// because Config struct has it with `json:"profiler_enabled"`.
 	default:
 		return RespondValidationError(c, fmt.Sprintf("Unknown configuration section: %s", section), "INVALID_SECTION")
 	}
@@ -208,8 +246,8 @@ func (s *Server) handlePatchConfigSection(c *fiber.Ctx) error {
 		return RespondInternalError(c, "Failed to save configuration", err.Error())
 	}
 
-	// Try to start RC server if RClone section was updated or full config update
-	if section == "rclone" || section == "" {
+	// Try to start RC server if RClone/mount section was updated or full config update
+	if section == "rclone" || section == "mount" || section == "" {
 		s.startRCServerIfNeeded(c.Context())
 	}
 
@@ -221,6 +259,16 @@ func (s *Server) handlePatchConfigSection(c *fiber.Ctx) error {
 }
 
 // handleReloadConfig reloads configuration from file
+//
+//	@Summary		Reload configuration
+//	@Description	Reloads the AltMount configuration from disk without restarting.
+//	@Tags			Config
+//	@Produce		json
+//	@Success		200	{object}	APIResponse
+//	@Failure		500	{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/config/reload [post]
 func (s *Server) handleReloadConfig(c *fiber.Ctx) error {
 	if s.configManager == nil {
 		return RespondServiceUnavailable(c, "Configuration management not available", "CONFIG_UNAVAILABLE")
@@ -240,6 +288,18 @@ func (s *Server) handleReloadConfig(c *fiber.Ctx) error {
 }
 
 // handleValidateConfig validates configuration without applying changes
+//
+//	@Summary		Validate configuration
+//	@Description	Validates a configuration object without saving it.
+//	@Tags			Config
+//	@Accept			json
+//	@Produce		json
+//	@Param			body	body		object{}	true	"Configuration to validate"
+//	@Success		200		{object}	APIResponse
+//	@Failure		400		{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/config/validate [post]
 func (s *Server) handleValidateConfig(c *fiber.Ctx) error {
 	if s.configManager == nil {
 		return RespondServiceUnavailable(c, "Configuration management not available", "CONFIG_UNAVAILABLE")
@@ -282,6 +342,18 @@ func (s *Server) handleValidateConfig(c *fiber.Ctx) error {
 // Provider Management Handlers
 
 // handleTestProvider tests NNTP provider connectivity
+//
+//	@Summary		Test NNTP provider
+//	@Description	Tests NNTP provider connectivity with given credentials, returning RTT on success.
+//	@Tags			Providers
+//	@Accept			json
+//	@Produce		json
+//	@Param			body	body		ProviderTestRequest		true	"Provider credentials to test"
+//	@Success		200		{object}	APIResponse{data=TestProviderResponse}
+//	@Failure		400		{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/providers/test [post]
 func (s *Server) handleTestProvider(c *fiber.Ctx) error {
 	if s.configManager == nil {
 		return RespondServiceUnavailable(c, "Configuration management not available", "CONFIG_UNAVAILABLE")
@@ -289,6 +361,7 @@ func (s *Server) handleTestProvider(c *fiber.Ctx) error {
 
 	// Decode test request
 	var testReq struct {
+		ProviderID  string `json:"provider_id"`
 		Host        string `json:"host"`
 		Port        int    `json:"port"`
 		Username    string `json:"username"`
@@ -335,13 +408,51 @@ func (s *Server) handleTestProvider(c *fiber.Ctx) error {
 		})
 	}
 
+	// If test is successful and we have a provider ID, update the config with RTT
+	rtt := result.RTT.Milliseconds()
+	if testReq.ProviderID != "" {
+		currentConfig := s.configManager.GetConfig()
+		newConfig := currentConfig.DeepCopy()
+		updated := false
+		for i, p := range newConfig.Providers {
+			if p.ID == testReq.ProviderID {
+				newConfig.Providers[i].LastRTTMs = rtt
+				updated = true
+				slog.DebugContext(c.Context(), "Updating provider latency",
+					"provider_id", testReq.ProviderID,
+					"rtt_ms", rtt)
+				break
+			}
+		}
+
+		if updated {
+			if err := s.configManager.UpdateConfig(newConfig); err == nil {
+				if err := s.configManager.SaveConfig(); err != nil {
+					slog.WarnContext(c.Context(), "Failed to save config after updating RTT", "error", err)
+				}
+			}
+		}
+	}
+
 	return RespondSuccess(c, TestProviderResponse{
 		Success: true,
-		RTTMs:   result.RTT.Milliseconds(),
+		RTTMs:   rtt,
 	})
 }
 
 // handleCreateProvider creates a new NNTP provider
+//
+//	@Summary		Create NNTP provider
+//	@Description	Adds a new NNTP provider to the configuration.
+//	@Tags			Providers
+//	@Accept			json
+//	@Produce		json
+//	@Param			body	body		ProviderCreateRequest	true	"Provider details"
+//	@Success		201		{object}	APIResponse{data=ProviderAPIResponse}
+//	@Failure		400		{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/providers [post]
 func (s *Server) handleCreateProvider(c *fiber.Ctx) error {
 	if s.configManager == nil {
 		return RespondServiceUnavailable(c, "Configuration management not available", "CONFIG_UNAVAILABLE")
@@ -436,12 +547,27 @@ func (s *Server) handleCreateProvider(c *fiber.Ctx) error {
 		Enabled:          newProvider.Enabled != nil && *newProvider.Enabled,
 		IsBackupProvider: newProvider.IsBackupProvider != nil && *newProvider.IsBackupProvider,
 		InflightRequests: newProvider.InflightRequests,
+		LastRTTMs:        newProvider.LastRTTMs,
 	}
 
 	return RespondSuccess(c, response)
 }
 
 // handleUpdateProvider updates an existing NNTP provider
+//
+//	@Summary		Update NNTP provider
+//	@Description	Updates an existing NNTP provider by ID.
+//	@Tags			Providers
+//	@Accept			json
+//	@Produce		json
+//	@Param			id		path		string					true	"Provider ID"
+//	@Param			body	body		ProviderUpdateRequest	true	"Fields to update"
+//	@Success		200		{object}	APIResponse{data=ProviderAPIResponse}
+//	@Failure		400		{object}	APIResponse
+//	@Failure		404		{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/providers/{id} [put]
 func (s *Server) handleUpdateProvider(c *fiber.Ctx) error {
 	if s.configManager == nil {
 		return RespondServiceUnavailable(c, "Configuration management not available", "CONFIG_UNAVAILABLE")
@@ -574,12 +700,24 @@ func (s *Server) handleUpdateProvider(c *fiber.Ctx) error {
 		Enabled:          provider.Enabled != nil && *provider.Enabled,
 		IsBackupProvider: provider.IsBackupProvider != nil && *provider.IsBackupProvider,
 		InflightRequests: provider.InflightRequests,
+		LastRTTMs:        provider.LastRTTMs,
 	}
 
 	return RespondSuccess(c, response)
 }
 
 // handleDeleteProvider removes an NNTP provider
+//
+//	@Summary		Delete NNTP provider
+//	@Description	Removes an NNTP provider by ID from the configuration.
+//	@Tags			Providers
+//	@Produce		json
+//	@Param			id	path	string	true	"Provider ID"
+//	@Success		204
+//	@Failure		404	{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/providers/{id} [delete]
 func (s *Server) handleDeleteProvider(c *fiber.Ctx) error {
 	if s.configManager == nil {
 		return RespondServiceUnavailable(c, "Configuration management not available", "CONFIG_UNAVAILABLE")
@@ -638,6 +776,18 @@ func (s *Server) handleDeleteProvider(c *fiber.Ctx) error {
 }
 
 // handleReorderProviders reorders the provider list
+//
+//	@Summary		Reorder NNTP providers
+//	@Description	Sets the priority order of NNTP providers.
+//	@Tags			Providers
+//	@Accept			json
+//	@Produce		json
+//	@Param			body	body		ProviderReorderRequest	true	"Ordered list of provider IDs"
+//	@Success		200		{object}	APIResponse
+//	@Failure		400		{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/providers/reorder [put]
 func (s *Server) handleReorderProviders(c *fiber.Ctx) error {
 	if s.configManager == nil {
 		return RespondServiceUnavailable(c, "Configuration management not available", "CONFIG_UNAVAILABLE")
@@ -715,6 +865,7 @@ func (s *Server) handleReorderProviders(c *fiber.Ctx) error {
 			Enabled:          p.Enabled != nil && *p.Enabled,
 			IsBackupProvider: p.IsBackupProvider != nil && *p.IsBackupProvider,
 			InflightRequests: p.InflightRequests,
+			LastRTTMs:        p.LastRTTMs,
 		}
 	}
 
@@ -727,6 +878,16 @@ func (s *Server) startRCServerIfNeeded(ctx context.Context) {
 	if s.mountService == nil {
 		slog.WarnContext(ctx, "Mount service not available, cannot start RC server")
 		return
+	}
+
+	// Only start RC server for rclone-based mount types
+	if s.configManager != nil {
+		cfg := s.configManager.GetConfig()
+		if cfg != nil && cfg.MountType != config.MountTypeRClone && cfg.MountType != config.MountTypeRCloneExternal {
+			slog.DebugContext(ctx, "Skipping RC server start, mount_type is not rclone-based",
+				"mount_type", string(cfg.MountType))
+			return
+		}
 	}
 
 	// Use the mount service to start the RC server (non-blocking for config save)
@@ -787,7 +948,7 @@ func (s *Server) getAPIKeyForConfig(c *fiber.Ctx) string {
 
 	// If no authenticated user and arrs service didn't return one, try manual DB check
 	if s.userRepo != nil {
-		users, err := s.userRepo.ListUsers(c.Context(), 1, 0)
+		users, err := s.userRepo.GetAllUsers(c.Context())
 		if err == nil && len(users) > 0 && users[0].APIKey != nil {
 			return *users[0].APIKey
 		}

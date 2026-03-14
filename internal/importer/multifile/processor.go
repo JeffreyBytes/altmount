@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/javi11/altmount/internal/importer/filesystem"
@@ -16,9 +17,17 @@ import (
 	"github.com/javi11/altmount/internal/metadata"
 	metapb "github.com/javi11/altmount/internal/metadata/proto"
 	"github.com/javi11/altmount/internal/pool"
+	"github.com/javi11/altmount/internal/progress"
+	concpool "github.com/sourcegraph/conc/pool"
 )
 
-// ProcessRegularFiles processes multiple regular files
+// maxConcurrentFileValidations limits parallel file validations to avoid
+// overwhelming the NNTP connection pool (each file uses up to maxValidationGoroutines connections).
+const maxConcurrentFileValidations = 4
+
+// ProcessRegularFiles processes multiple regular files.
+// Returns the virtual paths of all metadata files successfully written, plus any error.
+// writtenPaths is populated even on partial failure (first-error mode).
 func ProcessRegularFiles(
 	ctx context.Context,
 	virtualDir string,
@@ -31,20 +40,19 @@ func ProcessRegularFiles(
 	segmentSamplePercentage int,
 	allowedFileExtensions []string,
 	timeout time.Duration,
-) error {
+	tracker *progress.Tracker,
+) ([]string, error) {
 	if len(files) == 0 {
-		return nil
+		return nil, nil
 	}
 
-	// Validate file extensions before processing
 	if !utils.HasAllowedFilesInRegular(files, allowedFileExtensions) {
 		slog.WarnContext(ctx, "No files with allowed extensions found",
 			"allowed_extensions", allowedFileExtensions,
 			"file_count", len(files))
-		return fmt.Errorf("no files with allowed extensions found (allowed: %v)", allowedFileExtensions)
+		return nil, fmt.Errorf("no files with allowed extensions found (allowed: %v)", allowedFileExtensions)
 	}
 
-	// Convert PAR2 files to metadata format (shared across all files)
 	var par2Refs []*metapb.Par2FileReference
 	for _, par2File := range par2Files {
 		par2Refs = append(par2Refs, &metapb.Par2FileReference{
@@ -54,85 +62,107 @@ func ProcessRegularFiles(
 		})
 	}
 
-	for _, file := range files {
-		parentPath, filename := filesystem.DetermineFileLocation(file, virtualDir)
+	// Pre-compute per-file segment offsets for cumulative progress reporting.
+	// Each file gets an OffsetTracker so parallel validations report additive progress.
+	var totalSegments int
+	fileOffsets := make([]int, len(files))
+	for i, f := range files {
+		fileOffsets[i] = totalSegments
+		totalSegments += len(f.Segments)
+	}
 
-		// Ensure parent directory exists
-		if err := filesystem.EnsureDirectoryExists(parentPath, metadataService); err != nil {
-			return fmt.Errorf("failed to create parent directory %s: %w", parentPath, err)
+	var writtenPaths []string
+	var writtenPathsMu sync.Mutex
+
+	pl := concpool.New().WithErrors().WithFirstError().WithMaxGoroutines(maxConcurrentFileValidations)
+
+	for i, file := range files {
+		fileOffset := fileOffsets[i]
+		var fileTracker progress.ProgressTracker
+		if tracker != nil && totalSegments > 0 {
+			fileTracker = progress.NewOffsetTracker(tracker, fileOffset, totalSegments)
 		}
+		pl.Go(func() error {
+			parentPath, filename := filesystem.DetermineFileLocation(file, virtualDir)
 
-		// Create virtual file path
-		virtualPath := filepath.Join(parentPath, filename)
-		virtualPath = strings.ReplaceAll(virtualPath, string(filepath.Separator), "/")
-
-		// Check if file already exists and is healthy
-		if existingMeta, err := metadataService.ReadFileMetadata(virtualPath); err == nil && existingMeta != nil {
-			if existingMeta.Status == metapb.FileStatus_FILE_STATUS_HEALTHY {
-				slog.InfoContext(ctx, "Skipping re-import of healthy file",
-					"file", filename,
-					"virtual_path", virtualPath)
-				continue
+			if err := filesystem.EnsureDirectoryExists(parentPath, metadataService); err != nil {
+				return fmt.Errorf("failed to create parent directory %s: %w", parentPath, err)
 			}
-		}
 
-		// Double check if this specific file is allowed
-		if !utils.IsAllowedFile(filename, file.Size, allowedFileExtensions) {
-			continue
-		}
+			virtualPath := filepath.Join(parentPath, filename)
+			virtualPath = strings.ReplaceAll(virtualPath, string(filepath.Separator), "/")
 
-		// Validate segments
-		if err := validation.ValidateSegmentsForFile(
-			ctx,
-			filename,
-			file.Size,
-			file.Segments,
-			file.Encryption,
-			poolManager,
-			maxValidationGoroutines,
-			segmentSamplePercentage,
-			nil, // No progress callback for multi-file imports
-			timeout,
-		); err != nil {
-			return err
-		}
+			if existingMeta, err := metadataService.ReadFileMetadata(virtualPath); err == nil && existingMeta != nil {
+				if existingMeta.Status == metapb.FileStatus_FILE_STATUS_HEALTHY {
+					slog.InfoContext(ctx, "Skipping re-import of healthy file",
+						"file", filename,
+						"virtual_path", virtualPath)
+					return nil
+				}
+			}
 
-		// Create file metadata
-		fileMeta := metadataService.CreateFileMetadata(
-			file.Size,
-			nzbPath,
-			metapb.FileStatus_FILE_STATUS_HEALTHY,
-			file.Segments,
-			file.Encryption,
-			file.Password,
-			file.Salt,
-			file.AesKey,
-			file.AesIv,
-			file.ReleaseDate.Unix(),
-			par2Refs,
-			file.NzbdavID,
-		)
+			if !utils.IsAllowedFile(filename, file.Size, allowedFileExtensions) {
+				return nil
+			}
 
-		// Delete old metadata if exists (simple collision handling)
-		metadataPath := metadataService.GetMetadataFilePath(virtualPath)
-		if _, err := os.Stat(metadataPath); err == nil {
-			_ = metadataService.DeleteFileMetadata(virtualPath)
-		}
+			if err := validation.ValidateSegmentsForFile(
+				ctx,
+				filename,
+				file.Size,
+				file.Segments,
+				file.Encryption,
+				poolManager,
+				maxValidationGoroutines,
+				segmentSamplePercentage,
+				fileTracker,
+				timeout,
+			); err != nil {
+				return err
+			}
 
-		// Write file metadata to disk
-		if err := metadataService.WriteFileMetadata(virtualPath, fileMeta); err != nil {
-			return fmt.Errorf("failed to write metadata for file %s: %w", filename, err)
-		}
+			fileMeta := metadataService.CreateFileMetadata(
+				file.Size,
+				nzbPath,
+				metapb.FileStatus_FILE_STATUS_HEALTHY,
+				file.Segments,
+				file.Encryption,
+				file.Password,
+				file.Salt,
+				file.AesKey,
+				file.AesIv,
+				file.ReleaseDate.Unix(),
+				par2Refs,
+				file.NzbdavID,
+			)
 
-		slog.DebugContext(ctx, "Created metadata file",
-			"file", filename,
-			"virtual_path", virtualPath,
-			"size", file.Size)
+			metadataPath := metadataService.GetMetadataFilePath(virtualPath)
+			if _, err := os.Stat(metadataPath); err == nil {
+				_ = metadataService.DeleteFileMetadata(virtualPath)
+			}
+
+			if err := metadataService.WriteFileMetadata(virtualPath, fileMeta); err != nil {
+				return fmt.Errorf("failed to write metadata for file %s: %w", filename, err)
+			}
+
+			writtenPathsMu.Lock()
+			writtenPaths = append(writtenPaths, virtualPath)
+			writtenPathsMu.Unlock()
+
+			slog.DebugContext(ctx, "Created metadata file",
+				"file", filename,
+				"virtual_path", virtualPath,
+				"size", file.Size)
+			return nil
+		})
+	}
+
+	if err := pl.Wait(); err != nil {
+		return writtenPaths, err
 	}
 
 	slog.InfoContext(ctx, "Successfully processed regular files",
 		"virtual_dir", virtualDir,
 		"files", len(files))
 
-	return nil
+	return writtenPaths, nil
 }

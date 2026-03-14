@@ -29,7 +29,7 @@ func TestUsenetReader_Race_Close_GetBufferedOffset(t *testing.T) {
 		return nil, fmt.Errorf("mock error")
 	}
 
-	ur, err := NewUsenetReader(ctx, poolGetter, rg, 10)
+	ur, err := NewUsenetReader(ctx, poolGetter, rg, 10, nil, "", nil)
 	if err != nil {
 		t.Fatalf("Failed to create UsenetReader: %v", err)
 	}
@@ -39,7 +39,7 @@ func TestUsenetReader_Race_Close_GetBufferedOffset(t *testing.T) {
 	go func() {
 		defer close(done)
 		// Run for a bit to ensure we overlap with Close
-		for i := 0; i < 1000; i++ {
+		for range 1000 {
 			_ = ur.GetBufferedOffset()
 			time.Sleep(10 * time.Microsecond)
 		}

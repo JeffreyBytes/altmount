@@ -2,11 +2,15 @@ package api
 
 import (
 	"context"
+	"os"
 	"runtime"
+	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
+	"github.com/gofiber/fiber/v2/middleware/limiter"
 	"github.com/gofiber/fiber/v2/middleware/recover"
 	"github.com/javi11/altmount/internal/arrs"
 	"github.com/javi11/altmount/internal/auth"
@@ -15,9 +19,11 @@ import (
 	"github.com/javi11/altmount/internal/importer"
 	"github.com/javi11/altmount/internal/metadata"
 	"github.com/javi11/altmount/internal/nzbfilesystem"
+	"github.com/javi11/altmount/internal/nzbfilesystem/segcache"
 	"github.com/javi11/altmount/internal/pool"
 	"github.com/javi11/altmount/internal/progress"
 	"github.com/javi11/altmount/internal/rclone"
+	"github.com/javi11/altmount/internal/version"
 	"github.com/javi11/altmount/pkg/rclonecli"
 )
 
@@ -56,6 +62,9 @@ type Server struct {
 	progressBroadcaster *progress.ProgressBroadcaster
 	streamTracker       *StreamTracker
 	fuseManager         *FuseManager
+	segcacheMgr         *segcache.Manager // nil if segment cache is disabled
+	logFilePath         string
+	ready               atomic.Bool
 }
 
 // NewServer creates a new API server that can optionally register routes on the provided mux (for backwards compatibility)
@@ -76,6 +85,7 @@ func NewServer(
 	mountService *rclone.MountService,
 	progressBroadcaster *progress.ProgressBroadcaster,
 	streamTracker *StreamTracker,
+	segcacheMgr *segcache.Manager,
 ) *Server {
 	if config == nil {
 		config = DefaultConfig()
@@ -99,7 +109,8 @@ func NewServer(
 		startTime:           time.Now(),
 		progressBroadcaster: progressBroadcaster,
 		streamTracker:       streamTracker,
-		fuseManager:         NewFuseManager(),
+		segcacheMgr:         segcacheMgr,
+		fuseManager:         NewFuseManager(newMountFactory(nzbFilesystem, configManager, streamTracker)),
 	}
 
 	return server
@@ -113,6 +124,21 @@ func (s *Server) SetHealthWorker(healthWorker *health.HealthWorker) {
 // SetLibrarySyncWorker sets the library sync worker reference for the server
 func (s *Server) SetLibrarySyncWorker(librarySyncWorker *health.LibrarySyncWorker) {
 	s.librarySyncWorker = librarySyncWorker
+}
+
+// SetLogFilePath sets the path to the JSON log file used by the logs endpoints.
+func (s *Server) SetLogFilePath(path string) {
+	s.logFilePath = path
+}
+
+// SetReady sets the server as ready to accept requests
+func (s *Server) SetReady(ready bool) {
+	s.ready.Store(ready)
+}
+
+// IsReady returns true if the server is ready to accept requests
+func (s *Server) IsReady() bool {
+	return s.ready.Load()
 }
 
 // SetRcloneClient sets the rclone client reference for the server
@@ -129,22 +155,50 @@ func (s *Server) GetProgressBroadcaster() *progress.ProgressBroadcaster {
 func (s *Server) SetupRoutes(app *fiber.App) {
 	app.Use("/sabnzbd", s.handleSABnzbd)
 
-	api := app.Group(s.config.Prefix)
-	// Import do not need user authentication
-	api.Post("/import/file", s.handleManualImportFile)
-	api.Post("/import/nzbdav", s.handleImportNzbdav)
-	api.Post("/import/nzbdav/reset", s.handleResetNzbdavImportStatus)
-	api.Get("/import/nzbdav/status", s.handleGetNzbdavImportStatus)
-	api.Delete("/import/nzbdav", s.handleCancelNzbdavImport)
-	api.Post("/arrs/webhook", s.handleArrsWebhook)
+	// Stremio addon endpoints — key-based auth, no JWT required.
+	// CORS must be open (*) so Stremio can install the addon from any origin.
+	stremioGroup := app.Group("/stremio", cors.New(cors.Config{
+		AllowOrigins: "*",
+		AllowHeaders: "Origin, Content-Type, Accept",
+		AllowMethods: "GET, OPTIONS",
+	}))
+	stremioGroup.Get("/:key/manifest.json", s.handleStremioManifest)
+	stremioGroup.Get("/:key/stream/:type/:id.json", s.handleStremioAddonStream)
+	stremioGroup.Get("/:key/play", s.handleStremioAddonPlay)
 
-	// Apply global middleware
-	api.Use(cors.New())
+	api := app.Group(s.config.Prefix)
+
+	// Public endpoints (authentication handled inside or not required)
+	api.Post("/import/file", s.handleManualImportFile)
+	api.Post("/arrs/webhook", s.handleArrsWebhook)
+	api.Post("/nzb/streams", s.handleNzbStreams)
+
+	cfg := s.configManager.GetConfig()
+
+	// Apply global middleware — derive allowed CORS origins from COOKIE_DOMAIN env var,
+	// explicit api.allowed_origins config, or fall back to wildcard.
+	corsOrigins := "*"
+
+	if cookieDomain := os.Getenv("COOKIE_DOMAIN"); cookieDomain != "" {
+		// Allow both http and https on the configured domain
+		corsOrigins = "http://" + cookieDomain + ",https://" + cookieDomain
+	}
+
+	if cfg != nil && len(cfg.API.AllowedOrigins) > 0 {
+		// Explicit config overrides the env-derived value
+		corsOrigins = strings.Join(cfg.API.AllowedOrigins, ",")
+	}
+
+	api.Use(cors.New(cors.Config{
+		AllowOrigins:     corsOrigins,
+		AllowHeaders:     "Origin, Content-Type, Accept, Authorization",
+		AllowMethods:     "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+		AllowCredentials: true,
+	}))
 	api.Use(recover.New())
 
 	// Apply JWT authentication middleware globally except for public auth routes
 	// Only apply if login is required (default: true)
-	cfg := s.configManager.GetConfig()
 	loginRequired := true // Default to true if not set
 	if cfg != nil && cfg.Auth.LoginRequired != nil {
 		loginRequired = *cfg.Auth.LoginRequired
@@ -166,10 +220,18 @@ func (s *Server) SetupRoutes(app *fiber.App) {
 		}
 	}
 
+	// NZBDav Imports (now protected by JWT auth)
+	api.Post("/import/nzbdav", s.handleImportNzbdav)
+	api.Post("/import/nzbdav/reset", s.handleResetNzbdavImportStatus)
+	api.Get("/import/nzbdav/status", s.handleGetNzbdavImportStatus)
+	api.Delete("/import/nzbdav", s.handleCancelNzbdavImport)
+
 	// Queue endpoints
 	api.Get("/queue", s.handleListQueue)
 	api.Get("/queue/stats", s.handleGetQueueStats)
-	api.Get("/queue/progress/stream", s.handleProgressStream) // SSE endpoint for real-time progress
+	api.Get("/queue/stats/history", s.handleGetQueueHistoricalStats)
+	api.Get("/queue/stream", s.handleQueueStream)   // SSE endpoint for real-time queue updates
+	api.Get("/health/stream", s.handleHealthStream) // SSE endpoint for real-time health updates
 	api.Delete("/queue/completed", s.handleClearCompletedQueue)
 	api.Delete("/queue/failed", s.handleClearFailedQueue)
 	api.Delete("/queue/pending", s.handleClearPendingQueue)
@@ -178,11 +240,13 @@ func (s *Server) SetupRoutes(app *fiber.App) {
 	api.Post("/queue/bulk/cancel", s.handleCancelQueueBulk)
 	api.Post("/queue/upload", s.handleUploadToQueue)
 	api.Post("/queue/upload-nzblnk", s.handleUploadNZBLnk)
+	api.Post("/queue/upload-by-name", s.handleSearchNZBByName)
 	api.Post("/queue/test", s.handleAddTestQueueItem)
 	api.Get("/queue/:id", s.handleGetQueue)
 	api.Delete("/queue/:id", s.handleDeleteQueue)
 	api.Post("/queue/:id/retry", s.handleRetryQueue)
 	api.Post("/queue/:id/cancel", s.handleCancelQueue)
+	api.Patch("/queue/:id/priority", s.handleUpdateQueueItemPriority)
 	api.Get("/queue/:id/download", s.handleDownloadNZB)
 
 	// Health endpoints
@@ -194,10 +258,11 @@ func (s *Server) SetupRoutes(app *fiber.App) {
 	api.Get("/health/stats", s.handleGetHealthStats)
 	api.Delete("/health/cleanup", s.handleCleanupHealth)
 	api.Post("/health/reset-all", s.handleResetAllHealthChecks)
-	api.Post("/health/regenerate-symlinks", s.handleRegenerateSymlinks)
+	api.Post("/health/regenerate-symlinks", s.handleRegenerateLibraryFiles)
 	api.Post("/health/check", s.handleAddHealthCheck)
 	api.Get("/health/worker/status", s.handleGetHealthWorkerStatus)
 	api.Post("/health/:id/repair", s.handleRepairHealth)
+	api.Post("/health/:id/unmask", s.handleUnmaskHealth)
 	api.Post("/health/:id/check-now", s.handleDirectHealthCheck)
 	api.Post("/health/:id/priority", s.handleSetHealthPriority)
 	api.Post("/health/:id/cancel", s.handleCancelHealthCheck)
@@ -220,15 +285,25 @@ func (s *Server) SetupRoutes(app *fiber.App) {
 	// Note: /files/stream is handled by StreamHandler at HTTP server level
 
 	api.Post("/import/scan", s.handleStartManualScan)
+	api.Get("/logs", s.handleGetLogs)
+	// Note: /logs/stream is handled by ServeLogsSSE at HTTP server level (bypasses adaptor)
+
 	api.Get("/import/scan/status", s.handleGetScanStatus)
 	api.Delete("/import/scan", s.handleCancelScan)
+	api.Get("/import/history", s.handleGetImportHistory)
+	api.Delete("/import/history", s.handleClearImportHistory)
 	// System endpoints
 	api.Get("/system/stats", s.handleGetSystemStats)
 	api.Get("/system/health", s.handleGetSystemHealth)
 	api.Get("/system/browse", s.handleSystemBrowse)
 	api.Get("/system/pool/metrics", s.handleGetPoolMetrics)
+	api.Post("/system/stats/reset", s.handleResetSystemStats)
 	api.Post("/system/cleanup", s.handleSystemCleanup)
 	api.Post("/system/restart", s.handleSystemRestart)
+
+	// Update endpoints
+	api.Get("/system/update/status", s.handleGetUpdateStatus)
+	api.Post("/system/update/apply", s.handleApplyUpdate)
 
 	api.Get("/config", s.handleGetConfig)
 	api.Put("/config", s.handleUpdateConfig)
@@ -239,6 +314,7 @@ func (s *Server) SetupRoutes(app *fiber.App) {
 	// FUSE endpoints
 	api.Post("/fuse/start", s.handleStartFuseMount)
 	api.Post("/fuse/stop", s.handleStopFuseMount)
+	api.Post("/fuse/force-stop", s.handleForceStopFuseMount)
 	api.Get("/fuse/status", s.handleGetFuseStatus)
 
 	// Provider management endpoints
@@ -259,9 +335,25 @@ func (s *Server) SetupRoutes(app *fiber.App) {
 	api.Post("/arrs/download-client/register", s.handleRegisterArrsDownloadClients)
 	api.Post("/arrs/download-client/test", s.handleTestArrsDownloadClients)
 
-	// Direct authentication endpoints (converted to native Fiber)
-	api.Post("/auth/login", s.handleDirectLogin)
-	api.Post("/auth/register", s.handleRegister)
+	// Direct authentication endpoints — rate-limited to prevent brute-force attacks
+	authLimiter := limiter.New(limiter.Config{
+		Max:        10,
+		Expiration: 1 * time.Minute,
+		KeyGenerator: func(c *fiber.Ctx) string {
+			return c.IP()
+		},
+		LimitReached: func(c *fiber.Ctx) error {
+			return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{
+				"success": false,
+				"error": fiber.Map{
+					"code":    "TOO_MANY_REQUESTS",
+					"message": "Too many login attempts. Please wait a minute before trying again.",
+				},
+			})
+		},
+	})
+	api.Post("/auth/login", authLimiter, s.handleDirectLogin)
+	api.Post("/auth/register", authLimiter, s.handleRegister)
 	api.Get("/auth/registration-status", s.handleCheckRegistration)
 	api.Get("/auth/config", s.handleGetAuthConfig)
 
@@ -270,21 +362,7 @@ func (s *Server) SetupRoutes(app *fiber.App) {
 	api.Post("/user/refresh", s.handleAuthRefresh)
 	api.Post("/user/logout", s.handleAuthLogout)
 	api.Post("/user/api-key/regenerate", s.handleRegenerateAPIKey)
-
-	// Admin endpoints - apply RequireAdmin middleware to this group
-	if loginRequired && s.authService != nil && s.userRepo != nil {
-		tokenService := s.authService.TokenService()
-		if tokenService != nil {
-			adminRoutes := api.Group("/admin")
-			adminRoutes.Use(auth.RequireAdmin(tokenService, s.userRepo))
-			adminRoutes.Get("/users", s.handleListUsers)
-			adminRoutes.Put("/users/:user_id/admin", s.handleUpdateUserAdmin)
-		}
-	}
-
-	// Legacy admin endpoints (kept for backward compatibility, admin check inside handlers)
-	api.Get("/users", s.handleListUsers)
-	api.Put("/users/:user_id/admin", s.handleUpdateUserAdmin)
+	api.Put("/user/password", s.handleChangeOwnPassword)
 }
 
 // Shutdown shuts down the API server and its managed resources
@@ -295,6 +373,16 @@ func (s *Server) Shutdown(ctx context.Context) {
 }
 
 // handleGetActiveStreams handles GET /api/files/active-streams
+//
+//	@Summary		List active streams
+//	@Description	Returns all currently active NZB file streams. Optionally filter by type=file.
+//	@Tags			Files
+//	@Produce		json
+//	@Param			type	query		string	false	"Filter by source type (e.g. file)"
+//	@Success		200		{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/files/active-streams [get]
 func (s *Server) handleGetActiveStreams(c *fiber.Ctx) error {
 	if s.streamTracker == nil {
 		return c.Status(200).JSON(fiber.Map{
@@ -329,6 +417,8 @@ func (s *Server) handleGetActiveStreams(c *fiber.Ctx) error {
 func (s *Server) getSystemInfo() SystemInfoResponse {
 	uptime := time.Since(s.startTime)
 	return SystemInfoResponse{
+		Version:   version.Version,
+		GitCommit: version.GitCommit,
 		StartTime: s.startTime,
 		Uptime:    uptime.String(),
 		GoVersion: runtime.Version(),
@@ -380,6 +470,18 @@ func (s *Server) checkSystemHealth(ctx context.Context) SystemHealthResponse {
 }
 
 // Library sync handler methods
+
+// handleGetLibrarySyncStatus handles GET /api/health/library-sync/status
+//
+//	@Summary		Get library sync status
+//	@Description	Returns the current status of the library sync worker.
+//	@Tags			Health
+//	@Produce		json
+//	@Success		200	{object}	APIResponse
+//	@Failure		503	{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/health/library-sync/status [get]
 func (s *Server) handleGetLibrarySyncStatus(c *fiber.Ctx) error {
 	if s.librarySyncWorker == nil {
 		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
@@ -391,6 +493,17 @@ func (s *Server) handleGetLibrarySyncStatus(c *fiber.Ctx) error {
 	return handlers.handleGetLibrarySyncStatus(c)
 }
 
+// handleStartLibrarySync handles POST /api/health/library-sync/start
+//
+//	@Summary		Start library sync
+//	@Description	Triggers a library sync operation to reconcile the file system with the database.
+//	@Tags			Health
+//	@Produce		json
+//	@Success		200	{object}	APIResponse
+//	@Failure		503	{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/health/library-sync/start [post]
 func (s *Server) handleStartLibrarySync(c *fiber.Ctx) error {
 	if s.librarySyncWorker == nil {
 		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
@@ -402,6 +515,17 @@ func (s *Server) handleStartLibrarySync(c *fiber.Ctx) error {
 	return handlers.handleStartLibrarySync(c)
 }
 
+// handleCancelLibrarySync handles POST /api/health/library-sync/cancel
+//
+//	@Summary		Cancel library sync
+//	@Description	Cancels an in-progress library sync operation.
+//	@Tags			Health
+//	@Produce		json
+//	@Success		200	{object}	APIResponse
+//	@Failure		503	{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/health/library-sync/cancel [post]
 func (s *Server) handleCancelLibrarySync(c *fiber.Ctx) error {
 	if s.librarySyncWorker == nil {
 		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
@@ -413,6 +537,17 @@ func (s *Server) handleCancelLibrarySync(c *fiber.Ctx) error {
 	return handlers.handleCancelLibrarySync(c)
 }
 
+// handleDryRunLibrarySync handles POST /api/health/library-sync/dry-run
+//
+//	@Summary		Dry-run library sync
+//	@Description	Simulates a library sync and returns what would be changed without applying it.
+//	@Tags			Health
+//	@Produce		json
+//	@Success		200	{object}	APIResponse{data=DryRunSyncResult}
+//	@Failure		503	{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/health/library-sync/dry-run [post]
 func (s *Server) handleDryRunLibrarySync(c *fiber.Ctx) error {
 	if s.librarySyncWorker == nil {
 		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
@@ -424,12 +559,33 @@ func (s *Server) handleDryRunLibrarySync(c *fiber.Ctx) error {
 	return handlers.handleDryRunLibrarySync(c)
 }
 
+// handleGetSyncNeeded handles GET /api/health/library-sync/needed
+//
+//	@Summary		Check if library sync is needed
+//	@Description	Returns whether a library sync is needed based on current configuration state.
+//	@Tags			Health
+//	@Produce		json
+//	@Success		200	{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/health/library-sync/needed [get]
 func (s *Server) handleGetSyncNeeded(c *fiber.Ctx) error {
 	handlers := NewLibrarySyncHandlers(s.librarySyncWorker, s.configManager)
 	return handlers.handleGetSyncNeeded(c)
 }
 
 // handleKillStream handles DELETE /api/files/active-streams/:id
+//
+//	@Summary		Kill active stream
+//	@Description	Terminates an active NZB file stream by ID.
+//	@Tags			Files
+//	@Produce		json
+//	@Param			id	path		string	true	"Stream ID"
+//	@Success		200	{object}	APIResponse
+//	@Failure		404	{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/files/active-streams/{id} [delete]
 func (s *Server) handleKillStream(c *fiber.Ctx) error {
 	id := c.Params("id")
 	if s.streamTracker == nil {
@@ -453,6 +609,15 @@ func (s *Server) handleKillStream(c *fiber.Ctx) error {
 }
 
 // handleGetStreamHistory handles GET /api/files/streams/history
+//
+//	@Summary		Get stream history
+//	@Description	Returns a history of recently completed NZB file streams.
+//	@Tags			Files
+//	@Produce		json
+//	@Success		200	{object}	APIResponse
+//	@Security		BearerAuth
+//	@Security		ApiKeyAuth
+//	@Router			/files/streams/history [get]
 func (s *Server) handleGetStreamHistory(c *fiber.Ctx) error {
 	if s.streamTracker == nil {
 		return c.JSON(fiber.Map{

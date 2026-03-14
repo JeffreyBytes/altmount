@@ -14,9 +14,12 @@ import (
 	"github.com/javi11/altmount/internal/metadata"
 	metapb "github.com/javi11/altmount/internal/metadata/proto"
 	"github.com/javi11/altmount/internal/pool"
+	"github.com/javi11/altmount/internal/progress"
 )
 
-// ProcessSingleFile processes a single file (creates and writes metadata)
+// ProcessSingleFile processes a single file (creates and writes metadata).
+// Returns (virtualDir, writtenMetaPath, error). writtenMetaPath is the virtual path of the
+// metadata file written to disk; it is empty if no metadata was written.
 func ProcessSingleFile(
 	ctx context.Context,
 	virtualDir string,
@@ -29,13 +32,14 @@ func ProcessSingleFile(
 	segmentSamplePercentage int,
 	allowedFileExtensions []string,
 	timeout time.Duration,
-) (string, error) {
+	tracker *progress.Tracker,
+) (string, string, error) {
 	// Validate file extension before processing
 	if !utils.HasAllowedFilesInRegular([]parser.ParsedFile{file}, allowedFileExtensions) {
 		slog.WarnContext(ctx, "File does not match allowed extensions",
 			"filename", file.Filename,
 			"allowed_extensions", allowedFileExtensions)
-		return "", fmt.Errorf("file '%s' does not match allowed extensions (allowed: %v)", file.Filename, allowedFileExtensions)
+		return "", "", fmt.Errorf("file '%s' does not match allowed extensions (allowed: %v)", file.Filename, allowedFileExtensions)
 	}
 
 	// Create virtual file path
@@ -48,13 +52,13 @@ func ProcessSingleFile(
 			slog.InfoContext(ctx, "Skipping re-import of healthy file",
 				"file", file.Filename,
 				"virtual_path", virtualFilePath)
-			return virtualDir, nil
+			return virtualDir, "", nil
 		}
 	}
 
 	// Double check if this specific file is allowed
 	if !utils.IsAllowedFile(file.Filename, file.Size, allowedFileExtensions) {
-		return "", fmt.Errorf("file '%s' is not allowed", file.Filename)
+		return "", "", fmt.Errorf("file '%s' is not allowed", file.Filename)
 	}
 
 	// Validate segments
@@ -67,10 +71,10 @@ func ProcessSingleFile(
 		poolManager,
 		maxValidationGoroutines,
 		segmentSamplePercentage,
-		nil, // No progress callback for single file imports
+		tracker,
 		timeout,
 	); err != nil {
-		return "", err
+		return "", "", err
 	}
 
 	// Convert PAR2 files to metadata format
@@ -101,7 +105,7 @@ func ProcessSingleFile(
 
 	// Write file metadata to disk
 	if err := metadataService.WriteFileMetadata(virtualFilePath, fileMeta); err != nil {
-		return "", fmt.Errorf("failed to write metadata for single file %s: %w", file.Filename, err)
+		return "", "", fmt.Errorf("failed to write metadata for single file %s: %w", file.Filename, err)
 	}
 
 	slog.InfoContext(ctx, "Successfully processed single file",
@@ -109,5 +113,5 @@ func ProcessSingleFile(
 		"virtual_path", virtualFilePath,
 		"size", file.Size)
 
-	return virtualDir, nil
+	return virtualDir, virtualFilePath, nil
 }

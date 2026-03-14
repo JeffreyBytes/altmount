@@ -22,7 +22,9 @@ import (
 	"github.com/javi11/altmount/internal/importer"
 	"github.com/javi11/altmount/internal/metadata"
 	"github.com/javi11/altmount/internal/nzbfilesystem"
+	"github.com/javi11/altmount/internal/nzbfilesystem/segcache"
 	"github.com/javi11/altmount/internal/pool"
+	"github.com/javi11/altmount/internal/usenet"
 	"github.com/javi11/altmount/internal/progress"
 	"github.com/javi11/altmount/internal/rclone"
 	"github.com/javi11/altmount/internal/webdav"
@@ -40,7 +42,9 @@ type repositorySet struct {
 // initializeDatabase creates and initializes the database
 func initializeDatabase(ctx context.Context, cfg *config.Config) (*database.DB, error) {
 	dbConfig := database.Config{
+		Type:         cfg.Database.Type,
 		DatabasePath: cfg.Database.Path,
+		DSN:          cfg.Database.DSN,
 	}
 
 	db, err := database.NewDB(dbConfig)
@@ -105,10 +109,17 @@ func initializeFilesystem(
 	poolManager pool.Manager,
 	configGetter config.ConfigGetter,
 	streamTracker nzbfilesystem.StreamTracker,
+	segcacheMgr *segcache.Manager,
 ) *nzbfilesystem.NzbFilesystem {
 	// Reset all in-progress file health checks on start up
 	if err := healthRepo.ResetFileAllChecking(ctx); err != nil {
 		slog.ErrorContext(ctx, "failed to reset in progress file health", "err", err)
+	}
+
+	// Build segment store from segment cache manager (nil if disabled)
+	var segmentStore usenet.SegmentStore
+	if segcacheMgr != nil {
+		segmentStore = segcacheMgr.Cache()
 	}
 
 	// Create metadata-based remote file handler
@@ -118,6 +129,7 @@ func initializeFilesystem(
 		poolManager,
 		configGetter,
 		streamTracker,
+		segmentStore,
 	)
 
 	// Create filesystem backed by metadata
@@ -196,36 +208,41 @@ func createFiberApp(ctx context.Context, cfg *config.Config) (*fiber.App, *bool)
 // setupRepositories creates all database repositories
 func setupRepositories(ctx context.Context, db *database.DB) *repositorySet {
 	dbConn := db.Connection()
+	d := db.Dialect()
 
 	return &repositorySet{
-		MainRepo:   database.NewRepository(dbConn),
-		MediaRepo:  database.NewMediaRepository(dbConn),
-		HealthRepo: database.NewHealthRepository(dbConn),
-		UserRepo:   database.NewUserRepository(dbConn),
+		MainRepo:   database.NewRepository(dbConn, d),
+		MediaRepo:  database.NewMediaRepository(dbConn, d),
+		HealthRepo: database.NewHealthRepository(dbConn, d),
+		UserRepo:   database.NewUserRepository(dbConn, d),
 	}
 }
 
-// setupAuthService creates and initializes the authentication service
-func setupAuthService(ctx context.Context, userRepo *database.UserRepository) *auth.Service {
-	authConfig := auth.LoadConfigFromEnv()
-	if authConfig == nil {
-		return nil
+// setupAuthService creates and initializes the authentication service.
+// When loginRequired is true, JWT_SECRET must be set or an error is returned.
+// When loginRequired is false, a missing JWT_SECRET is logged as a warning and nil is returned.
+func setupAuthService(ctx context.Context, userRepo *database.UserRepository, loginRequired bool) (*auth.Service, error) {
+	authConfig, err := auth.LoadConfigFromEnv()
+	if err != nil {
+		if loginRequired {
+			return nil, fmt.Errorf("failed to load auth configuration: %w", err)
+		}
+		slog.WarnContext(ctx, "Auth configuration not loaded (login is disabled)", "err", err)
+		return nil, nil
 	}
 
 	authService, err := auth.NewService(authConfig, userRepo)
 	if err != nil {
-		slog.WarnContext(ctx, "Failed to create authentication service", "err", err)
-		return nil
+		return nil, fmt.Errorf("failed to create authentication service: %w", err)
 	}
 
 	// Setup OAuth providers
 	if err := authService.SetupProviders(authConfig); err != nil {
-		slog.WarnContext(ctx, "Failed to setup OAuth providers", "err", err)
-		return nil
+		return nil, fmt.Errorf("failed to setup auth providers: %w", err)
 	}
 
 	slog.InfoContext(ctx, "Authentication service initialized")
-	return authService
+	return authService, nil
 }
 
 // setupStreamHandler creates the HTTP stream handler for file streaming
@@ -252,6 +269,7 @@ func setupAPIServer(
 	mountService *rclone.MountService,
 	progressBroadcaster *progress.ProgressBroadcaster,
 	streamTracker *api.StreamTracker,
+	segcacheMgr *segcache.Manager,
 ) *api.Server {
 	apiConfig := &api.Config{
 		Prefix: "/api",
@@ -274,6 +292,7 @@ func setupAPIServer(
 		mountService,
 		progressBroadcaster,
 		streamTracker,
+		segcacheMgr,
 	)
 
 	apiServer.SetupRoutes(app)
@@ -286,6 +305,35 @@ func setupAPIServer(
 	app.Get("/live", handleFiberHealth)
 
 	return apiServer
+}
+
+// initializeSegmentCache creates and starts the segment cache manager if enabled
+func initializeSegmentCache(ctx context.Context, cfg *config.Config) *segcache.Manager {
+	if cfg.SegmentCache.Enabled == nil || !*cfg.SegmentCache.Enabled {
+		slog.InfoContext(ctx, "Segment cache disabled")
+		return nil
+	}
+
+	mgrCfg := segcache.ManagerConfig{
+		Enabled:        true,
+		CachePath:      cfg.SegmentCache.CachePath,
+		MaxSizeBytes:   int64(cfg.SegmentCache.MaxSizeGB) * 1024 * 1024 * 1024,
+		ExpiryDuration: time.Duration(cfg.SegmentCache.ExpiryHours) * time.Hour,
+	}.WithDefaults()
+
+	mgr, err := segcache.NewManager(mgrCfg, slog.Default().With("component", "segcache"))
+	if err != nil {
+		slog.WarnContext(ctx, "Failed to create segment cache manager, running without segment cache", "error", err)
+		return nil
+	}
+
+	mgr.Start(ctx)
+	slog.InfoContext(ctx, "Segment cache enabled",
+		"cache_path", mgrCfg.CachePath,
+		"max_size_bytes", mgrCfg.MaxSizeBytes,
+		"expiry_duration", mgrCfg.ExpiryDuration)
+
+	return mgr
 }
 
 // setupWebDAV creates and configures the WebDAV handler
@@ -329,6 +377,8 @@ func startHealthWorker(
 	configManager *config.Manager,
 	rcloneClient rclonecli.RcloneRcClient,
 	arrsService *arrs.Service,
+	importerService importer.ImportService,
+	broadcaster *progress.ProgressBroadcaster,
 ) (*health.HealthWorker, *health.LibrarySyncWorker, error) {
 	// Create metadata service for health worker
 	metadataService := metadata.NewMetadataService(cfg.Metadata.RootPath)
@@ -347,7 +397,9 @@ func startHealthWorker(
 		healthRepo,
 		metadataService,
 		arrsService,
+		importerService,
 		configManager.GetConfigGetter(),
+		broadcaster,
 	)
 
 	// Create library sync worker (always create, but only start if enabled)
@@ -395,7 +447,7 @@ func startMountService(ctx context.Context, cfg *config.Config, mountService *rc
 }
 
 // createHTTPServer creates the HTTP server with routing
-func createHTTPServer(app *fiber.App, webdavHandler *webdav.Handler, streamHandler *api.StreamHandler, port int, profilerEnabled bool) *http.Server {
+func createHTTPServer(apiServer *api.Server, app *fiber.App, webdavHandler *webdav.Handler, streamHandler *api.StreamHandler, port int, profilerEnabled bool) *http.Server {
 	// Mount WebDAV handler directly (no Fiber adapter needed)
 	webdavHTTPHandler := webdavHandler.GetHTTPHandler()
 
@@ -409,6 +461,14 @@ func createHTTPServer(app *fiber.App, webdavHandler *webdav.Handler, streamHandl
 	mainHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
 
+		// Check if server is ready, but allow /live and /api/system/health
+		if !apiServer.IsReady() && path != "/live" && path != "/api/system/health" && !strings.HasPrefix(path, "/api/auth/config") {
+			w.Header().Set("Retry-After", "10")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte("503 Service Unavailable: Server is initializing"))
+			return
+		}
+
 		// Route profiler requests if enabled
 		if profilerEnabled && strings.HasPrefix(path, "/debug/pprof") {
 			http.DefaultServeMux.ServeHTTP(w, r)
@@ -418,6 +478,14 @@ func createHTTPServer(app *fiber.App, webdavHandler *webdav.Handler, streamHandl
 		// Route stream requests directly to stream handler
 		if strings.HasPrefix(path, "/api/files/stream") {
 			streamHTTPHandler.ServeHTTP(w, r)
+			return
+		}
+
+		// Route SSE log stream directly — bypasses adaptor.FiberApp which
+		// blocks forever on streaming responses (calls Response.Body() which
+		// reads the SSE pipe until EOF that never comes).
+		if path == "/api/logs/stream" {
+			apiServer.ServeLogsSSE(w, r)
 			return
 		}
 

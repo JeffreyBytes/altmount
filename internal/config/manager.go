@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -21,24 +23,47 @@ const MountProvider = "altmount"
 const DefaultCategoryName = "Default"
 const DefaultCategoryDir = "complete"
 
+// MountType represents the active mount system
+type MountType string
+
+const (
+	MountTypeNone           MountType = "none"
+	MountTypeRClone         MountType = "rclone"
+	MountTypeFuse           MountType = "fuse"
+	MountTypeRCloneExternal MountType = "rclone_external"
+)
+
 // Config represents the complete application configuration
 type Config struct {
-	WebDAV          WebDAVConfig     `yaml:"webdav" mapstructure:"webdav" json:"webdav"`
-	API             APIConfig        `yaml:"api" mapstructure:"api" json:"api"`
-	Auth            AuthConfig       `yaml:"auth" mapstructure:"auth" json:"auth"`
-	Database        DatabaseConfig   `yaml:"database" mapstructure:"database" json:"database"`
-	Metadata        MetadataConfig   `yaml:"metadata" mapstructure:"metadata" json:"metadata"`
-	Streaming       StreamingConfig  `yaml:"streaming" mapstructure:"streaming" json:"streaming"`
-	Health          HealthConfig     `yaml:"health" mapstructure:"health" json:"health,omitempty"`
-	RClone          RCloneConfig     `yaml:"rclone" mapstructure:"rclone" json:"rclone"`
-	Import          ImportConfig     `yaml:"import" mapstructure:"import" json:"import"`
-	Log             LogConfig        `yaml:"log" mapstructure:"log" json:"log,omitempty"`
-	SABnzbd         SABnzbdConfig    `yaml:"sabnzbd" mapstructure:"sabnzbd" json:"sabnzbd"`
-	Arrs            ArrsConfig       `yaml:"arrs" mapstructure:"arrs" json:"arrs"`
-	Fuse            FuseConfig       `yaml:"fuse" mapstructure:"fuse" json:"fuse"`
-	Providers       []ProviderConfig `yaml:"providers" mapstructure:"providers" json:"providers"`
-	MountPath       string           `yaml:"mount_path" mapstructure:"mount_path" json:"mount_path"` // WebDAV mount path
-	ProfilerEnabled bool             `yaml:"profiler_enabled" mapstructure:"profiler_enabled" json:"profiler_enabled" default:"false"`
+	WebDAV          WebDAVConfig        `yaml:"webdav" mapstructure:"webdav" json:"webdav"`
+	API             APIConfig           `yaml:"api" mapstructure:"api" json:"api"`
+	Auth            AuthConfig          `yaml:"auth" mapstructure:"auth" json:"auth"`
+	Database        DatabaseConfig      `yaml:"database" mapstructure:"database" json:"database"`
+	Metadata        MetadataConfig      `yaml:"metadata" mapstructure:"metadata" json:"metadata"`
+	Streaming       StreamingConfig     `yaml:"streaming" mapstructure:"streaming" json:"streaming"`
+	Health          HealthConfig        `yaml:"health" mapstructure:"health" json:"health"`
+	RClone          RCloneConfig        `yaml:"rclone" mapstructure:"rclone" json:"rclone"`
+	Import          ImportConfig        `yaml:"import" mapstructure:"import" json:"import"`
+	Log             LogConfig           `yaml:"log" mapstructure:"log" json:"log"`
+	SABnzbd         SABnzbdConfig       `yaml:"sabnzbd" mapstructure:"sabnzbd" json:"sabnzbd"`
+	Arrs            ArrsConfig          `yaml:"arrs" mapstructure:"arrs" json:"arrs"`
+	Stremio         StremioConfig       `yaml:"stremio" mapstructure:"stremio" json:"stremio"`
+	Fuse            FuseConfig          `yaml:"fuse" mapstructure:"fuse" json:"fuse"`
+	SegmentCache    SegmentCacheConfig  `yaml:"segment_cache" mapstructure:"segment_cache" json:"segment_cache"`
+	Providers       []ProviderConfig    `yaml:"providers" mapstructure:"providers" json:"providers"`
+	MountPath       string              `yaml:"mount_path" mapstructure:"mount_path" json:"mount_path"`
+	MountType       MountType           `yaml:"mount_type" mapstructure:"mount_type" json:"mount_type"`
+	ProfilerEnabled bool                `yaml:"profiler_enabled" mapstructure:"profiler_enabled" json:"profiler_enabled" default:"false"`
+}
+
+// SegmentCacheConfig configures the segment-aligned disk cache shared by FUSE and WebDAV.
+// When enabled, this cache replaces the FUSE VFS disk cache and additionally benefits WebDAV.
+// Cache key: Usenet message ID. Cache unit: ~750KB decoded segment (matches one NNTP article).
+type SegmentCacheConfig struct {
+	Enabled     *bool  `yaml:"enabled" mapstructure:"enabled" json:"enabled"`
+	CachePath   string `yaml:"cache_path" mapstructure:"cache_path" json:"cache_path"`
+	MaxSizeGB   int    `yaml:"max_size_gb" mapstructure:"max_size_gb" json:"max_size_gb"`
+	ExpiryHours int    `yaml:"expiry_hours" mapstructure:"expiry_hours" json:"expiry_hours"`
 }
 
 // WebDAVConfig represents WebDAV server configuration
@@ -59,20 +84,50 @@ type FuseConfig struct {
 	EntryTimeoutSeconds int    `yaml:"entry_timeout_seconds" mapstructure:"entry_timeout_seconds" json:"entry_timeout_seconds"`
 	MaxCacheSizeMB      int    `yaml:"max_cache_size_mb" mapstructure:"max_cache_size_mb" json:"max_cache_size_mb"`
 	MaxReadAheadMB      int    `yaml:"max_read_ahead_mb" mapstructure:"max_read_ahead_mb" json:"max_read_ahead_mb"`
-
-	// VFS disk cache configuration
-	DiskCacheEnabled   *bool  `yaml:"disk_cache_enabled" mapstructure:"disk_cache_enabled" json:"disk_cache_enabled"`
-	DiskCachePath      string `yaml:"disk_cache_path" mapstructure:"disk_cache_path" json:"disk_cache_path"`
-	DiskCacheMaxSizeGB int    `yaml:"disk_cache_max_size_gb" mapstructure:"disk_cache_max_size_gb" json:"disk_cache_max_size_gb"`
-	DiskCacheExpiryH   int    `yaml:"disk_cache_expiry_hours" mapstructure:"disk_cache_expiry_hours" json:"disk_cache_expiry_hours"`
-	ChunkSizeMB        int    `yaml:"chunk_size_mb" mapstructure:"chunk_size_mb" json:"chunk_size_mb"`
-	ReadAheadChunks    int    `yaml:"read_ahead_chunks" mapstructure:"read_ahead_chunks" json:"read_ahead_chunks"`
+	Backend             string `yaml:"backend" mapstructure:"backend" json:"backend"` // "hanwen" or "cgo" (empty = platform default)
 }
 
 // APIConfig represents REST API configuration
 type APIConfig struct {
-	Prefix      string `yaml:"prefix" mapstructure:"prefix" json:"prefix"`
-	KeyOverride string `yaml:"key_override" mapstructure:"key_override" json:"key_override,omitempty"`
+	Prefix         string   `yaml:"prefix" mapstructure:"prefix" json:"prefix"`
+	KeyOverride    string   `yaml:"key_override" mapstructure:"key_override" json:"key_override,omitempty"`
+	AllowedOrigins []string `yaml:"allowed_origins" mapstructure:"allowed_origins" json:"allowed_origins,omitempty"`
+}
+
+// ProwlarrConfig configures the Prowlarr indexer integration for Stremio addon searches.
+type ProwlarrConfig struct {
+	// Enabled controls whether Prowlarr search is active for the Stremio addon.
+	Enabled *bool `yaml:"enabled" mapstructure:"enabled" json:"enabled"`
+	// Host is the Prowlarr base URL (e.g. "http://localhost:9696").
+	Host string `yaml:"host" mapstructure:"host" json:"host,omitempty"`
+	// APIKey is the Prowlarr API key.
+	APIKey string `yaml:"api_key" mapstructure:"api_key" json:"api_key,omitempty"`
+	// Categories filters search results by Newznab category IDs.
+	// Defaults to 5000 (Movies), 5010 (Movies/Foreign), 5030 (TV), 5040 (TV/HD).
+	Categories []int `yaml:"categories" mapstructure:"categories" json:"categories,omitempty"`
+	// Languages is an optional list of keywords; releases must contain at least one to pass.
+	// Empty = no filtering. Examples: ["Esp", "🇪🇸", "Spanish", "DUAL"]
+	Languages []string `yaml:"languages" mapstructure:"languages" json:"languages,omitempty"`
+	// Qualities is an optional list of keywords; releases must contain at least one to pass.
+	// Empty = no filtering. Examples: ["1080p", "HD", "4K", "3D"]
+	Qualities []string `yaml:"qualities" mapstructure:"qualities" json:"qualities,omitempty"`
+}
+
+// StremioConfig configures the Stremio NZB stream endpoint (POST /api/nzb/streams).
+type StremioConfig struct {
+	// Enabled controls whether the endpoint is active. Disabled by default.
+	// When false, the endpoint returns 404 Not Found.
+	Enabled *bool `yaml:"enabled" mapstructure:"enabled" json:"enabled"`
+	// NzbTTLHours controls how long a completed NZB result is cached before
+	// the same NZB is re-processed on the next request.
+	// Set to 0 to disable expiry (cache forever). Defaults to 24 hours.
+	NzbTTLHours int `yaml:"nzb_ttl_hours" mapstructure:"nzb_ttl_hours" json:"nzb_ttl_hours,omitempty"`
+	// BaseURL is the public base URL used when building Stremio stream links
+	// (e.g. "https://altmount.example.com"). Falls back to the auto-detected
+	// request origin when not set.
+	BaseURL string `yaml:"base_url" mapstructure:"base_url" json:"base_url,omitempty"`
+	// Prowlarr configures the Prowlarr indexer used by the Stremio addon to search for NZBs.
+	Prowlarr ProwlarrConfig `yaml:"prowlarr" mapstructure:"prowlarr" json:"prowlarr"`
 }
 
 // AuthConfig represents authentication configuration
@@ -82,7 +137,13 @@ type AuthConfig struct {
 
 // DatabaseConfig represents database configuration
 type DatabaseConfig struct {
+	// Type selects the database backend: "sqlite" (default) or "postgres".
+	Type string `yaml:"type" mapstructure:"type" json:"type"`
+	// Path is the SQLite database file path (sqlite only).
 	Path string `yaml:"path" mapstructure:"path" json:"path"`
+	// DSN is the PostgreSQL connection string (postgres only).
+	// Example: "postgres://user:password@localhost:5432/altmount?sslmode=disable"
+	DSN string `yaml:"dsn" mapstructure:"dsn" json:"dsn,omitempty"`
 }
 
 // MetadataConfig represents metadata filesystem configuration
@@ -102,9 +163,16 @@ type MetadataBackupConfig struct {
 	Path          string `yaml:"path" mapstructure:"path" json:"path"`
 }
 
+// FailureMaskingConfig represents failure masking configuration
+type FailureMaskingConfig struct {
+	Enabled   *bool `yaml:"enabled" mapstructure:"enabled" json:"enabled"`
+	Threshold int   `yaml:"threshold" mapstructure:"threshold" json:"threshold"`
+}
+
 // StreamingConfig represents streaming and chunking configuration
 type StreamingConfig struct {
-	MaxPrefetch int `yaml:"max_prefetch" mapstructure:"max_prefetch" json:"max_prefetch"`
+	MaxPrefetch    int                  `yaml:"max_prefetch" mapstructure:"max_prefetch" json:"max_prefetch"`
+	FailureMasking FailureMaskingConfig `yaml:"failure_masking" mapstructure:"failure_masking" json:"failure_masking"`
 }
 
 // RCloneConfig represents rclone configuration
@@ -163,6 +231,7 @@ type RCloneConfig struct {
 	AsyncRead          bool `yaml:"async_read" mapstructure:"async_read" json:"async_read"`
 	VFSFastFingerprint bool `yaml:"vfs_fast_fingerprint" mapstructure:"vfs_fast_fingerprint" json:"vfs_fast_fingerprint"`
 	UseMmap            bool `yaml:"use_mmap" mapstructure:"use_mmap" json:"use_mmap"`
+	Links              bool `yaml:"links" mapstructure:"links" json:"links"`
 }
 
 // ImportStrategy represents the import strategy type
@@ -185,9 +254,10 @@ type ImportConfig struct {
 	ReadTimeoutSeconds             int            `yaml:"read_timeout_seconds" mapstructure:"read_timeout_seconds" json:"read_timeout_seconds"`
 	ImportStrategy                 ImportStrategy `yaml:"import_strategy" mapstructure:"import_strategy" json:"import_strategy"`
 	ImportDir                      *string        `yaml:"import_dir" mapstructure:"import_dir" json:"import_dir,omitempty"`
-	SkipHealthCheck                *bool          `yaml:"skip_health_check" mapstructure:"skip_health_check" json:"skip_health_check,omitempty"`
 	WatchDir                       *string        `yaml:"watch_dir" mapstructure:"watch_dir" json:"watch_dir,omitempty"`
 	WatchIntervalSeconds           *int           `yaml:"watch_interval_seconds" mapstructure:"watch_interval_seconds" json:"watch_interval_seconds,omitempty"`
+	AllowNestedRarExtraction       *bool          `yaml:"allow_nested_rar_extraction" mapstructure:"allow_nested_rar_extraction" json:"allow_nested_rar_extraction,omitempty"`
+	ExpandBlurayIso                *bool          `yaml:"expand_bluray_iso" mapstructure:"expand_bluray_iso" json:"expand_bluray_iso,omitempty"`
 }
 
 // LogConfig represents logging configuration with rotation support
@@ -200,19 +270,34 @@ type LogConfig struct {
 	Compress   bool   `yaml:"compress" mapstructure:"compress" json:"compress,omitempty"`          // Compress old log files
 }
 
+// RepairConfig represents repair behavior configuration
+type RepairConfig struct {
+	Enabled             *bool `yaml:"enabled" mapstructure:"enabled" json:"enabled,omitempty"`
+	IntervalMinutes     int   `yaml:"interval_minutes" mapstructure:"interval_minutes" json:"interval_minutes,omitempty"`
+	MaxCoolDownHours    int   `yaml:"max_cooldown_hours" mapstructure:"max_cooldown_hours" json:"max_cooldown_hours,omitempty"`
+	MaxRepairRetries   int   `yaml:"max_repair_retries" mapstructure:"max_repair_retries" json:"max_repair_retries"`
+
+	ExponentialBackoff  *bool `yaml:"exponential_backoff" mapstructure:"exponential_backoff" json:"exponential_backoff,omitempty"`
+}
+
 // HealthConfig represents health checker configuration
 type HealthConfig struct {
-	Enabled                       *bool   `yaml:"enabled" mapstructure:"enabled" json:"enabled,omitempty"`
-	LibraryDir                    *string `yaml:"library_dir" mapstructure:"library_dir" json:"library_dir,omitempty"`
-	CleanupOrphanedMetadata       *bool   `yaml:"cleanup_orphaned_metadata" mapstructure:"cleanup_orphaned_metadata" json:"cleanup_orphaned_metadata,omitempty"`
-	CheckIntervalSeconds          int     `yaml:"check_interval_seconds" mapstructure:"check_interval_seconds" json:"check_interval_seconds,omitempty"`
-	MaxConnectionsForHealthChecks int     `yaml:"max_connections_for_health_checks" mapstructure:"max_connections_for_health_checks" json:"max_connections_for_health_checks,omitempty"`
-	MaxConcurrentJobs             int     `yaml:"max_concurrent_jobs" mapstructure:"max_concurrent_jobs" json:"max_concurrent_jobs,omitempty"`
-	SegmentSamplePercentage       int     `yaml:"segment_sample_percentage" mapstructure:"segment_sample_percentage" json:"segment_sample_percentage,omitempty"`
-	LibrarySyncIntervalMinutes    int     `yaml:"library_sync_interval_minutes" mapstructure:"library_sync_interval_minutes" json:"library_sync_interval_minutes,omitempty"`
-	LibrarySyncConcurrency        int     `yaml:"library_sync_concurrency" mapstructure:"library_sync_concurrency" json:"library_sync_concurrency,omitempty"`
-	ResolveRepairOnImport         *bool   `yaml:"resolve_repair_on_import" mapstructure:"resolve_repair_on_import" json:"resolve_repair_on_import,omitempty"`
-	VerifyData                    *bool   `yaml:"verify_data" mapstructure:"verify_data" json:"verify_data,omitempty"`
+	Enabled                       *bool        `yaml:"enabled" mapstructure:"enabled" json:"enabled,omitempty"`
+	LibraryDir                    *string      `yaml:"library_dir" mapstructure:"library_dir" json:"library_dir,omitempty"`
+	CleanupOrphanedMetadata       *bool        `yaml:"cleanup_orphaned_metadata" mapstructure:"cleanup_orphaned_metadata" json:"cleanup_orphaned_metadata,omitempty"`
+	CheckIntervalSeconds          int          `yaml:"check_interval_seconds" mapstructure:"check_interval_seconds" json:"check_interval_seconds,omitempty"`
+	MaxConnectionsForHealthChecks int          `yaml:"max_connections_for_health_checks" mapstructure:"max_connections_for_health_checks" json:"max_connections_for_health_checks,omitempty"`
+	MaxConcurrentJobs             int          `yaml:"max_concurrent_jobs" mapstructure:"max_concurrent_jobs" json:"max_concurrent_jobs,omitempty"`
+	SegmentSamplePercentage       int          `yaml:"segment_sample_percentage" mapstructure:"segment_sample_percentage" json:"segment_sample_percentage,omitempty"`
+	MaxRetries                    int          `yaml:"max_retries" mapstructure:"max_retries" json:"max_retries"`
+	LibrarySyncIntervalMinutes    int          `yaml:"library_sync_interval_minutes" mapstructure:"library_sync_interval_minutes" json:"library_sync_interval_minutes,omitempty"`
+	LibrarySyncConcurrency        int          `yaml:"library_sync_concurrency" mapstructure:"library_sync_concurrency" json:"library_sync_concurrency,omitempty"`
+	ResolveRepairOnImport         *bool        `yaml:"resolve_repair_on_import" mapstructure:"resolve_repair_on_import" json:"resolve_repair_on_import,omitempty"`
+	VerifyData                    *bool        `yaml:"verify_data" mapstructure:"verify_data" json:"verify_data,omitempty"`
+	CheckAllSegments              *bool        `yaml:"check_all_segments" mapstructure:"check_all_segments" json:"check_all_segments,omitempty"`
+	ReadTimeoutSeconds            int          `yaml:"read_timeout_seconds" mapstructure:"read_timeout_seconds" json:"read_timeout_seconds,omitempty"`
+	AcceptableMissingSegmentsPercentage float64 `yaml:"acceptable_missing_segments_percentage" mapstructure:"acceptable_missing_segments_percentage" json:"acceptable_missing_segments_percentage,omitempty"`
+	Repair                        RepairConfig `yaml:"repair" mapstructure:"repair" json:"repair"`
 }
 
 // GenerateProviderID creates a unique ID based on host, port, and username
@@ -238,6 +323,8 @@ type ProviderConfig struct {
 	ProxyURL          string     `yaml:"proxy_url" mapstructure:"proxy_url" json:"proxy_url,omitempty"`
 	Enabled           *bool      `yaml:"enabled" mapstructure:"enabled" json:"enabled,omitempty"`
 	IsBackupProvider  *bool      `yaml:"is_backup_provider" mapstructure:"is_backup_provider" json:"is_backup_provider,omitempty"`
+	SkipPing          bool       `yaml:"skip_ping" mapstructure:"skip_ping" json:"skip_ping,omitempty"`
+	LastRTTMs         int64      `yaml:"last_rtt_ms" mapstructure:"last_rtt_ms" json:"last_rtt_ms,omitempty"`
 	LastSpeedTestMbps float64    `yaml:"last_speed_test_mbps" mapstructure:"last_speed_test_mbps" json:"last_speed_test_mbps,omitempty"`
 	LastSpeedTestTime *time.Time `yaml:"last_speed_test_time" mapstructure:"last_speed_test_time" json:"last_speed_test_time,omitempty"`
 }
@@ -356,6 +443,9 @@ func (c *Config) Validate() error {
 	if !validStrategies[c.Import.ImportStrategy] {
 		return fmt.Errorf("import_strategy must be one of: NONE, SYMLINK, STRM")
 	}
+	if runtime.GOOS == "windows" && c.Import.ImportStrategy == ImportStrategySYMLINK {
+		return fmt.Errorf("import_strategy SYMLINK is not supported on Windows; use STRM instead")
+	}
 
 	// Validate import directory when strategy requires it
 	if c.Import.ImportStrategy == ImportStrategySYMLINK || c.Import.ImportStrategy == ImportStrategySTRM {
@@ -380,13 +470,7 @@ func (c *Config) Validate() error {
 	// Validate log level (both old and new config)
 	if c.Log.Level != "" {
 		validLevels := []string{"debug", "info", "warn", "error"}
-		isValid := false
-		for _, level := range validLevels {
-			if c.Log.Level == level {
-				isValid = true
-				break
-			}
-		}
+		isValid := slices.Contains(validLevels, c.Log.Level)
 		if !isValid {
 			return fmt.Errorf("log_level must be one of: debug, info, warn, error")
 		}
@@ -395,13 +479,7 @@ func (c *Config) Validate() error {
 	// Validate log configuration
 	if c.Log.Level != "" {
 		validLevels := []string{"debug", "info", "warn", "error"}
-		isValid := false
-		for _, level := range validLevels {
-			if c.Log.Level == level {
-				isValid = true
-				break
-			}
-		}
+		isValid := slices.Contains(validLevels, c.Log.Level)
 		if !isValid {
 			return fmt.Errorf("log.level must be one of: debug, info, warn, error")
 		}
@@ -483,23 +561,41 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	// Auto-enable RC when mount is enabled (mount requires RC to function)
-	if c.RClone.MountEnabled != nil && *c.RClone.MountEnabled {
-		if c.RClone.RCEnabled == nil || !*c.RClone.RCEnabled {
-			// Auto-enable RC since mount requires it
-			enabled := true
-			c.RClone.RCEnabled = &enabled
-		}
-	}
-
-	// Validate RClone Mount configuration
-	if c.RClone.MountEnabled != nil && *c.RClone.MountEnabled {
+	// Enforce mutual exclusion via MountType and sync legacy flags
+	falseVal := false
+	trueVal := true
+	switch c.MountType {
+	case MountTypeNone, "":
+		c.RClone.MountEnabled = &falseVal
+		c.RClone.RCEnabled = &falseVal
+		c.Fuse.Enabled = &falseVal
+	case MountTypeRClone:
 		if c.MountPath == "" {
-			return fmt.Errorf("rclone mount_path cannot be empty when mount is enabled")
+			return fmt.Errorf("mount_path cannot be empty when mount type is rclone")
 		}
 		if !filepath.IsAbs(c.MountPath) {
-			return fmt.Errorf("rclone mount_path must be an absolute path")
+			return fmt.Errorf("mount_path must be an absolute path")
 		}
+		c.RClone.MountEnabled = &trueVal
+		c.RClone.RCEnabled = &trueVal // mount requires RC
+		c.Fuse.Enabled = &falseVal
+	case MountTypeFuse:
+		if c.MountPath == "" {
+			return fmt.Errorf("mount_path cannot be empty when mount type is fuse")
+		}
+		if !filepath.IsAbs(c.MountPath) {
+			return fmt.Errorf("mount_path must be an absolute path")
+		}
+		c.RClone.MountEnabled = &falseVal
+		c.RClone.RCEnabled = &falseVal
+		c.Fuse.Enabled = &trueVal
+		c.Fuse.MountPath = c.MountPath
+	case MountTypeRCloneExternal:
+		c.RClone.MountEnabled = &falseVal
+		c.RClone.RCEnabled = &trueVal
+		c.Fuse.Enabled = &falseVal
+	default:
+		return fmt.Errorf("invalid mount_type: %s (must be none, rclone, fuse, or rclone_external)", c.MountType)
 	}
 
 	// Validate SABnzbd configuration
@@ -581,11 +677,6 @@ func (c *Config) Validate() error {
 		c.Fuse.MaxReadAheadMB = 128 // Default 128MB
 	}
 
-	// Validate FUSE mount_path is set when enabled
-	if c.Fuse.Enabled != nil && *c.Fuse.Enabled && c.Fuse.MountPath == "" {
-		return fmt.Errorf("fuse.mount_path is required when fuse is enabled")
-	}
-
 	return nil
 }
 
@@ -657,7 +748,7 @@ func (p *ProviderConfig) ToNNTPProvider() nntppool.Provider {
 
 	inflight := p.InflightRequests
 	if inflight <= 0 {
-		inflight = 3
+		inflight = 10
 	}
 
 	return nntppool.Provider{
@@ -668,6 +759,7 @@ func (p *ProviderConfig) ToNNTPProvider() nntppool.Provider {
 		Backup:      isBackup,
 		Inflight:    inflight,
 		IdleTimeout: 60 * time.Second,
+		SkipPing:    p.SkipPing,
 	}
 }
 
@@ -734,6 +826,7 @@ func providersFieldsEqual(a, b ProviderConfig) bool {
 	return a.Host == b.Host &&
 		a.Port == b.Port &&
 		a.Username == b.Username &&
+		a.SkipPing == b.SkipPing &&
 		a.Password == b.Password &&
 		a.MaxConnections == b.MaxConnections &&
 		a.TLS == b.TLS &&
@@ -966,6 +1059,19 @@ func (m *Manager) ReloadConfig() error {
 		config.Fuse.Enabled = &defaultEnabled
 	}
 
+	// Migrate: infer mount_type from legacy enabled flags if not set
+	if config.MountType == "" {
+		if config.RClone.MountEnabled != nil && *config.RClone.MountEnabled {
+			config.MountType = MountTypeRClone
+		} else if config.Fuse.Enabled != nil && *config.Fuse.Enabled {
+			config.MountType = MountTypeFuse
+		} else if config.RClone.RCEnabled != nil && *config.RClone.RCEnabled {
+			config.MountType = MountTypeRCloneExternal
+		} else {
+			config.MountType = MountTypeNone
+		}
+	}
+
 	// Validate configuration
 	if err := config.Validate(); err != nil {
 		return fmt.Errorf("config validation failed: %w", err)
@@ -1043,11 +1149,15 @@ func DefaultConfig(configDir ...string) *Config {
 	sabnzbdEnabled := false
 	scrapperEnabled := false
 	fuseEnabled := false
-	loginRequired := true // Require login by default
-	skipHealthCheck := true
+	loginRequired := true  // Require login by default
+	stremioEnabled := false   // Stremio endpoint disabled by default
+	prowlarrEnabled := false  // Prowlarr integration disabled by default
 	watchIntervalSeconds := 10 // Default watch interval
 	cleanupAutomaticImportFailure := false
 	metadataBackupEnabled := false
+	failureMaskingEnabled := true
+	repairEnabled := true
+	repairExponentialBackoff := true
 
 	// Set paths based on whether we're running in Docker or have a specific config directory
 	var dbPath, metadataPath, logPath, rclonePath, cachePath, backupPath string
@@ -1085,10 +1195,20 @@ func DefaultConfig(configDir ...string) *Config {
 		API: APIConfig{
 			Prefix: "/api",
 		},
+		Stremio: StremioConfig{
+			Enabled:     &stremioEnabled,
+			NzbTTLHours: 24,
+			Prowlarr: ProwlarrConfig{
+				Enabled:    &prowlarrEnabled,
+				Host:       "http://localhost:9696",
+				Categories: []int{2000, 2010, 2030, 2040, 2045, 2060, 5000, 5010, 5030, 5040},
+			},
+		},
 		Auth: AuthConfig{
 			LoginRequired: &loginRequired,
 		},
 		Database: DatabaseConfig{
+			Type: "sqlite",
 			Path: dbPath,
 		},
 		Metadata: MetadataConfig{
@@ -1097,12 +1217,16 @@ func DefaultConfig(configDir ...string) *Config {
 			Backup: MetadataBackupConfig{
 				Enabled:       &metadataBackupEnabled,
 				IntervalHours: 24,
-				KeepBackups:   10,
+				KeepBackups:   1,
 				Path:          backupPath,
 			},
 		},
 		Streaming: StreamingConfig{
 			MaxPrefetch: 30, // Default: 30 segments prefetched ahead
+			FailureMasking: FailureMaskingConfig{
+				Enabled:   &failureMaskingEnabled,
+				Threshold: 3,
+			},
 		},
 		RClone: RCloneConfig{
 			Path:         rclonePath,
@@ -1156,12 +1280,11 @@ func DefaultConfig(configDir ...string) *Config {
 				".xvid", ".rm", ".rmvb", ".asf", ".asx", ".wtv", ".mk3d", ".dvr-ms",
 			},
 			MaxImportConnections:    5,                  // Default: 5 concurrent NNTP connections for validation and archive processing
-			MaxDownloadPrefetch:     3,                  // Default: 3 segments prefetched ahead for archive analysis
+			MaxDownloadPrefetch:     10,                 // Default: 10 segments prefetched ahead for archive analysis
 			SegmentSamplePercentage: 1,                  // Default: 1% segment sampling
 			ReadTimeoutSeconds:      300,                // Default: 5 minutes read timeout
 			ImportStrategy:          ImportStrategyNone, // Default: no import strategy (direct import)
 			ImportDir:               nil,                // No default import directory
-			SkipHealthCheck:         &skipHealthCheck,
 			WatchDir:                nil,
 			WatchIntervalSeconds:    &watchIntervalSeconds,
 		},
@@ -1182,6 +1305,13 @@ func DefaultConfig(configDir ...string) *Config {
 			SegmentSamplePercentage:       5,                      // Default: 5% segment sampling
 			LibrarySyncIntervalMinutes:    360,                    // Default: sync every 6 hours
 			ResolveRepairOnImport:         &resolveRepairOnImport, // Enabled by default
+			AcceptableMissingSegmentsPercentage: 0,                // Default: no missing segments allowed
+			Repair: RepairConfig{
+				Enabled:            &repairEnabled,
+				IntervalMinutes:    60,
+				MaxCoolDownHours:   24,
+				ExponentialBackoff: &repairExponentialBackoff,
+			},
 		},
 		SABnzbd: SABnzbdConfig{
 			Enabled:               &sabnzbdEnabled,
@@ -1232,7 +1362,8 @@ func DefaultConfig(configDir ...string) *Config {
 			MaxCacheSizeMB:      128,
 			MaxReadAheadMB:      128,
 		},
-		MountPath: "", // Empty by default - required when ARRs is enabled
+		MountPath: "",            // Empty by default - required when ARRs is enabled
+		MountType: MountTypeNone, // No mount system active by default
 	}
 }
 
@@ -1315,6 +1446,19 @@ func LoadConfig(configFile string) (*Config, error) {
 	if config.Fuse.Enabled == nil {
 		defaultEnabled := false
 		config.Fuse.Enabled = &defaultEnabled
+	}
+
+	// Migrate: infer mount_type from legacy enabled flags if not set
+	if config.MountType == "" {
+		if config.RClone.MountEnabled != nil && *config.RClone.MountEnabled {
+			config.MountType = MountTypeRClone
+		} else if config.Fuse.Enabled != nil && *config.Fuse.Enabled {
+			config.MountType = MountTypeFuse
+		} else if config.RClone.RCEnabled != nil && *config.RClone.RCEnabled {
+			config.MountType = MountTypeRCloneExternal
+		} else {
+			config.MountType = MountTypeNone
+		}
 	}
 
 	// If log file was not explicitly set in the config file and we have a specific config file path,

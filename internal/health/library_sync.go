@@ -2,12 +2,14 @@ package health
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -17,6 +19,7 @@ import (
 	"github.com/javi11/altmount/internal/config"
 	"github.com/javi11/altmount/internal/database"
 	"github.com/javi11/altmount/internal/metadata"
+	"github.com/javi11/altmount/internal/pathutil"
 	"github.com/javi11/altmount/pkg/rclonecli"
 	"github.com/sourcegraph/conc/pool"
 )
@@ -83,7 +86,7 @@ func NewLibrarySyncWorker(
 	configManager *config.Manager,
 	rcloneClient rclonecli.RcloneRcClient,
 ) *LibrarySyncWorker {
-	return &LibrarySyncWorker{
+	worker := &LibrarySyncWorker{
 		metadataService: metadataService,
 		healthRepo:      healthRepo,
 		configGetter:    configGetter,
@@ -91,6 +94,35 @@ func NewLibrarySyncWorker(
 		rcloneClient:    rcloneClient,
 		manualTrigger:   make(chan struct{}, 1), // Buffered channel for non-blocking sends
 	}
+
+	// Load last result from database if available
+	_ = worker.LoadLastResult(context.Background())
+
+	return worker
+}
+
+const lastLibrarySyncResultKey = "last_library_sync_result"
+
+// LoadLastResult loads the last sync result from the database
+func (lsw *LibrarySyncWorker) LoadLastResult(ctx context.Context) error {
+	data, err := lsw.healthRepo.GetSystemState(ctx, lastLibrarySyncResultKey)
+	if err != nil {
+		return err
+	}
+	if data == "" {
+		return nil
+	}
+
+	var result SyncResult
+	if err := json.Unmarshal([]byte(data), &result); err != nil {
+		return err
+	}
+
+	lsw.progressMu.Lock()
+	lsw.lastSyncResult = &result
+	lsw.progressMu.Unlock()
+
+	return nil
 }
 
 // StartLibrarySync starts the library sync worker in a background goroutine
@@ -263,7 +295,7 @@ func (lsw *LibrarySyncWorker) findFilesToDelete(
 	ctx context.Context,
 	dbRecords []database.AutomaticHealthCheckRecord,
 	metaFileSet map[string]string,
-	filesInUse map[string]string,
+	filesInLibrary map[string]bool,
 ) []string {
 	var filesToDelete []string
 
@@ -280,14 +312,14 @@ func (lsw *LibrarySyncWorker) findFilesToDelete(
 			continue
 		}
 
-		// Check if file is in use (only for full sync, not metadata-only)
-		if filesInUse != nil {
+		// Check if file is in the official library (only for full sync, not metadata-only)
+		if filesInLibrary != nil {
 			// If repair is triggered, skip file existence check as it might be temporarily missing during repair
 			if dbRecord.Status == database.HealthStatusRepairTriggered {
 				continue
 			}
 
-			if _, exists := filesInUse[dbRecord.FilePath]; !exists {
+			if !filesInLibrary[dbRecord.FilePath] {
 				filesToDelete = append(filesToDelete, dbRecord.FilePath)
 			}
 		}
@@ -306,10 +338,7 @@ func (lsw *LibrarySyncWorker) recordSyncResult(
 	totalDbRecords int,
 ) {
 	duration := time.Since(startTime)
-
-	// Store sync result
-	lsw.progressMu.Lock()
-	lsw.lastSyncResult = &SyncResult{
+	result := &SyncResult{
 		FilesAdded:          dbCounts.added,
 		FilesDeleted:        dbCounts.deleted,
 		MetadataDeleted:     cleanup.metadataDeleted,
@@ -318,7 +347,18 @@ func (lsw *LibrarySyncWorker) recordSyncResult(
 		Duration:            duration,
 		CompletedAt:         time.Now(),
 	}
+
+	// Store sync result in memory
+	lsw.progressMu.Lock()
+	lsw.lastSyncResult = result
 	lsw.progressMu.Unlock()
+
+	// Persist sync result to database
+	if resultData, err := json.Marshal(result); err == nil {
+		if err := lsw.healthRepo.UpdateSystemState(ctx, lastLibrarySyncResultKey, string(resultData)); err != nil {
+			slog.ErrorContext(ctx, "Failed to persist library sync result", "error", err)
+		}
+	}
 
 	// Log completion
 	slog.InfoContext(ctx, "Library sync completed",
@@ -440,9 +480,9 @@ func (lsw *LibrarySyncWorker) SyncLibrary(ctx context.Context, dryRun bool) *Dry
 			"new_mount", newMountPath)
 	}
 
-	// Check import strategy - if NONE, only sync DB with metadata files
-	if cfg.Import.ImportStrategy == config.ImportStrategyNone {
-		slog.InfoContext(ctx, "Import strategy is NONE, performing metadata-only sync")
+	// Check import strategy - if NONE and no library dir, only sync DB with metadata files
+	if cfg.Import.ImportStrategy == config.ImportStrategyNone && (cfg.Health.LibraryDir == nil || *cfg.Health.LibraryDir == "") {
+		slog.InfoContext(ctx, "Import strategy is NONE and no library directory configured, performing metadata-only sync")
 		return lsw.syncMetadataOnly(ctx, startTime, dryRun)
 	}
 
@@ -508,6 +548,19 @@ func (lsw *LibrarySyncWorker) SyncLibrary(ctx context.Context, dryRun bool) *Dry
 			"total_updated", totalSymlinksUpdated)
 	}
 
+	// SAFETY: If the library scan returned zero files but we have metadata files,
+	// it's almost certainly a mount failure or network glitch.
+	// Abort cleanup operations to prevent mass data loss.
+	totalFilesFound := len(libraryFiles.Symlinks) + len(libraryFiles.StrmFiles) +
+		len(importDirFiles.Symlinks) + len(importDirFiles.StrmFiles)
+
+	shouldCleanup := cfg.Health.CleanupOrphanedMetadata != nil && *cfg.Health.CleanupOrphanedMetadata
+	if shouldCleanup && totalFilesFound == 0 && len(metadataFiles) > 0 {
+		slog.WarnContext(ctx, "Library scan returned zero files while metadata exists. Possible mount failure? Aborting cleanup for safety.",
+			"metadata_count", len(metadataFiles))
+		shouldCleanup = false
+	}
+
 	// Update total files count
 	lsw.progressMu.Lock()
 	lsw.progress.TotalFiles = len(metadataFiles)
@@ -515,21 +568,26 @@ func (lsw *LibrarySyncWorker) SyncLibrary(ctx context.Context, dryRun bool) *Dry
 
 	// Build a reverse map: mount relative path -> library path for quick lookup
 	filesInUse := make(map[string]string)
+	// Track which files are actually in the official library (to protect them from deletion)
+	filesInLibrary := make(map[string]bool)
 
 	// Helper to normalize keys to mount relative paths
-	normalizeKeys := func(m map[string]string) {
+	normalizeKeys := func(m map[string]string, isLibrary bool) {
 		for target, libPath := range m {
 			// Extract relative path within the mount
 			rel := strings.TrimPrefix(filepath.ToSlash(target), filepath.ToSlash(cfg.MountPath))
 			rel = strings.TrimPrefix(rel, "/")
 			filesInUse[rel] = libPath
+			if isLibrary {
+				filesInLibrary[rel] = true
+			}
 		}
 	}
 
-	normalizeKeys(libraryFiles.Symlinks)
-	normalizeKeys(libraryFiles.StrmFiles)
-	normalizeKeys(importDirFiles.Symlinks)
-	normalizeKeys(importDirFiles.StrmFiles)
+	normalizeKeys(libraryFiles.Symlinks, true)
+	normalizeKeys(libraryFiles.StrmFiles, true)
+	normalizeKeys(importDirFiles.Symlinks, false)
+	normalizeKeys(importDirFiles.StrmFiles, false)
 
 	// Get all health check paths from database
 	dbRecords, err := lsw.healthRepo.GetAllHealthCheckRecords(ctx)
@@ -544,8 +602,40 @@ func (lsw *LibrarySyncWorker) SyncLibrary(ctx context.Context, dryRun bool) *Dry
 	dbPathSet := syncMaps.dbPathSet
 
 	// Find files to add (in filesystem but not in database)
-	var filesToAdd []database.AutomaticHealthCheckRecord
-	var filesToAddMu sync.Mutex
+	// Collect results via channel to avoid large slice allocations and lock contention
+	filesToAddChan := make(chan database.AutomaticHealthCheckRecord, 100)
+	var totalAdded int
+	
+	// Start a goroutine to process results from the channel in batches to save RAM
+	done := make(chan struct{})
+	go func() {
+		const batchSize = 1000
+		batch := make([]database.AutomaticHealthCheckRecord, 0, batchSize)
+		
+		flushBatch := func() {
+			if len(batch) == 0 {
+				return
+			}
+			if !dryRun {
+				if err := lsw.healthRepo.BatchAddAutomaticHealthChecks(ctx, batch); err != nil {
+					slog.ErrorContext(ctx, "Failed to batch add automatic health checks",
+						"count", len(batch),
+						"error", err)
+				}
+			}
+			totalAdded += len(batch)
+			batch = batch[:0]
+		}
+
+		for record := range filesToAddChan {
+			batch = append(batch, record)
+			if len(batch) >= batchSize {
+				flushBatch()
+			}
+		}
+		flushBatch()
+		close(done)
+	}()
 
 	// Get concurrency setting (default to 10 if not set)
 	concurrency := cfg.Health.LibrarySyncConcurrency
@@ -559,6 +649,8 @@ func (lsw *LibrarySyncWorker) SyncLibrary(ctx context.Context, dryRun bool) *Dry
 	for mountRelativePath := range metaFileSet {
 		select {
 		case <-ctx.Done():
+			p.Wait()
+			close(filesToAddChan)
 			return nil
 		default:
 		}
@@ -567,48 +659,100 @@ func (lsw *LibrarySyncWorker) SyncLibrary(ctx context.Context, dryRun bool) *Dry
 		path := mountRelativePath
 
 		p.Go(func() {
-			// Check if needs to be added
-			if it, exists := dbPathSet[path]; !exists || it.LibraryPath == nil {
-				// Look up library path from our map
-				libraryPath := lsw.getLibraryPath(path, filesInUse)
+			// Check if needs to be added or repaired
+			var existingRecord *database.AutomaticHealthCheckRecord
+			if it, exists := dbPathSet[path]; exists {
+				existingRecord = &it
+			}
 
+			// Look up library path from our map (found via symlinks/strm scanning)
+			libraryPath := lsw.getLibraryPath(path, filesInUse)
+
+			// Path Recovery: If record exists but the physical path is broken, 
+			// try to see if it's at the expected location even if not in filesInUse
+			if existingRecord != nil && libraryPath == nil {
+				lp := existingRecord.LibraryPath
+				// A path needs recovery if it's nil, missing from disk, or is a relative path (buggy)
+				needsRecovery := lp == nil
+				
+				if !needsRecovery {
+					// Check if path is absolute and file exists
+					if !filepath.IsAbs(*lp) {
+						needsRecovery = true
+					} else if _, err := os.Stat(*lp); os.IsNotExist(err) {
+						needsRecovery = true
+					}
+				}
+
+				if needsRecovery {
+					// Use the configured mount path to build an absolute expected path
+					expectedPath := pathutil.JoinAbsPath(cfg.MountPath, path)
+					if _, err := os.Stat(expectedPath); err == nil {
+						// Found it! Use this recovered path
+						libStr := expectedPath
+						libraryPath = &libStr
+						slog.InfoContext(ctx, "Recovered broken library path", 
+							"path", path, "new_location", expectedPath)
+						
+						// Update DB immediately for this recovered path
+						if err := lsw.healthRepo.UpdateLibraryPath(ctx, path, expectedPath); err != nil {
+							slog.ErrorContext(ctx, "Failed to update recovered library path", 
+								"path", path, "error", err)
+						}
+					}
+				}
+			}
+
+			// Determine if we need to update/add the record
+			needsProcess := existingRecord == nil
+			if !needsProcess {
+				// Update if library path changed (e.g. renamed or recovered)
+				oldLP := existingRecord.LibraryPath
+				if libraryPath != nil && (oldLP == nil || *oldLP != *libraryPath) {
+					needsProcess = true
+				}
+			}
+
+			if needsProcess {
 				record, err := lsw.processMetadataForSync(ctx, path, libraryPath)
 				if err != nil {
-					slog.ErrorContext(ctx, "Failed to read metadata",
+					slog.ErrorContext(ctx, "Failed to read metadata during sync, registering as corrupted",
 						"mount_relative_path", path,
 						"error", err)
 
 					// Register as corrupted so HealthWorker can pick it up and trigger repair
-					if libraryPath != nil {
-						regErr := lsw.healthRepo.RegisterCorruptedFile(ctx, path, libraryPath, err.Error())
-						if regErr != nil {
-							slog.ErrorContext(ctx, "Failed to register corrupted file", "path", path, "error", regErr)
-						}
+					// Even if libraryPath is nil, we want to track this metadata corruption
+					regErr := lsw.healthRepo.RegisterCorruptedFile(ctx, path, libraryPath, err.Error())
+					if regErr != nil {
+						slog.ErrorContext(ctx, "Failed to register corrupted file", "path", path, "error", regErr)
 					}
 					return
 				}
 
 				if record != nil {
-					filesToAddMu.Lock()
-					filesToAdd = append(filesToAdd, *record)
-					filesToAddMu.Unlock()
+					filesToAddChan <- *record
 				}
 			}
 
 			if lsw.progress != nil {
-				lsw.progress.ProcessedFiles.Add(1)
+				current := lsw.progress.ProcessedFiles.Add(1)
+				if current%1000 == 0 {
+					slog.InfoContext(ctx, "Processing metadata progress", "count", current)
+				}
 			}
 		})
 	}
 
-	// Wait for all workers to complete
+	// Wait for all workers to complete and close results channel
 	p.Wait()
+	close(filesToAddChan)
+	<-done
 
-	// Additional cleanup of orphaned metadata files if enabled
+	// Additional cleanup of orphaned database records if enabled
 	metadataDeletedCount := 0
-	if cfg.Health.CleanupOrphanedMetadata != nil && *cfg.Health.CleanupOrphanedMetadata {
+	if shouldCleanup {
 		// We already have libraryFiles from earlier in the function
-		for relativeMountPath := range metaFileSet {
+		for relativeMountPath, metaPath := range metaFileSet {
 			select {
 			case <-ctx.Done():
 				return nil
@@ -619,27 +763,29 @@ func (lsw *LibrarySyncWorker) SyncLibrary(ctx context.Context, dryRun bool) *Dry
 
 			if libraryPath == nil {
 				if !dryRun {
-					deleteSourceNzb := false
-					if cfg.Metadata.DeleteSourceNzbOnRemoval != nil {
-						deleteSourceNzb = *cfg.Metadata.DeleteSourceNzbOnRemoval
+					// DELETE physical metadata file if it's not found in the library
+					if err := os.Remove(metaPath); err != nil {
+						if !os.IsNotExist(err) {
+							slog.ErrorContext(ctx, "Failed to delete orphaned metadata file", 
+								"path", metaPath, "error", err)
+						}
+					} else {
+						slog.InfoContext(ctx, "Deleted orphaned metadata file (not found in library)", 
+							"path", metaPath)
+						metadataDeletedCount++
 					}
-					err := lsw.metadataService.DeleteFileMetadataWithSourceNzb(ctx, relativeMountPath, deleteSourceNzb)
-					if err != nil {
-						slog.ErrorContext(ctx, "Failed to delete metadata file", "error", err)
-						continue
-					}
+				} else {
+					metadataDeletedCount++
 				}
-				metadataDeletedCount++
 			}
 		}
-
 	}
 
 	// Cleanup orphaned library files (symlinks and STRM files without metadata)
 	libraryFilesDeletedCount := 0
 	libraryDirsDeletedCount := 0
 
-	if cfg.Health.CleanupOrphanedMetadata != nil && *cfg.Health.CleanupOrphanedMetadata {
+	if shouldCleanup {
 		for metaPath, file := range filesInUse {
 			select {
 			case <-ctx.Done():
@@ -650,7 +796,33 @@ func (lsw *LibrarySyncWorker) SyncLibrary(ctx context.Context, dryRun bool) *Dry
 			// If the library file points to a metadata path that doesn't exist anymore, it's an orphan
 			if _, exists := metaFileSet[metaPath]; !exists {
 				if !dryRun {
-					err := os.Remove(file)
+					// SAFETY: Never delete physical files in NONE strategy.
+					if cfg.Import.ImportStrategy == config.ImportStrategyNone {
+						slog.DebugContext(ctx, "Skipped library file deletion (NONE strategy safety)", "path", file)
+						continue
+					}
+
+					// Extra safety for other strategies: verify file type before deletion
+					info, err := os.Lstat(file)
+					if err != nil {
+						continue
+					}
+
+					if cfg.Import.ImportStrategy == config.ImportStrategySYMLINK {
+						// Only delete if it's actually a symlink
+						if info.Mode()&os.ModeSymlink == 0 {
+							slog.WarnContext(ctx, "Skipped orphaned file deletion: not a symlink", "path", file)
+							continue
+						}
+					} else if cfg.Import.ImportStrategy == config.ImportStrategySTRM {
+						// Only delete if it's actually a .strm file
+						if !strings.HasSuffix(strings.ToLower(file), ".strm") {
+							slog.WarnContext(ctx, "Skipped orphaned file deletion: not a .strm file", "path", file)
+							continue
+						}
+					}
+
+					err = os.Remove(file)
 					if err != nil {
 						if !os.IsNotExist(err) {
 							slog.ErrorContext(ctx, "Failed to delete library file", "path", file, "error", err)
@@ -663,8 +835,8 @@ func (lsw *LibrarySyncWorker) SyncLibrary(ctx context.Context, dryRun bool) *Dry
 			}
 		}
 
-		// Remove empty directories after file cleanup (only if not dry run)
-		if !dryRun {
+		// Remove empty directories after file cleanup (only if not dry run and cleanup is safe)
+		if !dryRun && shouldCleanup {
 			var err error
 			libraryDirsDeletedCount, err = lsw.removeEmptyDirectories(ctx)
 			if err != nil {
@@ -675,11 +847,18 @@ func (lsw *LibrarySyncWorker) SyncLibrary(ctx context.Context, dryRun bool) *Dry
 		}
 	}
 
-	// Find files to delete (in database but not in filesystem or not in use)
-	filesToDelete := lsw.findFilesToDelete(ctx, dbRecords, metaFileSet, filesInUse)
+	// Find files to delete (in database but not in filesystem or not in the official library)
+	// SAFETY: If mount protection is triggered (shouldCleanup is false),
+	// we pass nil for filesInLibrary to skip the 'in-use' check and prevent mass record deletion.
+	effectiveFilesInLibrary := filesInLibrary
+	if !shouldCleanup {
+		effectiveFilesInLibrary = nil
+	}
+	filesToDelete := lsw.findFilesToDelete(ctx, dbRecords, metaFileSet, effectiveFilesInLibrary)
 
-	// Perform batch operations
-	dbCounts := lsw.syncDatabaseRecords(ctx, filesToAdd, filesToDelete, dryRun)
+	// Perform batch operations for deletions (additions were already streamed)
+	dbCounts := lsw.syncDatabaseRecords(ctx, nil, filesToDelete, dryRun)
+	dbCounts.added = totalAdded
 
 	// Return dry run results or record sync results
 	if dryRun {
@@ -716,7 +895,8 @@ func (lsw *LibrarySyncWorker) getAllMetadataFiles(ctx context.Context) ([]string
 	rootPath := cfg.Metadata.RootPath
 
 	var metaFiles []string
-	err := filepath.Walk(rootPath, func(path string, info os.FileInfo, err error) error {
+	count := 0
+	err := filepath.WalkDir(rootPath, func(path string, d os.DirEntry, err error) error {
 		// Check context cancellation
 		select {
 		case <-ctx.Done():
@@ -728,9 +908,18 @@ func (lsw *LibrarySyncWorker) getAllMetadataFiles(ctx context.Context) ([]string
 			return nil // Skip errors
 		}
 
+		// Skip the corrupted_metadata directory
+		if d.IsDir() && d.Name() == "corrupted_metadata" {
+			return filepath.SkipDir
+		}
+
 		// Only include .meta files
-		if !info.IsDir() && strings.HasSuffix(info.Name(), ".meta") {
+		if !d.IsDir() && strings.HasSuffix(d.Name(), ".meta") {
 			metaFiles = append(metaFiles, path)
+			count++
+			if count%1000 == 0 {
+				slog.InfoContext(ctx, "Scanning metadata files progress", "count", count)
+			}
 		}
 
 		return nil
@@ -740,6 +929,7 @@ func (lsw *LibrarySyncWorker) getAllMetadataFiles(ctx context.Context) ([]string
 		return nil, err
 	}
 
+	slog.InfoContext(ctx, "Finished scanning metadata files", "total", count)
 	return metaFiles, nil
 }
 
@@ -796,12 +986,16 @@ func (lsw *LibrarySyncWorker) processMetadataForSync(
 	// Calculate initial check time
 	scheduledCheckAt := calculateInitialCheck(releaseDateAsTime)
 
+	cfg := lsw.configGetter()
+
 	return &database.AutomaticHealthCheckRecord{
 		FilePath:         path,
 		LibraryPath:      libraryPath,
 		ReleaseDate:      &releaseDateAsTime,
 		ScheduledCheckAt: &scheduledCheckAt,
 		SourceNzbPath:    &fileMeta.SourceNzbPath,
+		MaxRetries:       cfg.GetMaxRetries(),
+		MaxRepairRetries: cfg.GetMaxRepairRetries(),
 	}, nil
 }
 
@@ -830,6 +1024,9 @@ func updateSymlinkForMountChange(
 	}
 
 	// Create new symlink
+	if runtime.GOOS == "windows" {
+		return currentTarget, false, fmt.Errorf("symlinks are not supported on Windows")
+	}
 	if err := os.Symlink(newTarget, symlinkPath); err != nil {
 		slog.ErrorContext(ctx, "Failed to create updated symlink",
 			"path", symlinkPath,
@@ -859,6 +1056,7 @@ func (lsw *LibrarySyncWorker) getAllLibraryFiles(ctx context.Context, oldMountPa
 
 	libraryDir := *cfg.Health.LibraryDir
 	mountDir := cfg.MountPath
+	cleanMountDir := filepath.Clean(mountDir)
 
 	result := &UsedFiles{
 		Symlinks:  make(map[string]string),
@@ -866,6 +1064,7 @@ func (lsw *LibrarySyncWorker) getAllLibraryFiles(ctx context.Context, oldMountPa
 	}
 
 	symlinkUpdates := 0
+	count := 0
 	shouldUpdateSymlinks := oldMountPath != "" && newMountPath != "" && oldMountPath != newMountPath
 	oldMountPathClean := filepath.Clean(oldMountPath)
 	newMountPathClean := filepath.Clean(newMountPath)
@@ -899,7 +1098,6 @@ func (lsw *LibrarySyncWorker) getAllLibraryFiles(ctx context.Context, oldMountPa
 
 			// Clean the paths for comparison
 			cleanTarget := filepath.Clean(target)
-			cleanMountDir := filepath.Clean(mountDir)
 
 			// Update symlink if it points to the old mount path
 			if shouldUpdateSymlinks && strings.HasPrefix(cleanTarget, oldMountPathClean) {
@@ -917,45 +1115,60 @@ func (lsw *LibrarySyncWorker) getAllLibraryFiles(ctx context.Context, oldMountPa
 			if strings.HasPrefix(cleanTarget, cleanMountDir) {
 				// Store mapping of mount target path -> library symlink path
 				result.Symlinks[cleanTarget] = path
+				count++
+			}
+		} else if !d.IsDir() {
+			// Check if it's a .strm file
+			if strings.HasSuffix(d.Name(), ".strm") {
+				// Read the STRM file content to extract the URL
+				content, err := os.ReadFile(path)
+				if err != nil {
+					slog.WarnContext(ctx, "Failed to read STRM file",
+						"path", path,
+						"error", err)
+					return nil
+				}
+
+				// Parse the URL from the file content (trim whitespace)
+				urlStr := strings.TrimSpace(string(content))
+				parsedURL, err := url.Parse(urlStr)
+				if err != nil {
+					slog.WarnContext(ctx, "Failed to parse URL from STRM file",
+						"path", path,
+						"url", urlStr,
+						"error", err)
+					return nil
+				}
+
+				// Extract the 'path' query parameter
+				virtualPath := parsedURL.Query().Get("path")
+				if virtualPath == "" {
+					slog.WarnContext(ctx, "STRM file URL missing 'path' query parameter",
+						"path", path,
+						"url", urlStr)
+					return nil
+				}
+
+				// Normalize path separators
+				virtualPath = filepath.ToSlash(virtualPath)
+
+				// Store mapping of virtual path -> library .strm file path
+				result.StrmFiles[virtualPath] = path
+				count++
+			} else if cfg.Import.ImportStrategy == config.ImportStrategyNone {
+				// For NONE strategy, also count regular files if they are in the mount directory
+				cleanPath := filepath.Clean(path)
+
+				if strings.HasPrefix(cleanPath, cleanMountDir) {
+					// In NONE strategy, the library file IS the mount file
+					result.Symlinks[cleanPath] = path
+					count++
+				}
 			}
 		}
 
-		// Check if it's a .strm file
-		if !d.IsDir() && strings.HasSuffix(d.Name(), ".strm") {
-			// Read the STRM file content to extract the URL
-			content, err := os.ReadFile(path)
-			if err != nil {
-				slog.WarnContext(ctx, "Failed to read STRM file",
-					"path", path,
-					"error", err)
-				return nil
-			}
-
-			// Parse the URL from the file content (trim whitespace)
-			urlStr := strings.TrimSpace(string(content))
-			parsedURL, err := url.Parse(urlStr)
-			if err != nil {
-				slog.WarnContext(ctx, "Failed to parse URL from STRM file",
-					"path", path,
-					"url", urlStr,
-					"error", err)
-				return nil
-			}
-
-			// Extract the 'path' query parameter
-			virtualPath := parsedURL.Query().Get("path")
-			if virtualPath == "" {
-				slog.WarnContext(ctx, "STRM file URL missing 'path' query parameter",
-					"path", path,
-					"url", urlStr)
-				return nil
-			}
-
-			// Normalize path separators
-			virtualPath = filepath.ToSlash(virtualPath)
-
-			// Store mapping of virtual path -> library .strm file path
-			result.StrmFiles[virtualPath] = path
+		if count > 0 && count%1000 == 0 {
+			slog.InfoContext(ctx, "Scanning library files progress", "count", count)
 		}
 
 		return nil
@@ -966,6 +1179,7 @@ func (lsw *LibrarySyncWorker) getAllLibraryFiles(ctx context.Context, oldMountPa
 		return nil, 0, err
 	}
 
+	slog.InfoContext(ctx, "Finished scanning library files", "total", count)
 	return result, symlinkUpdates, nil
 }
 
@@ -1077,8 +1291,10 @@ func (lsw *LibrarySyncWorker) getAllImportDirFiles(ctx context.Context, oldMount
 		} else if strings.HasSuffix(d.Name(), ".strm") {
 			// STRM file - add without .strm extension
 			result.StrmFiles[strings.TrimSuffix(virtualPath, ".strm")] = path
+		} else if cfg.Import.ImportStrategy == config.ImportStrategyNone {
+			// For NONE strategy, also count regular files
+			result.Symlinks[virtualPath] = path
 		}
-		// Ignore all other regular files
 
 		return nil
 	})
@@ -1095,7 +1311,7 @@ func (lsw *LibrarySyncWorker) getAllImportDirFiles(ctx context.Context, oldMount
 // It checks both the full mount path and the relative path (for STRM files)
 func (lsw *LibrarySyncWorker) getLibraryPath(metaPath string, filesInUse map[string]string) *string {
 	cfg := lsw.configGetter()
-	mountPath := filepath.Join(cfg.MountPath, strings.TrimPrefix(metaPath, "/"))
+	mountPath := pathutil.JoinAbsPath(cfg.MountPath, metaPath)
 
 	if libPath, ok := filesInUse[mountPath]; ok {
 		return &libPath

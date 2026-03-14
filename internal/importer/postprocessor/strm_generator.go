@@ -27,21 +27,63 @@ func (c *Coordinator) CreateStrmFiles(ctx context.Context, item *database.Import
 		return fmt.Errorf("STRM directory not configured")
 	}
 
+	// Keep the original resulting path for metadata and streaming URL
+	originalResultingPath := resultingPath
+
+	// 1. Get the internal relative path (relative to FUSE mount)
+	relPath := strings.TrimPrefix(resultingPath, "/")
+
+	// 2. Strip any existing /complete or /category prefix from the internal path to start clean
+	category := ""
+	if item.Category != nil && *item.Category != "" {
+		category = strings.Trim(*item.Category, "/")
+	}
+
+	if cfg.SABnzbd.CompleteDir != "" {
+		completeDir := strings.Trim(filepath.ToSlash(cfg.SABnzbd.CompleteDir), "/")
+		if after, ok := strings.CutPrefix(relPath, completeDir+"/"); ok {
+			relPath = after
+		} else if relPath == completeDir {
+			relPath = ""
+		}
+	}
+	if category != "" {
+		if after, ok := strings.CutPrefix(relPath, category+"/"); ok {
+			relPath = after
+		} else if relPath == category {
+			relPath = ""
+		}
+	}
+
+	// 3. Build the clean, isolated library path
+	// Construct: [CompleteDir] + [Category] + RelPath
+	pathParts := []string{}
+	if cfg.SABnzbd.CompleteDir != "" {
+		pathParts = append(pathParts, strings.Trim(cfg.SABnzbd.CompleteDir, "/"))
+	}
+	if category != "" {
+		pathParts = append(pathParts, category)
+	}
+	pathParts = append(pathParts, relPath)
+
+	resultingPath = filepath.Join(pathParts...)
+	resultingPath = filepath.ToSlash(filepath.Clean(resultingPath))
+
 	// Check the metadata directory to determine if this is a file or directory
-	metadataPath := filepath.Join(cfg.Metadata.RootPath, strings.TrimPrefix(resultingPath, "/"))
+	metadataPath := filepath.Join(cfg.Metadata.RootPath, strings.TrimPrefix(originalResultingPath, "/"))
 	fileInfo, err := os.Stat(metadataPath)
 
 	// If stat fails, check if it's a .meta file (single file case)
 	if err != nil {
 		metaFile := metadataPath + ".meta"
 		if _, metaErr := os.Stat(metaFile); metaErr == nil {
-			return c.createSingleStrmFile(ctx, resultingPath, cfg.WebDAV.Port)
+			return c.CreateSingleStrmFile(ctx, resultingPath, originalResultingPath, cfg.WebDAV.Port)
 		}
 		return fmt.Errorf("failed to stat metadata path: %w", err)
 	}
 
 	if !fileInfo.IsDir() {
-		return c.createSingleStrmFile(ctx, resultingPath, cfg.WebDAV.Port)
+		return c.CreateSingleStrmFile(ctx, resultingPath, originalResultingPath, cfg.WebDAV.Port)
 	}
 
 	// Directory - walk through and create STRM files for all files
@@ -61,7 +103,7 @@ func (c *Coordinator) CreateStrmFiles(ctx context.Context, item *database.Import
 		}
 
 		// Calculate relative path from the root metadata directory
-		relPath, err := filepath.Rel(cfg.Metadata.RootPath, path)
+		relPathWithMeta, err := filepath.Rel(cfg.Metadata.RootPath, path)
 		if err != nil {
 			c.log.ErrorContext(ctx, "Failed to calculate relative path",
 				"path", path,
@@ -71,9 +113,48 @@ func (c *Coordinator) CreateStrmFiles(ctx context.Context, item *database.Import
 		}
 
 		// Remove .meta extension
-		relPath = strings.TrimSuffix(relPath, ".meta")
+		relPath := strings.TrimSuffix(relPathWithMeta, ".meta")
 
-		if err := c.createSingleStrmFile(ctx, relPath, cfg.WebDAV.Port); err != nil {
+		// 1. Get the internal relative path (relative to FUSE mount)
+		relPath = strings.TrimPrefix(relPath, "/")
+
+		// 2. Strip any existing /complete or /category prefix from the internal path to start clean
+		category := ""
+		if item.Category != nil && *item.Category != "" {
+			category = strings.Trim(*item.Category, "/")
+		}
+
+		if cfg.SABnzbd.CompleteDir != "" {
+			completeDir := strings.Trim(filepath.ToSlash(cfg.SABnzbd.CompleteDir), "/")
+			if after, ok := strings.CutPrefix(relPath, completeDir+"/"); ok {
+				relPath = after
+			} else if relPath == completeDir {
+				relPath = ""
+			}
+		}
+		if category != "" {
+			if after, ok := strings.CutPrefix(relPath, category+"/"); ok {
+				relPath = after
+			} else if relPath == category {
+				relPath = ""
+			}
+		}
+
+		// 3. Build the clean, isolated library path
+		// Construct: [CompleteDir] + [Category] + RelPath
+		pathParts := []string{}
+		if cfg.SABnzbd.CompleteDir != "" {
+			pathParts = append(pathParts, strings.Trim(cfg.SABnzbd.CompleteDir, "/"))
+		}
+		if category != "" {
+			pathParts = append(pathParts, category)
+		}
+		pathParts = append(pathParts, relPath)
+
+		strmResultingPath := filepath.Join(pathParts...)
+		strmResultingPath = filepath.ToSlash(filepath.Clean(strmResultingPath))
+
+		if err := c.CreateSingleStrmFile(ctx, strmResultingPath, relPathWithMeta, cfg.WebDAV.Port); err != nil {
 			c.log.ErrorContext(ctx, "Failed to create STRM file",
 				"path", relPath,
 				"error", err)
@@ -99,19 +180,19 @@ func (c *Coordinator) CreateStrmFiles(ctx context.Context, item *database.Import
 	return nil
 }
 
-// createSingleStrmFile creates a STRM file for a single file with authentication
-func (c *Coordinator) createSingleStrmFile(ctx context.Context, virtualPath string, port int) error {
+// CreateSingleStrmFile creates a STRM file for a single file with authentication
+func (c *Coordinator) CreateSingleStrmFile(ctx context.Context, strmResultingPath, originalVirtualPath string, port int) error {
 	cfg := c.configGetter()
 
-	baseDir := filepath.Join(*cfg.Import.ImportDir, filepath.Dir(virtualPath))
+	baseDir := filepath.Join(*cfg.Import.ImportDir, filepath.Dir(strings.TrimPrefix(strmResultingPath, "/")))
 
-	if err := os.MkdirAll(baseDir, 0755); err != nil {
+	if err := os.MkdirAll(baseDir, 0775); err != nil {
 		return fmt.Errorf("failed to create STRM directory: %w", err)
 	}
 
 	// Keep original filename and add .strm extension
-	filename := filepath.Base(virtualPath) + ".strm"
-	strmPath := filepath.Join(*cfg.Import.ImportDir, filepath.Dir(virtualPath), filename)
+	filename := filepath.Base(strmResultingPath) + ".strm"
+	strmPath := filepath.Join(*cfg.Import.ImportDir, filepath.Dir(strings.TrimPrefix(strmResultingPath, "/")), filename)
 
 	// Get first admin user's API key for authentication
 	if c.userRepo == nil {
@@ -145,8 +226,8 @@ func (c *Coordinator) createSingleStrmFile(ctx context.Context, virtualPath stri
 		host = "localhost"
 	}
 
-	// Generate streaming URL with download_key
-	encodedPath := strings.ReplaceAll(virtualPath, " ", "%20")
+	// Generate streaming URL with download_key using the ORIGINAL virtual path
+	encodedPath := strings.ReplaceAll(originalVirtualPath, " ", "%20")
 	streamURL := fmt.Sprintf("http://%s:%d/api/files/stream?path=%s&download_key=%s",
 		host, port, encodedPath, hashedKey)
 

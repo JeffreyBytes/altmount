@@ -20,6 +20,10 @@ func (m *mockConfigManager) GetConfig() *config.Config {
 	return m.cfg
 }
 
+func (m *mockConfigManager) GetConfigGetter() config.ConfigGetter {
+	return m.GetConfig
+}
+
 func (m *mockConfigManager) UpdateConfig(cfg *config.Config) error {
 	m.cfg = cfg
 	return nil
@@ -72,7 +76,7 @@ func TestHandleArrsWebhook_EpisodeFileDelete(t *testing.T) {
 
 	app.Post("/api/arrs/webhook", server.handleArrsWebhook)
 
-	payload := map[string]interface{}{
+	payload := map[string]any{
 		"eventType": "EpisodeFileDelete",
 		"episodeFile": map[string]string{
 			"path": "/some/path/episode.mkv",
@@ -87,7 +91,7 @@ func TestHandleArrsWebhook_EpisodeFileDelete(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, 200, resp.StatusCode)
 
-	var result map[string]interface{}
+	var result map[string]any
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		t.Fatalf("Failed to decode response: %v", err)
 	}
@@ -112,7 +116,7 @@ func TestHandleArrsWebhook_MovieFileDelete(t *testing.T) {
 
 	app.Post("/api/arrs/webhook", server.handleArrsWebhook)
 
-	payload := map[string]interface{}{
+	payload := map[string]any{
 		"eventType": "MovieFileDelete",
 		"movie": map[string]string{
 			"folderPath": "/some/path/movie",
@@ -127,7 +131,7 @@ func TestHandleArrsWebhook_MovieFileDelete(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, 200, resp.StatusCode)
 
-	var result map[string]interface{}
+	var result map[string]any
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		t.Fatalf("Failed to decode response: %v", err)
 	}

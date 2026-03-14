@@ -137,6 +137,11 @@ func isFileAlreadyProcessed(metadataService *metadata.MetadataService, filePath 
 	return false
 }
 
+// GetPostProcessor returns the post-processor coordinator
+func (s *Service) GetPostProcessor() *postprocessor.Coordinator {
+	return s.postProcessor
+}
+
 // Service provides NZB import functionality with manual directory scanning and queue-based processing
 type Service struct {
 	config          ServiceConfig
@@ -167,6 +172,14 @@ type Service struct {
 	// Cancellation tracking for processing items
 	cancelFuncs map[int64]context.CancelFunc
 	cancelMu    sync.RWMutex
+
+	// categoryPathCache memoizes buildCategoryPath results; cleared on config reload.
+	categoryPathCache sync.Map
+
+	// writtenPathsCache stores the metadata paths written during ProcessItem so that
+	// HandleFailure can clean them up without changing the ItemProcessor interface.
+	// Keys are item.ID (int64), values are []string.
+	writtenPathsCache sync.Map
 }
 
 // NewService creates a new NZB import service with manual scanning and queue processing capabilities
@@ -186,9 +199,17 @@ func NewService(config ServiceConfig, metadataService *metadata.MetadataService,
 	if readTimeout == 0 {
 		readTimeout = 5 * time.Minute
 	}
+	allowNestedRarExtraction := true
+	if currentConfig.Import.AllowNestedRarExtraction != nil {
+		allowNestedRarExtraction = *currentConfig.Import.AllowNestedRarExtraction
+	}
+	expandBlurayIso := true
+	if currentConfig.Import.ExpandBlurayIso != nil {
+		expandBlurayIso = *currentConfig.Import.ExpandBlurayIso
+	}
 
 	// Create processor with poolManager for dynamic pool access
-	processor := NewProcessor(metadataService, poolManager, maxImportConnections, segmentSamplePercentage, allowedFileExtensions, maxDownloadPrefetch, readTimeout, broadcaster, configGetter)
+	processor := NewProcessor(metadataService, poolManager, maxImportConnections, segmentSamplePercentage, allowedFileExtensions, maxDownloadPrefetch, readTimeout, broadcaster, configGetter, nil, allowNestedRarExtraction, expandBlurayIso)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -220,6 +241,9 @@ func NewService(config ServiceConfig, metadataService *metadata.MetadataService,
 		paused:          false,
 	}
 
+	// Set recorder for processor
+	processor.SetRecorder(service)
+
 	// Create scanner adapter for directory scanning
 	scannerAdapter := &queueAdapterForScanner{
 		repo:            database.Repository,
@@ -244,10 +268,16 @@ func NewService(config ServiceConfig, metadataService *metadata.MetadataService,
 			ConfigGetter: configGetter,
 		},
 		database.Repository,
-		service,
+		service, // ItemProcessor
+		service, // QueueEventListener
 	)
 
 	return service, nil
+}
+
+// AddImportHistory records a successful file import in persistent history
+func (s *Service) AddImportHistory(ctx context.Context, history *database.ImportHistory) error {
+	return s.database.Repository.AddImportHistory(ctx, history)
 }
 
 // Start starts the NZB import service (queue workers only, manual scanning available via API)
@@ -291,16 +321,23 @@ func (s *Service) Start(ctx context.Context) error {
 
 // ProcessItem implements queue.ItemProcessor - processes a single queue item
 func (s *Service) ProcessItem(ctx context.Context, item *database.ImportQueueItem) (string, error) {
-	return s.processNzbItem(ctx, item)
+	resultPath, writtenPaths, err := s.processNzbItem(ctx, item)
+	// Always store written paths so HandleFailure can clean them up on error.
+	s.writtenPathsCache.Store(item.ID, writtenPaths)
+	return resultPath, err
 }
 
 // HandleSuccess implements queue.ItemProcessor - handles successful processing
 func (s *Service) HandleSuccess(ctx context.Context, item *database.ImportQueueItem, resultingPath string) error {
+	s.writtenPathsCache.Delete(item.ID)
 	return s.handleProcessingSuccess(ctx, item, resultingPath)
 }
 
 // HandleFailure implements queue.ItemProcessor - handles failed processing
 func (s *Service) HandleFailure(ctx context.Context, item *database.ImportQueueItem, err error) {
+	if paths, ok := s.writtenPathsCache.LoadAndDelete(item.ID); ok {
+		s.cleanupWrittenPaths(ctx, item.ID, paths.([]string))
+	}
 	s.handleProcessingFailure(ctx, item, err)
 }
 
@@ -327,8 +364,9 @@ func (s *Service) IsPaused() bool {
 	return s.queueManager.IsPaused()
 }
 
-func (s *Service) RegisterConfigChangeHandler(configManager *config.Manager) {
-	configManager.OnConfigChange(func(oldConfig, newConfig *config.Config) {
+func (s *Service) RegisterConfigChangeHandler(configManager any) {
+	mgr := configManager.(*config.Manager)
+	mgr.OnConfigChange(func(oldConfig, newConfig *config.Config) {
 		s.mu.Lock()
 		defer s.mu.Unlock()
 
@@ -393,14 +431,18 @@ func (s *Service) IsRunning() bool {
 }
 
 // SetRcloneClient sets or updates the RClone client for VFS notifications
-func (s *Service) SetRcloneClient(client rclonecli.RcloneRcClient) {
+func (s *Service) SetRcloneClient(client any) {
+	var rc rclonecli.RcloneRcClient
+	if client != nil {
+		rc = client.(rclonecli.RcloneRcClient)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.rcloneClient = client
+	s.rcloneClient = rc
 	if s.postProcessor != nil {
-		s.postProcessor.SetRcloneClient(client)
+		s.postProcessor.SetRcloneClient(rc)
 	}
-	if client != nil {
+	if rc != nil {
 		s.log.InfoContext(s.ctx, "RClone client updated for VFS notifications")
 	} else {
 		s.log.InfoContext(s.ctx, "RClone client disabled")
@@ -408,15 +450,18 @@ func (s *Service) SetRcloneClient(client rclonecli.RcloneRcClient) {
 }
 
 // SetArrsService sets or updates the ARRs service
-func (s *Service) SetArrsService(service *arrs.Service) {
+func (s *Service) SetArrsService(service any) {
+	var as *arrs.Service
+	if service != nil {
+		as = service.(*arrs.Service)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.arrsService = service
+	s.arrsService = as
 	if s.postProcessor != nil {
-		s.postProcessor.SetArrsService(service)
+		s.postProcessor.SetArrsService(as)
 	}
 }
-
 
 // GetQueueStats returns current queue statistics from database
 func (s *Service) GetQueueStats(ctx context.Context) (*database.QueueStats, error) {
@@ -559,12 +604,12 @@ func (s *Service) AddToQueue(ctx context.Context, filePath string, relativePath 
 
 	// Calculate file size before adding to queue
 	var fileSize *int64
-	if size, err := s.CalculateFileSizeOnly(filePath); err != nil {
+	if size, err := s.CalculateFileSizeOnly(filePath); err == nil {
+		fileSize = &size
+	} else {
 		s.log.WarnContext(ctx, "Failed to calculate file size", "file", filePath, "error", err)
 		// Continue with NULL file size - don't fail the queue addition
 		fileSize = nil
-	} else {
-		fileSize = &size
 	}
 
 	// Use default priority if not specified
@@ -596,6 +641,10 @@ func (s *Service) AddToQueue(ctx context.Context, filePath string, relativePath 
 		return nil, err
 	}
 
+	if s.broadcaster != nil {
+		s.broadcaster.BroadcastQueueChanged()
+	}
+
 	if fileSize != nil {
 		s.log.InfoContext(ctx, "Added NZB file to queue", "file", item.NzbPath, "queue_id", item.ID, "file_size", *fileSize)
 	} else {
@@ -606,7 +655,7 @@ func (s *Service) AddToQueue(ctx context.Context, filePath string, relativePath 
 }
 
 // processNzbItem processes the NZB file for a queue item
-func (s *Service) processNzbItem(ctx context.Context, item *database.ImportQueueItem) (string, error) {
+func (s *Service) processNzbItem(ctx context.Context, item *database.ImportQueueItem) (string, []string, error) {
 	// Determine the base path
 	basePath := ""
 	if item.RelativePath != nil {
@@ -618,7 +667,7 @@ func (s *Service) processNzbItem(ctx context.Context, item *database.ImportQueue
 
 	// Ensure NZB is in a persistent location to prevent data loss if /tmp is cleaned
 	if err := s.ensurePersistentNzb(ctx, item); err != nil {
-		return "", fmt.Errorf("failed to ensure persistent NZB: %w", err)
+		return "", nil, fmt.Errorf("failed to ensure persistent NZB: %w", err)
 	}
 
 	// Determine if allowed extensions override is needed
@@ -640,7 +689,7 @@ func (s *Service) processNzbItem(ctx context.Context, item *database.ImportQueue
 		}
 	}
 
-	return s.processor.ProcessNzbFile(ctx, item.NzbPath, basePath, int(item.ID), allowedExtensionsOverride, &virtualDir, extractedFiles)
+	return s.processor.ProcessNzbFile(ctx, item.NzbPath, basePath, int(item.ID), allowedExtensionsOverride, &virtualDir, extractedFiles, item.Category)
 }
 
 func (s *Service) calculateProcessVirtualDir(item *database.ImportQueueItem, basePath *string) string {
@@ -663,14 +712,24 @@ func (s *Service) calculateProcessVirtualDir(item *database.ImportQueueItem, bas
 				// Recalculate virtualDir relative to the nzbFolder to discard physical parent paths like /config
 				// We use the subdirectory structure found inside .nzbs if it exists
 
-				cleanBase := filepath.ToSlash(*basePath)
+				// Strip 'failed' subdirectory if present (added when items fail and are moved to .nzbs/failed)
+				// We want to avoid including 'failed' in the virtual directory path during retries.
 				cleanRel := filepath.ToSlash(relDir)
+				if after, ok := strings.CutPrefix(cleanRel, "failed/"); ok {
+					cleanRel = after
+				} else if cleanRel == "failed" {
+					cleanRel = ""
+				}
 
+				cleanBase := filepath.ToSlash(*basePath)
 				// Avoid duplication if basePath already starts with relDir (common with Watcher or manual imports)
-				if *basePath != "" && (cleanBase == cleanRel || strings.HasPrefix(cleanBase, cleanRel+"/")) {
+				// We only apply this reconstruction if basePath is empty or root, otherwise we trust basePath
+				if cleanBase != "" && cleanBase != "/" && cleanBase != "." {
+					virtualDir = *basePath
+				} else if *basePath != "" && (cleanBase == cleanRel || strings.HasPrefix(cleanBase, cleanRel+"/")) {
 					virtualDir = *basePath
 				} else {
-					virtualDir = filepath.Join(*basePath, relDir)
+					virtualDir = filepath.Join(*basePath, cleanRel)
 				}
 			}
 
@@ -726,22 +785,20 @@ func (s *Service) calculateProcessVirtualDir(item *database.ImportQueueItem, bas
 	}
 	virtualDir = filepath.ToSlash(virtualDir)
 
-	// Prepend SABnzbd CompleteDir to virtualDir
 	cfg := s.configGetter()
-	if cfg.SABnzbd.CompleteDir != "" {
-		completeDir := filepath.ToSlash(cfg.SABnzbd.CompleteDir)
-		// Ensure completeDir is absolute for comparison
+	// ALWAYS prepend CompleteDir to isolate completed downloads from final library.
+	if cfg != nil && cfg.SABnzbd.CompleteDir != "" {
+		completeDir := strings.TrimRight(filepath.ToSlash(cfg.SABnzbd.CompleteDir), "/")
 		if !strings.HasPrefix(completeDir, "/") {
 			completeDir = "/" + completeDir
 		}
 
-		if !strings.HasPrefix(virtualDir, completeDir) {
+		if completeDir != "/" && !strings.HasPrefix(virtualDir, completeDir+"/") && virtualDir != completeDir {
 			virtualDir = filepath.Join(completeDir, virtualDir)
-			virtualDir = filepath.ToSlash(virtualDir)
 		}
 	}
 
-	return virtualDir
+	return filepath.ToSlash(virtualDir)
 }
 
 // ensurePersistentNzb moves the NZB file to a persistent location in the metadata directory
@@ -776,12 +833,19 @@ func (s *Service) ensurePersistentNzb(ctx context.Context, item *database.Import
 	newFilename := sanitizeFilename(filename)
 	newPath := filepath.Join(nzbDir, newFilename)
 
-	// Replace strategy: remove existing file if it exists
+	// If a file with the same name already exists, append a numeric counter suffix
+	// (e.g. movie.nzb → movie_1.nzb) to avoid silently overwriting a different item.
 	if _, err := os.Stat(newPath); err == nil {
-		s.log.DebugContext(ctx, "Replacing existing persistent NZB", "path", newPath)
-		if err := os.Remove(newPath); err != nil {
-			return fmt.Errorf("failed to remove existing NZB for replace: %w", err)
+		ext := filepath.Ext(newFilename)
+		base := strings.TrimSuffix(newFilename, ext)
+		for i := 1; ; i++ {
+			candidate := filepath.Join(nzbDir, fmt.Sprintf("%s_%d%s", base, i, ext))
+			if _, statErr := os.Stat(candidate); os.IsNotExist(statErr) {
+				newPath = candidate
+				break
+			}
 		}
+		s.log.DebugContext(ctx, "NZB name collision, using alternate path", "path", newPath)
 	}
 
 	s.log.DebugContext(ctx, "Moving NZB to persistent storage", "old_path", item.NzbPath, "new_path", newPath)
@@ -810,33 +874,18 @@ func (s *Service) ensurePersistentNzb(ctx context.Context, item *database.Import
 			return fmt.Errorf("failed to copy NZB content: %w", err)
 		}
 
-		// Remove source if copy successful
-		// Note: We close srcFile via defer, but for removal on Windows/some FS we might need to close it first.
-		// Since we are in a function and defer runs at end, we can't remove yet if we don't close.
-		// But in this block we can just let it stay until end of function? No, we want to remove it.
-		// For simplicity, we can ignore removal failure or try to handle it better.
-		// Actually, we should probably close before removing.
+		// Close files explicitly to allow deletion
+		srcFile.Close()
+		dstFile.Close()
+
+		if err := os.Remove(item.NzbPath); err != nil {
+			s.log.WarnContext(ctx, "Failed to remove source NZB after copy", "path", item.NzbPath, "error", err)
+		}
 	}
 
-	// If we copied, we should remove the original.
-	// But `os.Rename` handles removal.
-	// If we fell back to copy, we need to remove.
-	if err != nil { // This err refers to Rename failure
-		// Close files (deferred, but we might want to close src explicitly if we want to delete)
-		// Since we didn't assign srcFile/dstFile to vars outside, we rely on GC/Defer.
-		// But defer runs at function exit.
-		// So removal might fail if open.
-		// Let's rely on standard practice or simple cleanup.
-		// If Rename failed, we copied.
-		// We should try to remove the source file.
-		os.Remove(item.NzbPath)
-	}
-
-	// Update item path in memory
+	// Update DB
 	oldPath := item.NzbPath
 	item.NzbPath = newPath
-
-	// Update item path in DB
 	if err := s.database.Repository.UpdateQueueItemNzbPath(ctx, item.ID, newPath); err != nil {
 		// If DB update fails, we are in a weird state (file moved but DB points to old).
 		// We should probably try to move it back or just fail.
@@ -851,19 +900,25 @@ func (s *Service) ensurePersistentNzb(ctx context.Context, item *database.Import
 	return nil
 }
 
-// buildCategoryPath resolves a category name to its configured directory path.
-// Returns the category's Dir if configured, otherwise falls back to the category name.
-// buildCategoryPath builds the directory path for a category.
-// For Default category, returns its configured Dir (defaults to "complete").
+// buildCategoryPath resolves a category name to its configured directory path (memoized).
 func (s *Service) buildCategoryPath(category string) string {
-	// Empty category uses Default category
 	if category == "" {
 		category = config.DefaultCategoryName
 	}
 
+	if cached, ok := s.categoryPathCache.Load(category); ok {
+		return cached.(string)
+	}
+
+	result := s.resolveCategoryPath(category)
+	s.categoryPathCache.Store(category, result)
+	return result
+}
+
+// resolveCategoryPath performs the actual category-to-directory resolution.
+func (s *Service) resolveCategoryPath(category string) string {
 	cfg := s.configGetter()
 	if cfg == nil || len(cfg.SABnzbd.Categories) == 0 {
-		// No config, use default dir for Default category
 		if strings.EqualFold(category, config.DefaultCategoryName) {
 			return config.DefaultCategoryDir
 		}
@@ -875,7 +930,6 @@ func (s *Service) buildCategoryPath(category string) string {
 			if cat.Dir != "" {
 				return cat.Dir
 			}
-			// For Default category with empty Dir, return default dir
 			if strings.EqualFold(category, config.DefaultCategoryName) {
 				return config.DefaultCategoryDir
 			}
@@ -920,9 +974,10 @@ func (s *Service) handleProcessingSuccess(ctx context.Context, item *database.Im
 		return err
 	}
 
-	// Clear progress tracking
+	// Notify completion and clear progress tracking
 	if s.broadcaster != nil {
-		s.broadcaster.ClearProgress(int(item.ID))
+		s.broadcaster.NotifyComplete(int(item.ID), "completed")
+		s.broadcaster.BroadcastQueueChanged()
 	}
 
 	s.log.InfoContext(ctx, "Successfully processed queue item", "queue_id", item.ID, "file", item.NzbPath)
@@ -937,6 +992,45 @@ func (s *Service) handleProcessingSuccess(ctx context.Context, item *database.Im
 	}
 
 	return nil
+}
+
+// OnItemClaimed implements queue.QueueEventListener. It broadcasts a queue-changed
+// notification whenever a worker claims a pending item (pending → processing transition).
+func (s *Service) OnItemClaimed(ctx context.Context, item *database.ImportQueueItem) {
+	if s.broadcaster != nil {
+		s.broadcaster.BroadcastQueueChanged()
+	}
+}
+
+// cleanupWrittenPaths deletes metadata files/directories written during a failed import.
+// Paths prefixed with "DIR:" indicate a whole directory should be removed; others are individual files.
+func (s *Service) cleanupWrittenPaths(ctx context.Context, itemID int64, paths []string) {
+	for _, p := range paths {
+		if strings.HasPrefix(p, "DIR:") {
+			dirPath := strings.TrimPrefix(p, "DIR:")
+			if delErr := s.metadataService.DeleteDirectory(dirPath); delErr != nil {
+				s.log.WarnContext(ctx, "Failed to clean up metadata directory after import failure",
+					"queue_id", itemID,
+					"dir", dirPath,
+					"error", delErr)
+			} else {
+				s.log.DebugContext(ctx, "Cleaned up metadata directory after import failure",
+					"queue_id", itemID,
+					"dir", dirPath)
+			}
+		} else {
+			if delErr := s.metadataService.DeleteFileMetadata(p); delErr != nil {
+				s.log.WarnContext(ctx, "Failed to clean up metadata file after import failure",
+					"queue_id", itemID,
+					"path", p,
+					"error", delErr)
+			} else {
+				s.log.DebugContext(ctx, "Cleaned up metadata file after import failure",
+					"queue_id", itemID,
+					"path", p)
+			}
+		}
+	}
 }
 
 // handleProcessingFailure handles when processing fails
@@ -965,21 +1059,26 @@ func (s *Service) handleProcessingFailure(ctx context.Context, item *database.Im
 			"file", item.NzbPath)
 	}
 
-	// Clear progress tracking
+	// Notify failure and clear progress tracking
 	if s.broadcaster != nil {
-		s.broadcaster.ClearProgress(int(item.ID))
+		s.broadcaster.NotifyComplete(int(item.ID), "failed")
+		s.broadcaster.BroadcastQueueChanged()
 	}
 
 	// Delegate fallback handling to post-processor
 	if err := s.postProcessor.HandleFailure(ctx, item, processingErr); err == nil {
-		// Fallback succeeded - mark item as fallback instead of failed
-		if err := s.database.Repository.UpdateQueueItemStatus(ctx, item.ID, database.QueueStatusFallback, nil); err != nil {
-			s.log.ErrorContext(ctx, "Failed to mark item as fallback", "queue_id", item.ID, "error", err)
+		// Fallback succeeded - remove item from queue since ownership transfers to external SABnzbd
+		if err := s.database.Repository.RemoveFromQueue(ctx, item.ID); err != nil {
+			s.log.ErrorContext(ctx, "Failed to remove fallback item from queue", "queue_id", item.ID, "error", err)
 		} else {
-			s.log.DebugContext(ctx, "Item marked as fallback after successful SABnzbd transfer",
+			s.log.InfoContext(ctx, "Item removed from queue after successful SABnzbd fallback transfer",
 				"queue_id", item.ID,
 				"file", item.NzbPath,
 				"fallback_host", s.configGetter().SABnzbd.FallbackHost)
+		}
+		// Remove the local NZB file since ownership transfers to the external SABnzbd instance
+		if rmErr := os.Remove(item.NzbPath); rmErr != nil && !os.IsNotExist(rmErr) {
+			s.log.WarnContext(ctx, "Failed to remove NZB file after fallback transfer", "file", item.NzbPath, "error", rmErr)
 		}
 	} else if IsNonRetryable(err) && strings.Contains(err.Error(), "SABnzbd fallback not configured") {
 		s.log.DebugContext(ctx, "SABnzbd fallback skipped (not configured)",
@@ -1059,6 +1158,10 @@ func (s *Service) ProcessItemInBackground(ctx context.Context, itemID int64) {
 			return
 		}
 
+		if s.broadcaster != nil {
+			s.broadcaster.BroadcastQueueChanged()
+		}
+
 		// Create cancellable context for this item
 		itemCtx, cancel := context.WithCancel(ctx)
 
@@ -1075,11 +1178,12 @@ func (s *Service) ProcessItemInBackground(ctx context.Context, itemID int64) {
 		}()
 
 		// Process the NZB file using cancellable context
-		resultingPath, processingErr := s.processNzbItem(itemCtx, item)
+		resultingPath, writtenPaths, processingErr := s.processNzbItem(itemCtx, item)
 
 		// Update queue database with results
 		if processingErr != nil {
-			// Handle failure
+			// Clean up any metadata files written before the failure
+			s.cleanupWrittenPaths(ctx, item.ID, writtenPaths)
 			s.handleProcessingFailure(ctx, item, processingErr)
 		} else {
 			// Handle success (storage path, VFS notification, symlinks, status update)
@@ -1163,4 +1267,81 @@ func (s *Service) calculateStrmFileSize(r io.Reader) (int64, error) {
 	}
 
 	return 0, NewNonRetryableError("no valid NXG link found in STRM file", nil)
+}
+
+// RegenerateMetadata attempts to find the original NZB for a file and re-process it to fix corrupted metadata.
+func (s *Service) RegenerateMetadata(ctx context.Context, mountRelativePath string) error {
+	nzbFolder := s.GetNzbFolder()
+	if nzbFolder == "" {
+		return fmt.Errorf("NZB storage folder not configured")
+	}
+
+	// The mountRelativePath typically looks like:
+	// "complete/tv/Show.Name.S01E01.1080p.WEB-DL/Show.Name.S01E01.1080p.WEB-DL.mkv"
+	// or "tv/Show Name/Season 01/Show Name - S01E01.mkv"
+
+	// Try to extract the release name. For "complete/" files, it's the folder name.
+	releaseName := ""
+	if strings.HasPrefix(mountRelativePath, "complete/") {
+		parts := strings.Split(mountRelativePath, "/")
+		if len(parts) >= 3 {
+			releaseName = parts[2]
+		}
+	}
+
+	if releaseName == "" {
+		// Fallback: use the filename without extension
+		releaseName = filepath.Base(mountRelativePath)
+		releaseName = strings.TrimSuffix(releaseName, filepath.Ext(releaseName))
+	}
+
+	s.log.InfoContext(ctx, "Attempting to regenerate metadata", "path", mountRelativePath, "release_name", releaseName)
+
+	// Search for the NZB file in the .nzbs directory
+	var foundNzbPath string
+	err := filepath.WalkDir(nzbFolder, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+
+		filename := d.Name()
+		// Match release name (ignoring .nzb extension and queue ID prefix)
+		// NZBs are stored as "ID_ReleaseName.nzb" or just "ReleaseName.nzb"
+		cleanName := strings.TrimSuffix(filename, ".nzb")
+		if idx := strings.Index(cleanName, "_"); idx != -1 {
+			// Check both with and without prefix
+			if cleanName[idx+1:] == releaseName || cleanName == releaseName {
+				foundNzbPath = path
+				return filepath.SkipAll
+			}
+		} else if cleanName == releaseName {
+			foundNzbPath = path
+			return filepath.SkipAll
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return fmt.Errorf("failed to search for NZB: %w", err)
+	}
+
+	if foundNzbPath == "" {
+		return fmt.Errorf("could not find original NZB for release: %s", releaseName)
+	}
+
+	s.log.InfoContext(ctx, "Found original NZB, rebuilding metadata", "nzb_path", foundNzbPath)
+
+	// Determine virtual directory based on where the file was originally (e.g. "complete/tv")
+	virtualDir := filepath.ToSlash(filepath.Dir(mountRelativePath))
+
+	// Re-process the NZB file. We use a dummy queue ID.
+	// This will overwrite the existing .meta file.
+	_, _, err = s.processor.ProcessNzbFile(ctx, foundNzbPath, "", 0, nil, &virtualDir, nil, nil)
+	if err != nil {
+		return fmt.Errorf("failed to re-process NZB: %w", err)
+	}
+
+	s.log.InfoContext(ctx, "Successfully regenerated metadata", "path", mountRelativePath)
+	return nil
 }

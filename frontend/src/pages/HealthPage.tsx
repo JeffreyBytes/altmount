@@ -1,4 +1,14 @@
-import { useCallback, useEffect, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
+import {
+	FileCheck,
+	RefreshCw,
+	RotateCcw,
+	Server,
+	Settings,
+	ShieldCheck,
+	Trash2,
+} from "lucide-react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { ErrorAlert } from "../components/ui/ErrorAlert";
 import { Pagination } from "../components/ui/Pagination";
 import { useConfirm } from "../contexts/ModalContext";
@@ -17,18 +27,20 @@ import {
 	useResetAllHealthChecks,
 	useRestartBulkHealthItems,
 	useSetHealthPriority,
+	useUnmaskHealthItem,
 } from "../hooks/useApi";
 import { useConfig } from "../hooks/useConfig";
+import { useHealthStream } from "../hooks/useHealthStream";
 import {
 	useCancelLibrarySync,
 	useLibrarySyncStatus,
 	useStartLibrarySync,
 } from "../hooks/useLibrarySync";
+import { debounce } from "../lib/utils";
 import { HealthPriority } from "../types/api";
 import { BulkActionsToolbar } from "./HealthPage/components/BulkActionsToolbar";
 import { CleanupModal } from "./HealthPage/components/CleanupModal";
 import { HealthFilters } from "./HealthPage/components/HealthFilters";
-import { HealthPageHeader } from "./HealthPage/components/HealthPageHeader";
 import { HealthStatsCards } from "./HealthPage/components/HealthStatsCards";
 import { HealthStatusAlert } from "./HealthPage/components/HealthStatusAlert";
 import { HealthTable } from "./HealthPage/components/HealthTable/HealthTable";
@@ -36,8 +48,23 @@ import { LibraryScanStatus } from "./HealthPage/components/LibraryScanStatus";
 import { ProviderHealth } from "./HealthPage/components/ProviderHealth/ProviderHealth";
 import type { CleanupConfig, SortBy, SortOrder } from "./HealthPage/types";
 
+type HealthTab = "files" | "providers";
+
+const HEALTH_SECTIONS = {
+	files: {
+		title: "File Health",
+		description: "Monitor and repair corrupted media files",
+		icon: FileCheck,
+	},
+	providers: {
+		title: "Provider Health",
+		description: "Check Usenet provider connectivity and speed",
+		icon: Server,
+	},
+};
+
 export function HealthPage() {
-	const [activeTab, setActiveTab] = useState<"files" | "providers">("files");
+	const [activeTab, setActiveTab] = useState<HealthTab>("files");
 	const [page, setPage] = useState(0);
 	const [searchTerm, setSearchTerm] = useState("");
 	const [statusFilter, setStatusFilter] = useState("");
@@ -46,11 +73,6 @@ export function HealthPage() {
 		older_than: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().slice(0, 16),
 		delete_files: false,
 	});
-	const [autoRefreshEnabled, setAutoRefreshEnabled] = useState(true);
-	const [refreshInterval, setRefreshInterval] = useState(5000);
-	const [nextRefreshTime, setNextRefreshTime] = useState<Date | null>(null);
-	const [userInteracting, setUserInteracting] = useState(false);
-	const [countdown, setCountdown] = useState(0);
 	const [selectedItems, setSelectedItems] = useState<Set<string>>(new Set());
 	const [sortBy, setSortBy] = useState<SortBy>("created_at");
 	const [sortOrder, setSortOrder] = useState<SortOrder>("desc");
@@ -68,7 +90,6 @@ export function HealthPage() {
 		status: statusFilter || undefined,
 		sort_by: sortBy,
 		sort_order: sortOrder,
-		refetchInterval: autoRefreshEnabled && !userInteracting ? refreshInterval : undefined,
 	});
 
 	const { data: stats } = useHealthStats();
@@ -83,8 +104,25 @@ export function HealthPage() {
 	const cancelHealthCheck = useCancelHealthCheck();
 	const repairHealthItem = useRepairHealthItem();
 	const setHealthPriority = useSetHealthPriority();
+	const unmaskItem = useUnmaskHealthItem();
 	const { confirmAction } = useConfirm();
 	const { showToast } = useToast();
+	const queryClient = useQueryClient();
+
+	// SSE stream for real-time health updates — debounced to avoid an HTTP GET on every event
+	const debouncedHealthRefetch = useMemo(
+		() =>
+			debounce(() => {
+				void refetch();
+				void queryClient.invalidateQueries({ queryKey: ["health", "stats"] });
+			}, 2000),
+		[refetch, queryClient],
+	);
+
+	useHealthStream({
+		enabled: activeTab === "files",
+		onHealthChanged: debouncedHealthRefetch,
+	});
 
 	// Config hook
 	const { data: config } = useConfig();
@@ -99,45 +137,72 @@ export function HealthPage() {
 	const startLibrarySync = useStartLibrarySync();
 	const cancelLibrarySync = useCancelLibrarySync();
 
-	const handleDelete = async (id: number) => {
-		const confirmed = await confirmAction(
-			"Delete Health Record",
-			"Are you sure you want to delete this health record? The actual file won´t be deleted.",
-			{
-				type: "warning",
-				confirmText: "Delete",
-				confirmButtonClass: "btn-error",
-			},
-		);
-		if (confirmed) {
-			await deleteItem.mutateAsync(id);
-		}
-	};
+	const handleDelete = useCallback(
+		async (id: number) => {
+			const confirmed = await confirmAction(
+				"Delete Health Record",
+				"Are you sure you want to delete this health record? The actual file won´t be deleted.",
+				{
+					type: "warning",
+					confirmText: "Delete",
+					confirmButtonClass: "btn-error",
+				},
+			);
+			if (confirmed) {
+				await deleteItem.mutateAsync(id);
+			}
+		},
+		[confirmAction, deleteItem],
+	);
 
-	const handleSetPriority = async (id: number, priority: HealthPriority) => {
-		try {
-			await setHealthPriority.mutateAsync({ id, priority });
-			const priorityLabel =
-				priority === HealthPriority.Next
-					? "Next"
-					: priority === HealthPriority.High
-						? "High"
-						: "Normal";
+	const handleUnmask = useCallback(
+		async (id: number) => {
+			try {
+				await unmaskItem.mutateAsync(id);
+				showToast({
+					title: "File Unmasked",
+					message: "The file has been unmasked and will now be visible in mounts.",
+					type: "success",
+				});
+			} catch (err) {
+				console.error("Failed to unmask file:", err);
+				showToast({
+					title: "Unmask Failed",
+					message: "Failed to unmask file health record",
+					type: "error",
+				});
+			}
+		},
+		[unmaskItem, showToast],
+	);
 
-			showToast({
-				title: "Priority Updated",
-				message: `File priority set to ${priorityLabel}`,
-				type: "success",
-			});
-		} catch (err) {
-			console.error("Failed to update priority:", err);
-			showToast({
-				title: "Update Failed",
-				message: "Failed to update file priority",
-				type: "error",
-			});
-		}
-	};
+	const handleSetPriority = useCallback(
+		async (id: number, priority: HealthPriority) => {
+			try {
+				await setHealthPriority.mutateAsync({ id, priority });
+				const priorityLabel =
+					priority === HealthPriority.Next
+						? "Next"
+						: priority === HealthPriority.High
+							? "High"
+							: "Normal";
+
+				showToast({
+					title: "Priority Updated",
+					message: `File priority set to ${priorityLabel}`,
+					type: "success",
+				});
+			} catch (err) {
+				console.error("Failed to update priority:", err);
+				showToast({
+					title: "Update Failed",
+					message: "Failed to update file priority",
+					type: "error",
+				});
+			}
+		},
+		[setHealthPriority, showToast],
+	);
 
 	const handleCleanup = () => {
 		setCleanupConfig({
@@ -177,34 +242,43 @@ export function HealthPage() {
 		}
 	};
 
-	const handleRegenerateSymlinks = async () => {
-		const confirmed = await confirmAction(
-			"Regenerate Symlinks",
-			"This will regenerate symlinks for all files without library path. This operation is only available when import strategy is set to SYMLINK. Are you sure you want to continue?",
-			{
-				type: "info",
-				confirmText: "Regenerate",
-				confirmButtonClass: "btn-primary",
-			},
-		);
+	const handleRegenerateLibraryFiles = async (filePaths?: string[]) => {
+		const isBulk = filePaths && filePaths.length > 0;
+		const message = isBulk
+			? `This will regenerate library files for the ${filePaths.length} selected items. Are you sure?`
+			: "This will regenerate library files for all records in the database. Are you sure you want to continue?";
+
+		const confirmed = await confirmAction("Regenerate Library Files", message, {
+			type: "info",
+			confirmText: "Regenerate",
+			confirmButtonClass: "btn-primary",
+		});
 
 		if (confirmed) {
 			try {
-				const result = await regenerateSymlinks.mutateAsync();
+				const result = await regenerateSymlinks.mutateAsync(filePaths);
 				showToast({
-					title: "Symlinks Regenerated",
+					title: "Regeneration Complete",
 					message: result.message,
 					type: result.error_count > 0 ? "warning" : "success",
 				});
+				if (isBulk) {
+					setSelectedItems(new Set());
+				}
 			} catch (error) {
-				console.error("Failed to regenerate symlinks:", error);
+				console.error("Failed to regenerate library files:", error);
 				showToast({
 					title: "Regeneration Failed",
-					message: error instanceof Error ? error.message : "Failed to regenerate symlinks",
+					message: error instanceof Error ? error.message : "Failed to regenerate library files",
 					type: "error",
 				});
 			}
 		}
+	};
+
+	const handleBulkRegenerate = () => {
+		if (selectedItems.size === 0) return;
+		handleRegenerateLibraryFiles(Array.from(selectedItems));
 	};
 
 	const handleCleanupConfirm = async () => {
@@ -356,17 +430,7 @@ export function HealthPage() {
 		}
 	};
 
-	const toggleAutoRefresh = () => {
-		setAutoRefreshEnabled(!autoRefreshEnabled);
-		setNextRefreshTime(null);
-	};
-
-	const handleRefreshIntervalChange = (interval: number) => {
-		setRefreshInterval(interval);
-		setNextRefreshTime(null);
-	};
-
-	const handleSelectItem = (filePath: string, checked: boolean) => {
+	const handleSelectItem = useCallback((filePath: string, checked: boolean) => {
 		setSelectedItems((prev) => {
 			const newSet = new Set(prev);
 			if (checked) {
@@ -376,7 +440,7 @@ export function HealthPage() {
 			}
 			return newSet;
 		});
-	};
+	}, []);
 
 	const handleSelectAll = (checked: boolean) => {
 		if (checked && data) {
@@ -503,58 +567,8 @@ export function HealthPage() {
 		clearSelection();
 	};
 
-	const handleUserInteractionStart = () => {
-		setUserInteracting(true);
-	};
-
-	const handleUserInteractionEnd = () => {
-		const timer = setTimeout(() => {
-			setUserInteracting(false);
-		}, 2000);
-
-		return () => clearTimeout(timer);
-	};
-
 	const data = healthResponse?.data;
 	const meta = healthResponse?.meta;
-
-	// Update next refresh time when auto-refresh is enabled
-	useEffect(() => {
-		if (!autoRefreshEnabled || userInteracting) {
-			setNextRefreshTime(null);
-			return;
-		}
-
-		setNextRefreshTime(new Date(Date.now() + refreshInterval));
-
-		const interval = setInterval(() => {
-			setNextRefreshTime(new Date(Date.now() + refreshInterval));
-		}, refreshInterval);
-
-		return () => clearInterval(interval);
-	}, [autoRefreshEnabled, refreshInterval, userInteracting]);
-
-	// Update countdown timer every second
-	useEffect(() => {
-		if (!nextRefreshTime || !autoRefreshEnabled || userInteracting) {
-			setCountdown(0);
-			return;
-		}
-
-		const updateCountdown = () => {
-			const remaining = Math.max(0, Math.ceil((nextRefreshTime.getTime() - Date.now()) / 1000));
-			setCountdown(remaining);
-
-			if (remaining === 0) {
-				setNextRefreshTime(new Date(Date.now() + refreshInterval));
-			}
-		};
-
-		updateCountdown();
-		const timer = setInterval(updateCountdown, 1000);
-
-		return () => clearInterval(timer);
-	}, [nextRefreshTime, autoRefreshEnabled, userInteracting, refreshInterval]);
 
 	// Reset page when search term or status filter changes
 	useEffect(() => {
@@ -579,124 +593,241 @@ export function HealthPage() {
 
 	return (
 		<div className="space-y-6">
-			<HealthPageHeader
-				autoRefreshEnabled={autoRefreshEnabled}
-				refreshInterval={refreshInterval}
-				countdown={countdown}
-				userInteracting={userInteracting}
-				isLoading={isLoading}
-				isCleanupPending={cleanupHealth.isPending}
-				isRegenerateSymlinksPending={regenerateSymlinks.isPending}
-				onToggleAutoRefresh={toggleAutoRefresh}
-				onRefreshIntervalChange={handleRefreshIntervalChange}
-				onRefresh={() => refetch()}
-				onResetAll={handleResetAll}
-				onCleanup={handleCleanup}
-				onRegenerateSymlinks={handleRegenerateSymlinks}
-				onUserInteractionStart={handleUserInteractionStart}
-				onUserInteractionEnd={handleUserInteractionEnd}
-			/>
+			{/* Header */}
+			<div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-center">
+				<div className="flex items-center space-x-3">
+					<div className="rounded-xl bg-primary/10 p-2">
+						<ShieldCheck className="h-8 w-8 text-primary" />
+					</div>
+					<div>
+						<h1 className="font-bold text-3xl tracking-tight">Health Monitoring</h1>
+						<p className="text-base-content/60 text-sm">
+							Monitor library integrity and provider status
+						</p>
+					</div>
+				</div>
 
-			<HealthStatsCards stats={stats} />
+				<div className="flex items-center gap-2">
+					<div className="dropdown">
+						<button type="button" tabIndex={0} className="btn btn-outline btn-sm gap-2">
+							<Settings className="h-3.5 w-3.5" />
+							Maintenance
+						</button>
+						<ul className="dropdown-content menu z-[1] mt-2 w-52 rounded-box border border-base-200 bg-base-100 p-2 shadow-lg">
+							<li>
+								<button type="button" onClick={handleResetAll} className="gap-2 text-warning">
+									<RotateCcw className="h-4 w-4" /> Reset All Checks
+								</button>
+							</li>
+							<li>
+								<button type="button" onClick={handleCleanup} className="gap-2 text-error">
+									<Trash2 className="h-4 w-4" /> Cleanup Records
+								</button>
+							</li>
+							<li>
+								<button
+									type="button"
+									onClick={() => handleRegenerateLibraryFiles()}
+									className="gap-2"
+								>
+									<RefreshCw className="h-4 w-4" /> Regenerate Library Files
+								</button>
+							</li>
+						</ul>
+					</div>
 
-			<LibraryScanStatus
-				status={librarySyncStatus}
-				isLoading={librarySyncLoading}
-				error={librarySyncError}
-				isStartPending={startLibrarySync.isPending}
-				isCancelPending={cancelLibrarySync.isPending}
-				syncIntervalMinutes={config?.health.library_sync_interval_minutes}
-				onStart={handleStartLibrarySync}
-				onCancel={handleCancelLibrarySync}
-				onRetry={refetchLibrarySync}
-			/>
-
-			<div className="mb-6 flex gap-2">
-				<button
-					type="button"
-					className={`btn ${activeTab === "files" ? "btn-primary" : "btn-ghost"}`}
-					onClick={() => setActiveTab("files")}
-				>
-					File Health
-				</button>
-				<button
-					type="button"
-					className={`btn ${activeTab === "providers" ? "btn-primary" : "btn-ghost"}`}
-					onClick={() => setActiveTab("providers")}
-				>
-					Provider Health
-				</button>
+					<button
+						type="button"
+						className="btn btn-outline btn-sm"
+						onClick={() => refetch()}
+						disabled={isLoading}
+					>
+						{isLoading ? (
+							<span className="loading loading-spinner loading-xs" />
+						) : (
+							<RefreshCw className="h-3.5 w-3.5" />
+						)}
+						Refresh
+					</button>
+				</div>
 			</div>
 
-			{activeTab === "files" ? (
-				<>
-					<HealthFilters
-						searchTerm={searchTerm}
-						statusFilter={statusFilter}
-						onSearchChange={setSearchTerm}
-						onStatusFilterChange={setStatusFilter}
-						onUserInteractionStart={handleUserInteractionStart}
-						onUserInteractionEnd={handleUserInteractionEnd}
-					/>
+			<div className="grid grid-cols-1 gap-6 lg:grid-cols-12">
+				{/* Sidebar Navigation */}
+				<div className="lg:col-span-3 xl:col-span-2">
+					{" "}
+					<div className="space-y-6">
+						<div className="card border-2 border-base-300/50 bg-base-100 shadow-md">
+							<div className="card-body p-2 sm:p-4">
+								<div>
+									<h3 className="mb-2 px-4 font-bold text-base-content/40 text-xs uppercase tracking-widest">
+										Monitoring
+									</h3>
+									<ul className="menu menu-md gap-1 p-0">
+										{(
+											Object.entries(HEALTH_SECTIONS) as [HealthTab, typeof HEALTH_SECTIONS.files][]
+										).map(([key, section]) => {
+											const IconComponent = section.icon;
+											const isActive = activeTab === key;
+											return (
+												<li key={key}>
+													<button
+														type="button"
+														className={`flex items-center gap-3 rounded-lg px-4 py-3 transition-all ${
+															isActive
+																? "bg-primary font-semibold text-primary-content shadow-md shadow-primary/20"
+																: "hover:bg-base-200"
+														}`}
+														onClick={() => setActiveTab(key)}
+													>
+														<IconComponent
+															className={`h-5 w-5 ${isActive ? "" : "text-base-content/60"}`}
+														/>
+														<div className="min-w-0 flex-1 text-left">
+															<div className="text-sm">{section.title}</div>
+														</div>
+													</button>
+												</li>
+											);
+										})}
+									</ul>
+								</div>
+							</div>
+						</div>
 
-					<BulkActionsToolbar
-						selectedCount={selectedItems.size}
-						isRestartPending={restartBulkItems.isPending}
-						isDeletePending={deleteBulkItems.isPending}
-						isRepairPending={repairBulkItems.isPending}
-						onClearSelection={() => setSelectedItems(new Set())}
-						onBulkRestart={handleBulkRestart}
-						onBulkDelete={handleBulkDelete}
-						onBulkRepair={handleBulkRepair}
-					/>
-
-					<HealthTable
-						data={data}
-						isLoading={isLoading}
-						selectedItems={selectedItems}
-						sortBy={sortBy}
-						sortOrder={sortOrder}
-						searchTerm={searchTerm}
-						statusFilter={statusFilter}
-						isCancelPending={cancelHealthCheck.isPending}
-						isDirectCheckPending={directHealthCheck.isPending}
-						isRepairPending={repairHealthItem.isPending}
-						isDeletePending={deleteItem.isPending}
-						onSelectItem={handleSelectItem}
-						onSelectAll={handleSelectAll}
-						onSort={handleSort}
-						onCancelCheck={handleCancelCheck}
-						onManualCheck={handleManualCheck}
-						onRepair={handleRepair}
-						onDelete={handleDelete}
-						onSetPriority={handleSetPriority}
-					/>
-
-					{meta?.total && meta.total > pageSize && (
-						<Pagination
-							currentPage={page + 1}
-							totalPages={Math.ceil(meta.total / pageSize)}
-							onPageChange={(newPage) => setPage(newPage - 1)}
-							totalItems={meta.total}
-							itemsPerPage={pageSize}
-							showSummary={true}
+						{/* Library Sync Mini Card */}
+						<LibraryScanStatus
+							status={librarySyncStatus}
+							isLoading={librarySyncLoading}
+							error={librarySyncError}
+							isStartPending={startLibrarySync.isPending}
+							isCancelPending={cancelLibrarySync.isPending}
+							syncIntervalMinutes={config?.health.library_sync_interval_minutes}
+							onStart={handleStartLibrarySync}
+							onCancel={handleCancelLibrarySync}
+							onRetry={refetchLibrarySync}
+							variant="sidebar"
 						/>
-					)}
+					</div>
+				</div>
 
-					<HealthStatusAlert stats={stats} />
+				{/* Content Area */}
+				<div className="lg:col-span-9 xl:col-span-10">
+					{" "}
+					<div className="space-y-6">
+						{/* Section Description Card */}
+						<div className="card border-2 border-base-300/50 bg-base-100 shadow-md">
+							<div className="card-body p-4 sm:p-6">
+								<div className="flex items-center space-x-4">
+									<div className="rounded-xl bg-primary/10 p-3">
+										{(() => {
+											const IconComponent = HEALTH_SECTIONS[activeTab].icon;
+											return <IconComponent className="h-6 w-6 text-primary" />;
+										})()}
+									</div>
+									<div>
+										<h2 className="font-bold text-2xl tracking-tight">
+											{HEALTH_SECTIONS[activeTab].title}
+										</h2>
+										<p className="max-w-2xl text-base-content/60 text-sm">
+											{HEALTH_SECTIONS[activeTab].description}
+										</p>
+									</div>
+								</div>
+							</div>
+						</div>
 
-					<CleanupModal
-						show={showCleanupModal}
-						config={cleanupConfig}
-						isPending={cleanupHealth.isPending}
-						onClose={() => setShowCleanupModal(false)}
-						onConfigChange={setCleanupConfig}
-						onConfirm={handleCleanupConfirm}
-					/>
-				</>
-			) : (
-				<ProviderHealth />
-			)}
+						{activeTab === "files" ? (
+							<div className="space-y-6">
+								<HealthStatsCards stats={stats} />
+
+								<div className="card border-2 border-base-300/50 bg-base-100 shadow-md">
+									<div className="card-body p-4 sm:p-8">
+										<HealthFilters
+											searchTerm={searchTerm}
+											statusFilter={statusFilter}
+											onSearchChange={setSearchTerm}
+											onStatusFilterChange={setStatusFilter}
+										/>
+
+										<BulkActionsToolbar
+											selectedCount={selectedItems.size}
+											isRestartPending={restartBulkItems.isPending}
+											isDeletePending={deleteBulkItems.isPending}
+											isRepairPending={repairBulkItems.isPending}
+											isRegeneratePending={regenerateSymlinks.isPending}
+											onClearSelection={() => setSelectedItems(new Set())}
+											onBulkRestart={handleBulkRestart}
+											onBulkDelete={handleBulkDelete}
+											onBulkRepair={handleBulkRepair}
+											onBulkRegenerate={handleBulkRegenerate}
+										/>
+
+										<div className="mt-6">
+											<HealthTable
+												data={data}
+												isLoading={isLoading}
+												selectedItems={selectedItems}
+												sortBy={sortBy}
+												sortOrder={sortOrder}
+												searchTerm={searchTerm}
+												statusFilter={statusFilter}
+												isCancelPending={cancelHealthCheck.isPending}
+												isDirectCheckPending={directHealthCheck.isPending}
+												isRepairPending={repairHealthItem.isPending}
+												isDeletePending={deleteItem.isPending}
+												isUnmaskPending={unmaskItem.isPending}
+												onSelectItem={handleSelectItem}
+												onSelectAll={handleSelectAll}
+												onSort={handleSort}
+												onCancelCheck={handleCancelCheck}
+												onManualCheck={handleManualCheck}
+												onRepair={handleRepair}
+												onDelete={handleDelete}
+												onUnmask={handleUnmask}
+												onSetPriority={handleSetPriority}
+												onRegenerate={(filePath: string) =>
+													handleRegenerateLibraryFiles([filePath])
+												}
+											/>
+										</div>
+
+										{meta?.total && meta.total > pageSize && (
+											<div className="mt-6">
+												<Pagination
+													currentPage={page + 1}
+													totalPages={Math.ceil(meta.total / pageSize)}
+													onPageChange={(newPage) => setPage(newPage - 1)}
+													totalItems={meta.total}
+													itemsPerPage={pageSize}
+													showSummary={true}
+												/>
+											</div>
+										)}
+									</div>
+								</div>
+
+								<HealthStatusAlert stats={stats} />
+
+								<CleanupModal
+									show={showCleanupModal}
+									config={cleanupConfig}
+									isPending={cleanupHealth.isPending}
+									onClose={() => setShowCleanupModal(false)}
+									onConfigChange={setCleanupConfig}
+									onConfirm={handleCleanupConfirm}
+								/>
+							</div>
+						) : (
+							<div className="card border-2 border-base-300/50 bg-base-100 shadow-md">
+								<div className="card-body p-4 sm:p-8">
+									<ProviderHealth />
+								</div>
+							</div>
+						)}
+					</div>
+				</div>
+			</div>
 		</div>
 	);
 }

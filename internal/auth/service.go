@@ -27,11 +27,12 @@ type Service struct {
 // Config represents authentication service configuration
 type Config struct {
 	// JWT configuration
-	JWTSecret      string        // JWT signing secret
-	TokenDuration  time.Duration // JWT token duration
-	CookieDomain   string        // Cookie domain
-	CookieSecure   bool          // Secure cookie flag
-	CookieSameSite http.SameSite // SameSite cookie attribute
+	JWTSecret              string        // JWT signing secret
+	TokenDuration          time.Duration // JWT token duration
+	CookieDomain           string        // Cookie domain
+	CookieSecure           bool          // Secure cookie flag (used only when CookieSecureAutoDetect is false)
+	CookieSecureAutoDetect bool          // When true, derive Secure flag from request protocol at runtime
+	CookieSameSite         http.SameSite // SameSite cookie attribute
 
 	// Direct authentication
 	DirectAuthEnabled bool   // Enable direct username/password authentication
@@ -45,52 +46,64 @@ type Config struct {
 // DefaultConfig returns default authentication configuration
 func DefaultConfig() *Config {
 	return &Config{
-		TokenDuration:     24 * time.Hour,       // 24 hours
-		CookieDomain:      "",                   // Empty string allows browser to use current domain
-		CookieSecure:      false,                // true for production
-		CookieSameSite:    http.SameSiteLaxMode, // Use Lax mode for Safari compatibility
-		DirectAuthEnabled: true,
-		Issuer:            "altmount",
-		Audience:          "altmount-api",
+		TokenDuration:          24 * time.Hour,       // 24 hours
+		CookieDomain:           "",                   // Empty string allows browser to use current domain
+		CookieSecure:           false,                // Only used when CookieSecureAutoDetect is false
+		CookieSecureAutoDetect: true,                 // Auto-detect Secure flag from request protocol
+		CookieSameSite:         http.SameSiteLaxMode, // Use Lax mode for Safari compatibility
+		DirectAuthEnabled:      true,
+		Issuer:                 "altmount",
+		Audience:               "altmount-api",
 	}
 }
 
-// LoadConfigFromEnv loads configuration from environment variables
-func LoadConfigFromEnv() *Config {
+// LoadConfigFromEnv loads configuration from environment variables.
+// Returns an error if JWT_SECRET is not set, as a missing secret is a security risk.
+func LoadConfigFromEnv() (*Config, error) {
 	config := DefaultConfig()
 
-	if secret := os.Getenv("JWT_SECRET"); secret != "" {
-		config.JWTSecret = secret
-	} else {
-		config.JWTSecret = "default-dev-secret-change-in-production"
+	secret := os.Getenv("JWT_SECRET")
+	if secret == "" {
+		return nil, fmt.Errorf("JWT_SECRET environment variable must be set")
 	}
+	config.JWTSecret = secret
 
 	if domain := os.Getenv("COOKIE_DOMAIN"); domain != "" {
 		config.CookieDomain = domain
 	}
 
-	if secure := os.Getenv("COOKIE_SECURE"); secure == "true" {
-		config.CookieSecure = true
+	if secure := os.Getenv("COOKIE_SECURE"); secure != "" {
+		// Explicit env var disables auto-detection and forces a fixed value
+		config.CookieSecureAutoDetect = false
+		config.CookieSecure = secure != "false"
 	}
 
 	if salt := os.Getenv("DIRECT_AUTH_SALT"); salt != "" {
 		config.DirectAuthSalt = salt
 	} else {
 		// Generate a random salt for direct authentication
-		config.DirectAuthSalt = generateRandomSalt()
+		salt, err := generateRandomSalt()
+		if err != nil {
+			return nil, fmt.Errorf("failed to generate random salt: %w", err)
+		}
+		config.DirectAuthSalt = salt
 	}
 
 	if directAuth := os.Getenv("DIRECT_AUTH_ENABLED"); directAuth == "false" {
 		config.DirectAuthEnabled = false
 	}
 
-	return config
+	return config, nil
 }
 
 // NewService creates a new authentication service
 func NewService(config *Config, userRepo *database.UserRepository) (*Service, error) {
 	if config == nil {
-		config = LoadConfigFromEnv()
+		var err error
+		config, err = LoadConfigFromEnv()
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// Create auth service options
@@ -100,14 +113,19 @@ func NewService(config *Config, userRepo *database.UserRepository) (*Service, er
 		urlDomain = "localhost"
 	}
 
+	// When auto-detect is enabled, the actual Secure flag is resolved per-request
+	// in setJWTCookie/clearJWTCookie. The go-pkgz/auth library option is set to false
+	// so it does not reject token reads on HTTP connections.
+	secureCookiesForLib := config.CookieSecure && !config.CookieSecureAutoDetect
+
 	opts := auth.Opts{
 		SecretReader: token.SecretFunc(func(string) (string, error) {
 			return config.JWTSecret, nil
 		}),
 		TokenDuration:   config.TokenDuration,
 		CookieDuration:  config.TokenDuration,
-		DisableXSRF:     false, // Enable XSRF protection
-		SecureCookies:   config.CookieSecure,
+		DisableXSRF:     true, // SameSite: Lax cookie already prevents CSRF
+		SecureCookies:   secureCookiesForLib,
 		JWTCookieName:   "JWT",
 		JWTCookieDomain: config.CookieDomain,
 		SameSiteCookie:  config.CookieSameSite,
@@ -214,14 +232,9 @@ func (s *Service) CreateOrUpdateUser(ctx context.Context, claims token.Claims) (
 		}
 		slog.InfoContext(ctx, "Created new user", "user_id", userID, "is_admin", user.IsAdmin)
 	} else {
-		// Update existing user
-		user.ID = existingUser.ID
-		user.IsAdmin = existingUser.IsAdmin // Preserve admin status
-		err = s.userRepo.UpdateUser(ctx, user)
-		if err != nil {
-			return nil, err
-		}
-		slog.InfoContext(ctx, "Updated existing user", "user_id", userID)
+		// Use existing user as-is
+		user = existingUser
+		slog.InfoContext(ctx, "Found existing user", "user_id", userID)
 	}
 
 	// Update last login
@@ -403,7 +416,7 @@ func CreateClaimsFromUser(ctx context.Context, user *database.User) token.Claims
 
 	// Set custom attributes
 	if claims.User.Attributes == nil {
-		claims.User.Attributes = make(map[string]interface{})
+		claims.User.Attributes = make(map[string]any)
 	}
 	claims.User.Attributes["is_admin"] = user.IsAdmin
 	claims.User.Attributes["provider"] = user.Provider
@@ -426,11 +439,11 @@ func (d *directCredChecker) Check(user, password string) (bool, error) {
 	return true, nil
 }
 
-// generateRandomSalt generates a random salt for authentication
-func generateRandomSalt() string {
+// generateRandomSalt generates a cryptographically random salt for authentication
+func generateRandomSalt() (string, error) {
 	bytes := make([]byte, 32)
 	if _, err := rand.Read(bytes); err != nil {
-		return "default-salt-change-in-production"
+		return "", fmt.Errorf("failed to generate random bytes: %w", err)
 	}
-	return hex.EncodeToString(bytes)
+	return hex.EncodeToString(bytes), nil
 }

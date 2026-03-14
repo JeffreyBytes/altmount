@@ -4,19 +4,22 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"log/slog"
 	"strings"
 	"time"
 )
 
 // QueueRepository handles queue-specific database operations
 type QueueRepository struct {
-	db DBQuerier
+	db      DBQuerier
+	dialect dialectHelper
 }
 
 // NewQueueRepository creates a new queue repository
-func NewQueueRepository(db *sql.DB) *QueueRepository {
-	return &QueueRepository{db: db}
+func NewQueueRepository(db *sql.DB, d Dialect) *QueueRepository {
+	return &QueueRepository{
+		db:      newDialectAwareDB(db, d),
+		dialect: dialectHelper{d: d},
+	}
 }
 
 // RemoveFromQueue removes an item from the queue
@@ -122,19 +125,22 @@ func (r *QueueRepository) AddToQueue(ctx context.Context, item *ImportQueueItem)
 		WHERE status NOT IN ('processing', 'pending')
 	`
 
-	result, err := r.db.ExecContext(ctx, query,
-		item.NzbPath, item.RelativePath, item.Category, item.Priority, item.Status,
-		item.RetryCount, item.MaxRetries, item.BatchID, item.Metadata, item.FileSize)
-	if err != nil {
-		return fmt.Errorf("failed to add queue item: %w", err)
+	args := []any{item.NzbPath, item.RelativePath, item.Category, item.Priority, item.Status,
+		item.RetryCount, item.MaxRetries, item.BatchID, item.Metadata, item.FileSize}
+
+	if r.dialect.IsPostgres() {
+		err := r.db.QueryRowContext(ctx, query+" RETURNING id", args...).Scan(&item.ID)
+		if err != nil && err != sql.ErrNoRows {
+			return fmt.Errorf("failed to add queue item: %w", err)
+		}
+	} else {
+		result, err := r.db.ExecContext(ctx, query, args...)
+		if err != nil {
+			return fmt.Errorf("failed to add queue item: %w", err)
+		}
+		item.ID, _ = result.LastInsertId()
 	}
 
-	id, err := result.LastInsertId()
-	if err != nil {
-		return fmt.Errorf("failed to get queue item id: %w", err)
-	}
-
-	item.ID = id
 	item.CreatedAt = time.Now()
 	item.UpdatedAt = time.Now()
 	return nil
@@ -250,21 +256,25 @@ func (r *QueueRepository) ClaimNextQueueItem(ctx context.Context) (*ImportQueueI
 func (r *QueueRepository) UpdateQueueItemStatus(ctx context.Context, id int64, status QueueStatus, errorMessage *string) error {
 	now := time.Now()
 	var query string
-	var args []interface{}
+	var args []any
 
 	switch status {
 	case QueueStatusProcessing:
 		query = `UPDATE import_queue SET status = ?, started_at = ?, updated_at = ? WHERE id = ?`
-		args = []interface{}{status, now, now, id}
+		args = []any{status, now, now, id}
 	case QueueStatusCompleted:
 		query = `UPDATE import_queue SET status = ?, completed_at = ?, updated_at = ?, error_message = NULL WHERE id = ?`
-		args = []interface{}{status, now, now, id}
+		args = []any{status, now, now, id}
+		// Track successful import
+		_ = r.IncrementDailyStat(ctx, "completed")
 	case QueueStatusFailed:
 		query = `UPDATE import_queue SET status = ?, error_message = ?, updated_at = ? WHERE id = ?`
-		args = []interface{}{status, errorMessage, now, id}
+		args = []any{status, errorMessage, now, id}
+		// Track failed import
+		_ = r.IncrementDailyStat(ctx, "failed")
 	default:
 		query = `UPDATE import_queue SET status = ?, error_message = ?, updated_at = ? WHERE id = ?`
-		args = []interface{}{status, errorMessage, now, id}
+		args = []any{status, errorMessage, now, id}
 	}
 
 	_, err := r.db.ExecContext(ctx, query, args...)
@@ -273,6 +283,178 @@ func (r *QueueRepository) UpdateQueueItemStatus(ctx context.Context, id int64, s
 	}
 
 	return nil
+}
+
+// IncrementDailyStat increments the completed or failed count for the current day
+func (r *QueueRepository) IncrementDailyStat(ctx context.Context, statType string) error {
+	column := "completed_count"
+	if statType == "failed" {
+		column = "failed_count"
+	}
+
+	// Also increment hourly stat for rolling 24h calculation
+	_ = r.IncrementHourlyStat(ctx, statType)
+
+	// date('now') is rewritten to CURRENT_DATE for postgres by the dialectAwareDB wrapper.
+	query := fmt.Sprintf(`
+		INSERT INTO import_daily_stats (day, %s, updated_at)
+		VALUES (date('now'), 1, datetime('now'))
+		ON CONFLICT(day) DO UPDATE SET
+		%s = %s + 1,
+		updated_at = datetime('now')
+	`, column, column, column)
+
+	_, err := r.db.ExecContext(ctx, query)
+	return err
+}
+
+// IncrementHourlyStat increments the completed or failed count for the current hour
+func (r *QueueRepository) IncrementHourlyStat(ctx context.Context, statType string) error {
+	column := "completed_count"
+	if statType == "failed" {
+		column = "failed_count"
+	}
+
+	// Calculate start of current hour
+	currentHour := time.Now().UTC().Truncate(time.Hour)
+
+	query := fmt.Sprintf(`
+		INSERT INTO import_hourly_stats (hour, %s, updated_at)
+		VALUES (?, 1, datetime('now'))
+		ON CONFLICT(hour) DO UPDATE SET
+		%s = %s + 1,
+		updated_at = datetime('now')
+	`, column, column, column)
+
+	_, err := r.db.ExecContext(ctx, query, currentHour)
+	return err
+}
+
+// GetImportHourlyStats retrieves import statistics for the specified number of hours
+func (r *QueueRepository) GetImportHourlyStats(ctx context.Context, hours int) ([]*ImportHourlyStat, error) {
+	cutoff := time.Now().UTC().Add(-time.Duration(hours) * time.Hour)
+	query := `
+		SELECT hour, completed_count, failed_count, bytes_downloaded, updated_at
+		FROM import_hourly_stats
+		WHERE hour >= ?
+		ORDER BY hour ASC
+	`
+
+	rows, err := r.db.QueryContext(ctx, query, cutoff)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get import hourly stats: %w", err)
+	}
+	defer rows.Close()
+
+	var stats []*ImportHourlyStat
+	for rows.Next() {
+		var s ImportHourlyStat
+		err := rows.Scan(&s.Hour, &s.CompletedCount, &s.FailedCount, &s.BytesDownloaded, &s.UpdatedAt)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan import hourly stat: %w", err)
+		}
+		stats = append(stats, &s)
+	}
+
+	return stats, rows.Err()
+}
+
+// GetImportDailyStats retrieves historical import statistics for the last N days
+func (r *QueueRepository) GetImportDailyStats(ctx context.Context, days int) ([]*ImportDailyStat, error) {
+	cutoff := time.Now().UTC().AddDate(0, 0, -days).Format("2006-01-02")
+	query := `
+		SELECT day, completed_count, failed_count, bytes_downloaded, updated_at
+		FROM import_daily_stats
+		WHERE day >= ?
+		ORDER BY day ASC
+	`
+
+	rows, err := r.db.QueryContext(ctx, query, cutoff)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get import history: %w", err)
+	}
+	defer rows.Close()
+
+	var stats []*ImportDailyStat
+	for rows.Next() {
+		var s ImportDailyStat
+		err := rows.Scan(&s.Day, &s.CompletedCount, &s.FailedCount, &s.BytesDownloaded, &s.UpdatedAt)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan import daily stat: %w", err)
+		}
+
+		stats = append(stats, &s)
+	}
+
+	return stats, nil
+}
+
+// GetImportHistory retrieves historical import statistics for the last N days (Alias for GetImportDailyStats)
+func (r *QueueRepository) GetImportHistory(ctx context.Context, days int) ([]*ImportDailyStat, error) {
+	return r.GetImportDailyStats(ctx, days)
+}
+
+
+// AddImportHistory records a successful file import in the persistent history table
+func (r *QueueRepository) AddImportHistory(ctx context.Context, history *ImportHistory) error {
+	query := `
+		INSERT INTO import_history (nzb_id, nzb_name, file_name, file_size, virtual_path, category, completed_at)
+		VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+	`
+	_, err := r.db.ExecContext(ctx, query,
+		history.NzbID, history.NzbName, history.FileName, history.FileSize,
+		history.VirtualPath, history.Category)
+	if err != nil {
+		return fmt.Errorf("failed to add import history: %w", err)
+	}
+	return nil
+}
+
+// ListImportHistory retrieves the last N successful imports from the persistent history
+func (r *QueueRepository) ListImportHistory(ctx context.Context, limit int) ([]*ImportHistory, error) {
+	query := `
+		SELECT h.id, h.nzb_id, h.nzb_name, h.file_name, h.file_size, h.virtual_path, f.library_path, h.category, h.completed_at
+		FROM import_history h
+		LEFT JOIN file_health f ON h.virtual_path = f.file_path
+		ORDER BY h.completed_at DESC
+		LIMIT ?
+	`
+	rows, err := r.db.QueryContext(ctx, query, limit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list import history: %w", err)
+	}
+	defer rows.Close()
+
+	var history []*ImportHistory
+	for rows.Next() {
+		var h ImportHistory
+		err := rows.Scan(&h.ID, &h.NzbID, &h.NzbName, &h.FileName, &h.FileSize, &h.VirtualPath, &h.LibraryPath, &h.Category, &h.CompletedAt)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan import history: %w", err)
+		}
+		history = append(history, &h)
+	}
+	return history, nil
+}
+
+// IncrementRetryCountAndResetStatus increments the retry count and resets the status to pending
+func (r *QueueRepository) IncrementRetryCountAndResetStatus(ctx context.Context, id int64, errorMessage *string) (bool, error) {
+	query := `
+		UPDATE import_queue 
+		SET status = 'pending', retry_count = retry_count + 1, started_at = NULL, error_message = ?, updated_at = datetime('now')
+		WHERE id = ? AND retry_count < max_retries
+	`
+	result, err := r.db.ExecContext(ctx, query, errorMessage, id)
+	if err != nil {
+		return false, fmt.Errorf("failed to increment retry count: %w", err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("failed to get rows affected: %w", err)
+	}
+
+	return rowsAffected > 0, nil
 }
 
 // FilterExistingNzbdavIds checks a list of nzbdav IDs and returns those that already exist in the queue
@@ -286,27 +468,25 @@ func (r *QueueRepository) FilterExistingNzbdavIds(ctx context.Context, ids []str
 	existingIds := make([]string, 0)
 
 	for i := 0; i < len(ids); i += batchSize {
-		end := i + batchSize
-		if end > len(ids) {
-			end = len(ids)
-		}
+		end := min(i+batchSize, len(ids))
 
 		batchIds := ids[i:end]
 
 		// Build placeholders for the IN clause
 		placeholders := make([]string, len(batchIds))
-		args := make([]interface{}, len(batchIds))
+		args := make([]any, len(batchIds))
 		for j, id := range batchIds {
 			placeholders[j] = "?"
 			args[j] = id
 		}
 
-		// Query using json_extract to find matching IDs
+		// Query using json_extract (SQLite) or ->>'key' (PostgreSQL) to find matching IDs
+		jsonExpr := r.dialect.JSONExtract("metadata", "nzbdav_id")
 		query := fmt.Sprintf(`
-			SELECT DISTINCT json_extract(metadata, '$.nzbdav_id') 
-			FROM import_queue 
-			WHERE json_extract(metadata, '$.nzbdav_id') IN (%s)
-		`, strings.Join(placeholders, ","))
+			SELECT DISTINCT %s
+			FROM import_queue
+			WHERE %s IN (%s)
+		`, jsonExpr, jsonExpr, strings.Join(placeholders, ","))
 
 		rows, err := r.db.QueryContext(ctx, query, args...)
 		if err != nil {
@@ -388,11 +568,11 @@ func (r *QueueRepository) GetQueueStats(ctx context.Context) (*QueueStats, error
 
 	// Calculate average processing time for completed items
 	var avgProcessingTimeFloat sql.NullFloat64
-	avgQuery := `
-		SELECT AVG((julianday(completed_at) - julianday(started_at)) * 24 * 60 * 60 * 1000)
-		FROM import_queue 
+	avgQuery := fmt.Sprintf(`
+		SELECT AVG(%s)
+		FROM import_queue
 		WHERE status = 'completed' AND started_at IS NOT NULL AND completed_at IS NOT NULL
-	`
+	`, r.dialect.AvgProcessingTimeMS("started_at", "completed_at"))
 	err = r.db.QueryRowContext(ctx, avgQuery).Scan(&avgProcessingTimeFloat)
 	if err != nil {
 		return nil, fmt.Errorf("failed to calculate average processing time: %w", err)
@@ -431,19 +611,23 @@ func (r *QueueRepository) AddBatchToQueue(ctx context.Context, items []*ImportQu
 
 		now := time.Now()
 		for _, item := range items {
-			result, err := txRepo.db.ExecContext(ctx, query,
-				item.NzbPath, item.RelativePath, item.Category, item.Priority, item.Status,
-				item.RetryCount, item.MaxRetries, item.BatchID, item.Metadata, item.FileSize)
-			if err != nil {
-				return fmt.Errorf("failed to insert queue item %s: %w", item.NzbPath, err)
-			}
+			args := []any{item.NzbPath, item.RelativePath, item.Category, item.Priority, item.Status,
+				item.RetryCount, item.MaxRetries, item.BatchID, item.Metadata, item.FileSize}
 
-			// Update ID for the item
-			if id, err := result.LastInsertId(); err == nil {
-				item.ID = id
-				item.CreatedAt = now
-				item.UpdatedAt = now
+			if txRepo.dialect.IsPostgres() {
+				err := txRepo.db.QueryRowContext(ctx, query+" RETURNING id", args...).Scan(&item.ID)
+				if err != nil && err != sql.ErrNoRows {
+					return fmt.Errorf("failed to insert queue item %s: %w", item.NzbPath, err)
+				}
+			} else {
+				result, err := txRepo.db.ExecContext(ctx, query, args...)
+				if err != nil {
+					return fmt.Errorf("failed to insert queue item %s: %w", item.NzbPath, err)
+				}
+				item.ID, _ = result.LastInsertId()
 			}
+			item.CreatedAt = now
+			item.UpdatedAt = now
 		}
 
 		return nil
@@ -476,19 +660,18 @@ func (r *QueueRepository) GetQueueItem(ctx context.Context, id int64) (*ImportQu
 
 // withQueueTransaction executes a function within a queue database transaction
 func (r *QueueRepository) withQueueTransaction(ctx context.Context, fn func(*QueueRepository) error) error {
-	// Cast to *sql.DB to access BeginTx method
-	sqlDB, ok := r.db.(*sql.DB)
+	ddb, ok := r.db.(*dialectAwareDB)
 	if !ok {
-		return fmt.Errorf("repository not connected to sql.DB")
+		return fmt.Errorf("repository not connected to dialectAwareDB")
 	}
 
-	tx, err := sqlDB.BeginTx(ctx, nil)
+	tx, err := ddb.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to begin queue transaction: %w", err)
 	}
 
 	// Create a repository that uses the transaction
-	txRepo := &QueueRepository{db: tx}
+	txRepo := &QueueRepository{db: tx, dialect: r.dialect}
 
 	err = fn(txRepo)
 	if err != nil {
@@ -519,17 +702,62 @@ func (r *QueueRepository) ResetStaleItems(ctx context.Context) error {
 		return fmt.Errorf("failed to reset stale queue items: %w", err)
 	}
 
-	rowsAffected, err := result.RowsAffected()
+	_, err = result.RowsAffected()
 	if err != nil {
 		return fmt.Errorf("failed to get rows affected: %w", err)
 	}
 
-	if rowsAffected > 0 {
-		// Log the reset operation for operational visibility with structured logging
-		slog.InfoContext(ctx, "Reset stale queue items",
-			"count", rowsAffected,
-			"component", "queue-repository")
-	}
-
 	return nil
 }
+
+// ClearImportHistory deletes all records from the import_history and import_daily_stats tables
+func (r *QueueRepository) ClearImportHistory(ctx context.Context) error {
+	// Clear history records
+	queryHistory := `DELETE FROM import_history`
+	if _, err := r.db.ExecContext(ctx, queryHistory); err != nil {
+		return fmt.Errorf("failed to clear import history: %w", err)
+	}
+
+	// Also clear daily stats
+	return r.ClearDailyStats(ctx)
+}
+
+// ClearDailyStats deletes all records from the import_daily_stats and import_hourly_stats tables
+func (r *QueueRepository) ClearDailyStats(ctx context.Context) error {
+	queryDaily := `DELETE FROM import_daily_stats`
+	if _, err := r.db.ExecContext(ctx, queryDaily); err != nil {
+		return fmt.Errorf("failed to clear daily stats: %w", err)
+	}
+
+	return r.ClearHourlyStats(ctx)
+}
+
+// ClearHourlyStats deletes all records from the import_hourly_stats table
+func (r *QueueRepository) ClearHourlyStats(ctx context.Context) error {
+	queryHourly := `DELETE FROM import_hourly_stats`
+	if _, err := r.db.ExecContext(ctx, queryHourly); err != nil {
+		return fmt.Errorf("failed to clear hourly stats: %w", err)
+	}
+	return nil
+}
+
+// ClearImportHistorySince deletes records from the import_history and import_queue tables
+// since the specified time, and adjusts the import_daily_stats and import_hourly_stats accordingly.
+func (r *QueueRepository) ClearImportHistorySince(ctx context.Context, since time.Time) error {
+	// Clear from persistent history
+	queryHistory := `DELETE FROM import_history WHERE completed_at >= ?`
+	if _, err := r.db.ExecContext(ctx, queryHistory, since); err != nil {
+		return fmt.Errorf("failed to clear import history: %w", err)
+	}
+
+	// Also clear from queue (completed/failed)
+	queryQueue := `DELETE FROM import_queue WHERE status IN ('completed', 'failed') AND updated_at >= ?`
+	if _, err := r.db.ExecContext(ctx, queryQueue, since); err != nil {
+		return fmt.Errorf("failed to clear queue history: %w", err)
+	}
+
+	// Note: We don't decrement daily/hourly counts here for simplicity,
+	// as strict rolling 24h will naturally age out the data.
+	return nil
+}
+

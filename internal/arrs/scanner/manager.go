@@ -53,7 +53,43 @@ func (m *Manager) findInstanceForFilePath(ctx context.Context, filePath string, 
 		}
 	}
 
-	// Strategy 2: Slow Path - Search Cache by Relative Path
+	// Strategy 2: Category Match - Check if file is in the staging/complete folder
+	cfg := m.configGetter()
+	if cfg.SABnzbd.CompleteDir != "" {
+		completeDir := strings.TrimRight(filepath.ToSlash(cfg.SABnzbd.CompleteDir), "/")
+		if !strings.HasPrefix(completeDir, "/") {
+			completeDir = "/" + completeDir
+		}
+
+		normalizedPath := filepath.ToSlash(filePath)
+		if !strings.HasPrefix(normalizedPath, "/") {
+			normalizedPath = "/" + normalizedPath
+		}
+
+		// Check if path starts with complete_dir
+		if strings.HasPrefix(normalizedPath, completeDir+"/") {
+			// Extract category (e.g. /complete/tv/show -> tv)
+			afterPrefix := strings.TrimPrefix(normalizedPath, completeDir+"/")
+			parts := strings.Split(afterPrefix, "/")
+			if len(parts) > 0 {
+				category := parts[0]
+				slog.DebugContext(ctx, "File is in complete_dir, matching by category", "category", category)
+
+				for _, instance := range allInstances {
+					if !instance.Enabled {
+						continue
+					}
+
+					if strings.EqualFold(instance.Category, category) {
+						slog.InfoContext(ctx, "Found managing instance by category in complete_dir", "instance", instance.Name, "category", category)
+						return instance.Type, instance.Name, nil
+					}
+				}
+			}
+		}
+	}
+
+	// Strategy 3: Slow Path - Search Cache by Relative Path
 	if relativePath != "" {
 		slog.InfoContext(ctx, "Root folder match failed, attempting relative path search", "relative_path", relativePath)
 
@@ -74,14 +110,14 @@ func (m *Manager) findInstanceForFilePath(ctx context.Context, filePath string, 
 	return "", "", fmt.Errorf("no ARR instance found managing file path: %s", filePath)
 }
 
-func (m *Manager) managesFile(ctx context.Context, instanceType string, client interface{}, filePath string) bool {
+func (m *Manager) managesFile(ctx context.Context, instanceType string, client any, filePath string) bool {
 	if instanceType == "radarr" {
 		return m.radarrManagesFile(ctx, client.(*radarr.Radarr), filePath)
 	}
 	return m.sonarrManagesFile(ctx, client.(*sonarr.Sonarr), filePath)
 }
 
-func (m *Manager) hasFile(ctx context.Context, instanceType string, client interface{}, instanceName, relativePath string) bool {
+func (m *Manager) hasFile(ctx context.Context, instanceType string, client any, instanceName, relativePath string) bool {
 	if instanceType == "radarr" {
 		return m.radarrHasFile(ctx, client.(*radarr.Radarr), instanceName, relativePath)
 	}
@@ -345,6 +381,9 @@ func (m *Manager) triggerRadarrRescanByPath(ctx context.Context, client *radarr.
 
 	var targetMovie *radarr.Movie
 	for _, movie := range movies {
+		// Try match by filename (the most robust way if paths differ)
+		requestFileName := filepath.Base(filePath)
+
 		if movie.HasFile && movie.MovieFile != nil {
 			// Try exact match
 			if movie.MovieFile.Path == filePath {
@@ -352,9 +391,7 @@ func (m *Manager) triggerRadarrRescanByPath(ctx context.Context, client *radarr.
 				break
 			}
 
-			// Try match by filename (the most robust way if paths differ)
 			movieFileName := filepath.Base(movie.MovieFile.Path)
-			requestFileName := filepath.Base(filePath)
 			if movieFileName == requestFileName {
 				slog.InfoContext(ctx, "Found Radarr movie match by filename",
 					"movie", movie.Title,
@@ -364,8 +401,8 @@ func (m *Manager) triggerRadarrRescanByPath(ctx context.Context, client *radarr.
 			}
 
 			// Try match without .strm extension if filePath is a .strm file
-			if strings.HasSuffix(filePath, ".strm") {
-				strippedPath := strings.TrimSuffix(filePath, ".strm")
+			if before, ok := strings.CutSuffix(filePath, ".strm"); ok {
+				strippedPath := before
 				// Check if movie file path (without its own extension) matches stripped filePath
 				if strings.TrimSuffix(movie.MovieFile.Path, filepath.Ext(movie.MovieFile.Path)) == strippedPath {
 					targetMovie = movie
@@ -383,20 +420,6 @@ func (m *Manager) triggerRadarrRescanByPath(ctx context.Context, client *radarr.
 					targetMovie = movie
 					break
 				}
-			}
-		}
-	}
-
-	if targetMovie == nil {
-		// Fallback: Check if the file is inside a movie folder
-		// This handles cases where Radarr has already detected the file as missing/unlinked
-		for _, movie := range movies {
-			if strings.Contains(filePath, movie.Path) {
-				slog.InfoContext(ctx, "Found Radarr movie match by folder path (fallback)",
-					"movie", movie.Title,
-					"path", movie.Path)
-				targetMovie = movie
-				break
 			}
 		}
 	}
@@ -424,10 +447,10 @@ func (m *Manager) triggerRadarrRescanByPath(ctx context.Context, client *radarr.
 			slog.WarnContext(ctx, "Failed to blocklist Radarr release", "error", err)
 		}
 
-		// Delete the existing file
+		// Delete the existing file from Radarr database
 		err = client.DeleteMovieFilesContext(ctx, targetMovie.MovieFile.ID)
 		if err != nil {
-			slog.WarnContext(ctx, "Failed to delete movie file, continuing with rescan",
+			slog.WarnContext(ctx, "Failed to delete movie file from Radarr, continuing with search",
 				"instance", instanceName,
 				"movie_id", targetMovie.ID,
 				"file_id", targetMovie.MovieFile.ID,
@@ -438,20 +461,7 @@ func (m *Manager) triggerRadarrRescanByPath(ctx context.Context, client *radarr.
 			"movie", targetMovie.Title)
 	}
 
-	// Trigger rescan for the movie
-	_, err = client.SendCommandContext(ctx, &radarr.CommandRequest{
-		Name:     "RescanMovie",
-		MovieIDs: []int64{targetMovie.ID},
-	})
-	if err != nil {
-		return fmt.Errorf("failed to trigger Radarr rescan for movie ID %d: %w", targetMovie.ID, err)
-	}
-
-	slog.DebugContext(ctx, "Successfully triggered Radarr rescan",
-		"instance", instanceName,
-		"movie_id", targetMovie.ID)
-
-	// Step 3: Trigger search for the missing movie
+	// Step 3: Trigger targeted search for the missing movie
 	searchCmd := &radarr.CommandRequest{
 		Name:     "MoviesSearch",
 		MovieIDs: []int64{targetMovie.ID},
@@ -462,7 +472,7 @@ func (m *Manager) triggerRadarrRescanByPath(ctx context.Context, client *radarr.
 		return fmt.Errorf("failed to trigger Radarr search for movie ID %d: %w", targetMovie.ID, err)
 	}
 
-	slog.InfoContext(ctx, "Successfully triggered Radarr search for re-download",
+	slog.InfoContext(ctx, "Successfully triggered Radarr targeted search for re-download",
 		"instance", instanceName,
 		"movie_id", targetMovie.ID,
 		"command_id", response.ID)
@@ -552,8 +562,8 @@ func (m *Manager) triggerSonarrRescanByPath(ctx context.Context, client *sonarr.
 		}
 
 		// Try match without .strm extension
-		if strings.HasSuffix(filePath, ".strm") {
-			strippedPath := strings.TrimSuffix(filePath, ".strm")
+		if before, ok := strings.CutSuffix(filePath, ".strm"); ok {
+			strippedPath := before
 			if strings.TrimSuffix(episodeFile.Path, filepath.Ext(episodeFile.Path)) == strippedPath {
 				targetEpisodeFile = episodeFile
 				break
@@ -594,53 +604,14 @@ func (m *Manager) triggerSonarrRescanByPath(ctx context.Context, client *sonarr.
 				slog.WarnContext(ctx, "Failed to blocklist Sonarr release", "error", err)
 			}
 
-			// Delete the existing episode file
+			// Delete the existing episode file from Sonarr database
 			err = client.DeleteEpisodeFileContext(ctx, targetEpisodeFile.ID)
 			if err != nil {
-				slog.WarnContext(ctx, "Failed to delete episode file",
+				slog.WarnContext(ctx, "Failed to delete episode file from Sonarr, continuing with search",
 					"instance", instanceName,
 					"episode_file_id", targetEpisodeFile.ID,
 					"error", err)
 			}
-
-			// Trigger rescan for the series
-			_, _ = client.SendCommandContext(ctx, &sonarr.CommandRequest{
-				Name:     "RescanSeries",
-				SeriesID: targetSeries.ID,
-			})
-		}
-	}
-
-	if len(episodeIDs) == 0 {
-		// Fallback: Try to find episodes by parsing SxxExx from the filename
-		// This handles cases where Sonarr has already unlinked the file
-		fileName := filepath.Base(filePath)
-		slog.InfoContext(ctx, "No linked episodes found, attempting filename parsing fallback", "filename", fileName)
-
-		allSatisfied := true
-		for _, episode := range episodes {
-			// Construct SxxExx pattern (e.g. S01E01)
-			sxxExx := fmt.Sprintf("S%02dE%02d", episode.SeasonNumber, episode.EpisodeNumber)
-			if strings.Contains(strings.ToUpper(fileName), sxxExx) {
-				slog.InfoContext(ctx, "Found Sonarr episode match by filename pattern",
-					"pattern", sxxExx,
-					"episode_id", episode.ID)
-
-				// Check if this episode is already satisfied by a different healthy file
-				if !episode.HasFile || episode.EpisodeFileID == 0 {
-					allSatisfied = false
-				}
-
-				episodeIDs = append(episodeIDs, episode.ID)
-			}
-		}
-
-		// If we found episodes and ALL of them are already satisfied by other files,
-		// then this file is a "zombie" duplicate and can be safely deleted.
-		if len(episodeIDs) > 0 && allSatisfied {
-			slog.InfoContext(ctx, "All episodes in unlinked file are already satisfied by other files in Sonarr. Marking as zombie.", 
-				"file_path", filePath)
-			return fmt.Errorf("file %s is a zombie: %w", filePath, model.ErrEpisodeAlreadySatisfied)
 		}
 	}
 
@@ -648,7 +619,7 @@ func (m *Manager) triggerSonarrRescanByPath(ctx context.Context, client *sonarr.
 		return fmt.Errorf("no episodes found for file: %s: %w", filePath, model.ErrPathMatchFailed)
 	}
 
-	// Trigger episode search for all episodes in this file
+	// Trigger targeted episode search for all episodes in this file
 	searchCmd := &sonarr.CommandRequest{
 		Name:       "EpisodeSearch",
 		EpisodeIDs: episodeIDs,
@@ -656,10 +627,10 @@ func (m *Manager) triggerSonarrRescanByPath(ctx context.Context, client *sonarr.
 
 	response, err := client.SendCommandContext(ctx, searchCmd)
 	if err != nil {
-		return fmt.Errorf("failed to trigger episode search: %w", err)
+		return fmt.Errorf("failed to trigger Sonarr episode search: %w", err)
 	}
 
-	slog.DebugContext(ctx, "Successfully triggered episode search for re-download",
+	slog.InfoContext(ctx, "Successfully triggered Sonarr targeted episode search for re-download",
 		"instance", instanceName,
 		"series_title", targetSeries.Title,
 		"episode_ids", episodeIDs,
